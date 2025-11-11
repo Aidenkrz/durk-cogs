@@ -1033,14 +1033,14 @@ class SS14Currency(commands.Cog):
             await ctx.send("No wealth data available.", ephemeral=True)
             return
 
-        total = stats.get('total_players', 0)
-        total_wealth = stats.get('total_wealth', 0)
-        avg = stats.get('avg_wealth', 0)
-        median = stats.get('median_wealth', 0)
-        min_w = stats.get('min_wealth', 0)
-        max_w = stats.get('max_wealth', 0)
-        q1 = stats.get('q1_wealth', 0)
-        q3 = stats.get('q3_wealth', 0)
+        total = int(stats.get('total_players', 0))
+        total_wealth = float(stats.get('total_wealth', 0))
+        avg = float(stats.get('avg_wealth', 0))
+        median = float(stats.get('median_wealth', 0))
+        min_w = float(stats.get('min_wealth', 0))
+        max_w = float(stats.get('max_wealth', 0))
+        q1 = float(stats.get('q1_wealth', 0))
+        q3 = float(stats.get('q3_wealth', 0))
 
         embed = discord.Embed(
             title="📊 Wealth Distribution Analysis",
