@@ -329,8 +329,63 @@ class SS14Currency(commands.Cog):
             ON transaction_history(timestamp)
         """)
         
+        # Prediction markets table
+        await self.local_db.execute("""
+            CREATE TABLE IF NOT EXISTS prediction_markets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                market_id TEXT UNIQUE NOT NULL,
+                question TEXT NOT NULL,
+                created_by_id INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT NOT NULL DEFAULT 'open',
+                winning_option INTEGER,
+                resolved_at TIMESTAMP,
+                resolved_by_id INTEGER
+            )
+        """)
+        
+        # Market options table
+        await self.local_db.execute("""
+            CREATE TABLE IF NOT EXISTS market_options (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                option_index INTEGER NOT NULL,
+                option_text TEXT NOT NULL,
+                FOREIGN KEY (market_id) REFERENCES prediction_markets(market_id),
+                UNIQUE(market_id, option_index)
+            )
+        """)
+        
+        # Bets table
+        await self.local_db.execute("""
+            CREATE TABLE IF NOT EXISTS prediction_bets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                market_id TEXT NOT NULL,
+                player_id TEXT NOT NULL,
+                guild_id INTEGER NOT NULL,
+                option_index INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                placed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (market_id) REFERENCES prediction_markets(market_id)
+            )
+        """)
+        
+        await self.local_db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_markets_guild
+            ON prediction_markets(guild_id, status)
+        """)
+        await self.local_db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bets_market
+            ON prediction_bets(market_id)
+        """)
+        await self.local_db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_bets_player
+            ON prediction_bets(player_id, guild_id)
+        """)
+        
         await self.local_db.commit()
-        log.info("Local database initialized with gambling stats and transaction history.")
+        log.info("Local database initialized with gambling stats, transaction history, and prediction markets.")
 
     async def resolve_player(
         self,
@@ -1451,6 +1506,620 @@ class SS14Currency(commands.Cog):
                 inline=False
             )
         
+    @currency.command(name="createmarket")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def create_market(self, ctx: commands.Context, *, question: str):
+        """Creates a new prediction market (Admin only).
+        
+        After creating the market, you'll be prompted to add options.
+        Example: /currency createmarket Will the server reach 100 players today?
+        """
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        # Generate unique market ID
+        market_id = f"{ctx.guild.id}_{int(time.time())}_{ctx.author.id}"
+        
+        # Create the market
+        try:
+            await self.local_db.execute("""
+                INSERT INTO prediction_markets (guild_id, market_id, question, created_by_id, status)
+                VALUES (?, ?, ?, ?, 'setup')
+            """, (ctx.guild.id, market_id, question, ctx.author.id))
+            await self.local_db.commit()
+        except Exception as e:
+            log.error(f"Error creating market: {e}", exc_info=True)
+            await ctx.send("❌ Failed to create market.", ephemeral=True)
+            return
+        
+        # Show option entry view
+        view = MarketOptionsView(self, market_id, question, ctx.guild.id)
+        embed = discord.Embed(
+            title="📊 Creating Prediction Market",
+            description=f"**Question:** {question}\n\nAdd betting options using the buttons below.",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Options Added", value="None yet", inline=False)
+        embed.set_footer(text="Add at least 2 options, then click 'Finish'")
+        
+        message = await ctx.send(embed=embed, view=view)
+        view.message = message
+
+    @currency.command(name="bet")
+    async def place_bet(self, ctx: commands.Context, market_id: str, option: int, amount: int):
+        """Place a bet on a prediction market.
+        
+        Args:
+            market_id: The ID of the market (from /currency markets)
+            option: The option number to bet on
+            amount: Amount of coins to wager
+        """
+        if amount <= 0:
+            await ctx.send("❌ You must bet a positive amount.", ephemeral=True)
+            return
+        
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("❌ Database connection not configured.", ephemeral=True)
+            return
+        
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        # Get player ID
+        player_id = await get_player_id_from_discord(pool, ctx.author.id)
+        if not player_id:
+            await ctx.send("❌ Your Discord account is not linked to an SS14 account.", ephemeral=True)
+            return
+        
+        # Check balance
+        balance = await get_player_currency(pool, player_id)
+        if balance < amount:
+            await ctx.send(f"❌ Insufficient funds. You have {balance:,} coins but need {amount:,}.", ephemeral=True)
+            return
+        
+        # Verify market exists and is open
+        async with self.local_db.execute("""
+            SELECT question, status FROM prediction_markets
+            WHERE market_id = ? AND guild_id = ?
+        """, (market_id, ctx.guild.id)) as cursor:
+            market = await cursor.fetchone()
+        
+        if not market:
+            await ctx.send("❌ Market not found.", ephemeral=True)
+            return
+        
+        if market[1] != 'open':
+            await ctx.send(f"❌ This market is {market[1]} and not accepting bets.", ephemeral=True)
+            return
+        
+        # Verify option exists
+        async with self.local_db.execute("""
+            SELECT option_text FROM market_options
+            WHERE market_id = ? AND option_index = ?
+        """, (market_id, option)) as cursor:
+            option_data = await cursor.fetchone()
+        
+        if not option_data:
+            await ctx.send(f"❌ Invalid option number {option}.", ephemeral=True)
+            return
+        
+        # Deduct coins from player (atomically)
+        success, old_balance, new_balance = await add_player_currency(pool, player_id, -amount)
+        if not success:
+            await ctx.send("❌ Failed to deduct coins. Please try again.", ephemeral=True)
+            return
+        
+        # Record the bet
+        try:
+            await self.local_db.execute("""
+                INSERT INTO prediction_bets (market_id, player_id, guild_id, option_index, amount)
+                VALUES (?, ?, ?, ?, ?)
+            """, (market_id, str(player_id), ctx.guild.id, option, amount))
+            await self.local_db.commit()
+            
+            # Log transaction
+            await self.log_transaction(
+                ctx.guild.id, "market_bet", amount,
+                from_player_id=player_id,
+                balance_before=old_balance,
+                balance_after=new_balance,
+                notes=f"Bet on market {market_id[:16]}... option {option}"
+            )
+            
+            embed = discord.Embed(
+                title="✅ Bet Placed",
+                description=f"**Question:** {market[0]}",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Your Bet", value=f"Option {option}: {option_data[0]}", inline=False)
+            embed.add_field(name="Amount Wagered", value=f"{amount:,} coins", inline=True)
+            embed.add_field(name="New Balance", value=f"{new_balance:,} coins", inline=True)
+            embed.set_footer(text=f"Market ID: {market_id}")
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            # Refund if bet recording fails
+            log.error(f"Error recording bet: {e}", exc_info=True)
+            await add_player_currency(pool, player_id, amount)
+            await ctx.send("❌ Failed to record bet. Your coins have been refunded.", ephemeral=True)
+
+class MarketOptionsView(View):
+    """View for adding options to a prediction market during creation."""
+    def __init__(self, cog: 'SS14Currency', market_id: str, question: str, guild_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.market_id = market_id
+        self.question = question
+        self.guild_id = guild_id
+        self.options = []
+        self.message = None
+    
+    async def update_embed(self):
+        """Update the embed to show current options."""
+        embed = discord.Embed(
+            title="📊 Creating Prediction Market",
+            description=f"**Question:** {self.question}\n\nAdd betting options using the buttons below.",
+            color=discord.Color.blue()
+        )
+        
+        if self.options:
+            options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(self.options)])
+            embed.add_field(name="Options Added", value=options_text, inline=False)
+        else:
+            embed.add_field(name="Options Added", value="None yet", inline=False)
+        
+        embed.set_footer(text="Add at least 2 options, then click 'Finish'")
+        
+        if self.message:
+            await self.message.edit(embed=embed)
+    
+    @discord.ui.button(label="Add Option", style=discord.ButtonStyle.green)
+    async def add_option(self, interaction: discord.Interaction, button: Button):
+        """Add a new option to the market."""
+        modal = AddOptionModal()
+        await interaction.response.send_modal(modal)
+        await modal.wait()
+        
+        if modal.option_text:
+            self.options.append(modal.option_text)
+            await self.update_embed()
+    
+    @discord.ui.button(label="Finish", style=discord.ButtonStyle.primary)
+    async def finish(self, interaction: discord.Interaction, button: Button):
+        """Finish creating the market."""
+        if len(self.options) < 2:
+            await interaction.response.send_message("❌ You need at least 2 options.", ephemeral=True)
+            return
+        
+        await interaction.response.defer()
+        
+        try:
+            # Add options to database
+            for i, option_text in enumerate(self.options):
+                await self.cog.local_db.execute("""
+                    INSERT INTO market_options (market_id, option_index, option_text)
+                    VALUES (?, ?, ?)
+                """, (self.market_id, i + 1, option_text))
+            
+            # Update market status to open
+            await self.cog.local_db.execute("""
+                UPDATE prediction_markets
+                SET status = 'open'
+                WHERE market_id = ?
+            """, (self.market_id,))
+            
+            await self.cog.local_db.commit()
+            
+            # Disable buttons
+            for item in self.children:
+                item.disabled = True
+            
+            embed = discord.Embed(
+                title="✅ Market Created",
+                description=f"**Question:** {self.question}",
+                color=discord.Color.green()
+            )
+            
+            options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(self.options)])
+            embed.add_field(name="Options", value=options_text, inline=False)
+            embed.add_field(name="Market ID", value=f"`{self.market_id}`", inline=False)
+            embed.add_field(name="Status", value="🟢 Open for betting", inline=False)
+            
+            await self.message.edit(embed=embed, view=self)
+            self.stop()
+            
+        except Exception as e:
+            log.error(f"Error finishing market creation: {e}", exc_info=True)
+            await interaction.followup.send("❌ Failed to create market.", ephemeral=True)
+    
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
+    async def cancel(self, interaction: discord.Interaction, button: Button):
+        """Cancel market creation."""
+        await interaction.response.defer()
+        
+        # Delete the market from database
+        await self.cog.local_db.execute("""
+            DELETE FROM prediction_markets WHERE market_id = ?
+        """, (self.market_id,))
+        await self.cog.local_db.commit()
+        
+        # Disable buttons
+        for item in self.children:
+            item.disabled = True
+        
+        await self.message.edit(content="❌ Market creation cancelled.", embed=None, view=self)
+        self.stop()
+
+
+class AddOptionModal(Modal, title="Add Market Option"):
+    """Modal for adding an option to a prediction market."""
+    
+    option_text = TextInput(
+        label="Option Description",
+        style=TextStyle.short,
+        placeholder="e.g., Yes, No, Maybe",
+        required=True,
+        max_length=200
+    )
+    
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.option_text = None
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        self.option_text = self.option_text.value.strip()
+        await interaction.response.defer()
+
+    @currency.command(name="markets")
+    async def list_markets(self, ctx: commands.Context, status: str = "open"):
+        """List prediction markets.
+        
+        Args:
+            status: Filter by status (open/resolved/cancelled/all). Default: open
+        """
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        # Build query based on status filter
+        if status.lower() == "all":
+            query = """
+                SELECT market_id, question, status, created_at
+                FROM prediction_markets
+                WHERE guild_id = ?
+                ORDER BY created_at DESC
+                LIMIT 10
+            """
+            params = (ctx.guild.id,)
+        else:
+            query = """
+                SELECT market_id, question, status, created_at
+                FROM prediction_markets
+                WHERE guild_id = ? AND status = ?
+                ORDER BY created_at DESC
+                LIMIT 10
+            """
+            params = (ctx.guild.id, status.lower())
+        
+        async with self.local_db.execute(query, params) as cursor:
+            markets = await cursor.fetchall()
+        
+        if not markets:
+            await ctx.send(f"📊 No {status} markets found.", ephemeral=True)
+            return
+        
+        embed = discord.Embed(
+            title=f"📊 Prediction Markets ({status.title()})",
+            description=f"Showing {len(markets)} market(s)",
+            color=discord.Color.blue()
+        )
+        
+        for market in markets:
+            market_id = market[0]
+            question = market[1]
+            mkt_status = market[2]
+            created = market[3]
+            
+            # Get total bets
+            async with self.local_db.execute("""
+                SELECT COUNT(*), SUM(amount)
+                FROM prediction_bets
+                WHERE market_id = ?
+            """, (market_id,)) as cursor:
+                bet_stats = await cursor.fetchone()
+            
+            bet_count = bet_stats[0] or 0
+            total_pool = bet_stats[1] or 0
+            
+            status_emoji = {
+                'open': '🟢',
+                'resolved': '✅',
+                'cancelled': '❌',
+                'setup': '⚙️'
+            }.get(mkt_status, '⚪')
+            
+            field_value = (
+                f"**ID:** `{market_id}`\n"
+                f"**Status:** {status_emoji} {mkt_status.title()}\n"
+                f"**Bets:** {bet_count} ({total_pool:,} coins)\n"
+                f"**Created:** {created[:10]}"
+            )
+            
+            embed.add_field(
+                name=question[:100],
+                value=field_value,
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Use /currency marketinfo <id> for details | Requested by {ctx.author.name}")
+        await ctx.send(embed=embed)
+
+    @currency.command(name="marketinfo")
+    async def market_info(self, ctx: commands.Context, market_id: str):
+        """Get detailed information about a prediction market."""
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        # Get market details
+        async with self.local_db.execute("""
+            SELECT question, status, created_at, winning_option, resolved_at
+            FROM prediction_markets
+            WHERE market_id = ? AND guild_id = ?
+        """, (market_id, ctx.guild.id)) as cursor:
+            market = await cursor.fetchone()
+        
+        if not market:
+            await ctx.send("❌ Market not found.", ephemeral=True)
+            return
+        
+        question, status, created_at, winning_option, resolved_at = market
+        
+        # Get options with bet counts
+        async with self.local_db.execute("""
+            SELECT mo.option_index, mo.option_text,
+                   COUNT(pb.id) as bet_count,
+                   COALESCE(SUM(pb.amount), 0) as total_wagered
+            FROM market_options mo
+            LEFT JOIN prediction_bets pb ON mo.market_id = pb.market_id AND mo.option_index = pb.option_index
+            WHERE mo.market_id = ?
+            GROUP BY mo.option_index, mo.option_text
+            ORDER BY mo.option_index
+        """, (market_id,)) as cursor:
+            options = await cursor.fetchall()
+        
+        status_emoji = {
+            'open': '🟢 Open',
+            'resolved': '✅ Resolved',
+            'cancelled': '❌ Cancelled',
+            'setup': '⚙️ Setup'
+        }.get(status, status)
+        
+        embed = discord.Embed(
+            title="📊 Market Information",
+            description=f"**{question}**",
+            color=discord.Color.blue() if status == 'open' else discord.Color.green() if status == 'resolved' else discord.Color.red()
+        )
+        
+        embed.add_field(name="Status", value=status_emoji, inline=True)
+        embed.add_field(name="Created", value=created_at[:10], inline=True)
+        
+        if resolved_at:
+            embed.add_field(name="Resolved", value=resolved_at[:10], inline=True)
+        
+        # Add options
+        total_pool = 0
+        for opt in options:
+            option_idx, option_text, bet_count, wagered = opt
+            total_pool += wagered
+            
+            winner_mark = " 🏆" if winning_option == option_idx else ""
+            field_name = f"Option {option_idx}{winner_mark}"
+            field_value = f"{option_text}\n**Bets:** {bet_count} | **Wagered:** {wagered:,} coins"
+            
+            embed.add_field(name=field_name, value=field_value, inline=False)
+        
+        embed.add_field(name="💰 Total Pool", value=f"{total_pool:,} coins", inline=False)
+        embed.set_footer(text=f"Market ID: {market_id}")
+        
+        await ctx.send(embed=embed)
+
+    @currency.command(name="resolvemarket")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def resolve_market(self, ctx: commands.Context, market_id: str, winning_option: int):
+        """Resolve a market and distribute winnings (Admin only).
+        
+        Args:
+            market_id: The market ID
+            winning_option: The option number that won
+        """
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("❌ Database connection not configured.", ephemeral=True)
+            return
+        
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        # Verify market exists and is open
+        async with self.local_db.execute("""
+            SELECT question, status FROM prediction_markets
+            WHERE market_id = ? AND guild_id = ?
+        """, (market_id, ctx.guild.id)) as cursor:
+            market = await cursor.fetchone()
+        
+        if not market:
+            await ctx.send("❌ Market not found.", ephemeral=True)
+            return
+        
+        if market[1] != 'open':
+            await ctx.send(f"❌ Market is {market[1]} and cannot be resolved.", ephemeral=True)
+            return
+        
+        # Verify winning option exists
+        async with self.local_db.execute("""
+            SELECT option_text FROM market_options
+            WHERE market_id = ? AND option_index = ?
+        """, (market_id, winning_option)) as cursor:
+            option = await cursor.fetchone()
+        
+        if not option:
+            await ctx.send(f"❌ Invalid winning option {winning_option}.", ephemeral=True)
+            return
+        
+        # Get all bets
+        async with self.local_db.execute("""
+            SELECT option_index, SUM(amount) as total
+            FROM prediction_bets
+            WHERE market_id = ?
+            GROUP BY option_index
+        """, (market_id,)) as cursor:
+            option_totals = await cursor.fetchall()
+        
+        # Calculate total pool and winning pool
+        total_pool = sum(row[1] for row in option_totals)
+        winning_pool = next((row[1] for row in option_totals if row[0] == winning_option), 0)
+        
+        if winning_pool == 0:
+            await ctx.send("⚠️ No one bet on the winning option. Resolving market anyway.", ephemeral=True)
+        
+        # Get winning bets
+        async with self.local_db.execute("""
+            SELECT player_id, amount
+            FROM prediction_bets
+            WHERE market_id = ? AND option_index = ?
+        """, (market_id, winning_option)) as cursor:
+            winning_bets = await cursor.fetchall()
+        
+        # Distribute winnings proportionally
+        winners_paid = 0
+        total_distributed = 0
+        
+        for player_id_str, bet_amount in winning_bets:
+            player_id = uuid.UUID(player_id_str)
+            
+            # Calculate winnings (proportional share of total pool)
+            if winning_pool > 0:
+                share = bet_amount / winning_pool
+                payout = int(total_pool * share)
+            else:
+                payout = bet_amount  # Refund if no winners
+            
+            # Add winnings to player
+            success, old_bal, new_bal = await add_player_currency(pool, player_id, payout)
+            if success:
+                winners_paid += 1
+                total_distributed += payout
+                
+                # Log transaction
+                await self.log_transaction(
+                    ctx.guild.id, "market_win", payout,
+                    to_player_id=player_id,
+                    balance_before=old_bal,
+                    balance_after=new_bal,
+                    notes=f"Won from market {market_id[:16]}..."
+                )
+        
+        # Mark market as resolved
+        await self.local_db.execute("""
+            UPDATE prediction_markets
+            SET status = 'resolved', winning_option = ?, resolved_at = CURRENT_TIMESTAMP, resolved_by_id = ?
+            WHERE market_id = ?
+        """, (winning_option, ctx.author.id, market_id))
+        await self.local_db.commit()
+        
+        embed = discord.Embed(
+            title="✅ Market Resolved",
+            description=f"**Question:** {market[0]}",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Winning Option", value=f"Option {winning_option}: {option[0]}", inline=False)
+        embed.add_field(name="Total Pool", value=f"{total_pool:,} coins", inline=True)
+        embed.add_field(name="Winners Paid", value=f"{winners_paid} player(s)", inline=True)
+        embed.add_field(name="Total Distributed", value=f"{total_distributed:,} coins", inline=True)
+        embed.set_footer(text=f"Resolved by {ctx.author.name}")
+        
+        await ctx.send(embed=embed)
+
+    @currency.command(name="cancelmarket")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def cancel_market(self, ctx: commands.Context, market_id: str):
+        """Cancel a market and refund all bets (Admin only)."""
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("❌ Database connection not configured.", ephemeral=True)
+            return
+        
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        # Verify market exists
+        async with self.local_db.execute("""
+            SELECT question, status FROM prediction_markets
+            WHERE market_id = ? AND guild_id = ?
+        """, (market_id, ctx.guild.id)) as cursor:
+            market = await cursor.fetchone()
+        
+        if not market:
+            await ctx.send("❌ Market not found.", ephemeral=True)
+            return
+        
+        if market[1] == 'cancelled':
+            await ctx.send("❌ Market is already cancelled.", ephemeral=True)
+            return
+        
+        if market[1] == 'resolved':
+            await ctx.send("❌ Cannot cancel a resolved market.", ephemeral=True)
+            return
+        
+        # Get all bets to refund
+        async with self.local_db.execute("""
+            SELECT player_id, SUM(amount) as total
+            FROM prediction_bets
+            WHERE market_id = ?
+            GROUP BY player_id
+        """, (market_id,)) as cursor:
+            refunds = await cursor.fetchall()
+        
+        # Refund all bets
+        refunded_count = 0
+        total_refunded = 0
+        
+        for player_id_str, amount in refunds:
+            player_id = uuid.UUID(player_id_str)
+            success, old_bal, new_bal = await add_player_currency(pool, player_id, amount)
+            if success:
+                refunded_count += 1
+                total_refunded += amount
+                
+                # Log transaction
+                await self.log_transaction(
+                    ctx.guild.id, "market_refund", amount,
+                    to_player_id=player_id,
+                    balance_before=old_bal,
+                    balance_after=new_bal,
+                    notes=f"Refund from cancelled market {market_id[:16]}..."
+                )
+        
+        # Mark market as cancelled
+        await self.local_db.execute("""
+            UPDATE prediction_markets
+            SET status = 'cancelled', resolved_at = CURRENT_TIMESTAMP, resolved_by_id = ?
+            WHERE market_id = ?
+        """, (ctx.author.id, market_id))
+        await self.local_db.commit()
+        
+        embed = discord.Embed(
+            title="❌ Market Cancelled",
+            description=f"**Question:** {market[0]}",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Players Refunded", value=f"{refunded_count} player(s)", inline=True)
+        embed.add_field(name="Total Refunded", value=f"{total_refunded:,} coins", inline=True)
+        embed.set_footer(text=f"Cancelled by {ctx.author.name}")
+        
+        await ctx.send(embed=embed)
+
         # Inequality metric
         if median_wealth > 0:
             inequality = ((avg_wealth - median_wealth) / median_wealth) * 100
@@ -1677,7 +2346,13 @@ class OpenCoinflipView(View):
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
-        await self.message.edit(content="This open coinflip challenge has expired.", view=self)
+        
+        embed = discord.Embed(
+            title="⏱️ Coinflip Challenge Expired",
+            description=f"{self.challenger.mention}'s open coinflip challenge for **{self.amount}** coins has expired.",
+            color=discord.Color.red()
+        )
+        await self.message.edit(content=None, embed=embed, view=self)
 
     @discord.ui.button(label="Accept Challenge", style=discord.ButtonStyle.green)
     async def accept_button(self, interaction: discord.Interaction, button: Button):
@@ -1783,7 +2458,13 @@ class CoinflipView(View):
     async def on_timeout(self):
         for item in self.children:
             item.disabled = True
-        await self.message.edit(content="Coinflip challenge expired.", view=self)
+        
+        embed = discord.Embed(
+            title="⏱️ Coinflip Challenge Expired",
+            description=f"{self.opponent.mention} did not respond to {self.challenger.mention}'s coinflip challenge for **{self.amount}** coins.",
+            color=discord.Color.red()
+        )
+        await self.message.edit(content=None, embed=embed, view=self)
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.green)
     async def accept_button(self, interaction: discord.Interaction, button: Button):
