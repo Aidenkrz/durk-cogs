@@ -7,6 +7,7 @@ import aiohttp
 import urllib.parse
 from discord.ui import Modal, TextInput
 from discord import TextStyle
+import typing
 from typing import Dict, Optional
 
 from redbot.core import commands, Config, checks, app_commands
@@ -216,8 +217,8 @@ class SS14Currency(commands.Cog):
 
     @currency.command(name="set")
     @checks.admin_or_permissions(manage_guild=True)
-    async def set_coins(self, ctx: commands.Context, username: str, amount: int):
-        """Sets the coin balance for a given SS14 username."""
+    async def set_coins(self, ctx: commands.Context, user: typing.Union[discord.Member, str], amount: int):
+        """Sets the coin balance for a given SS14 username or linked Discord user."""
         pool = await self.get_pool_for_guild(ctx.guild.id)
         if not pool:
             await ctx.send("Database connection is not configured for this server.", ephemeral=True)
@@ -226,41 +227,63 @@ class SS14Currency(commands.Cog):
         if amount < 0:
             await ctx.send("You cannot set a negative coin balance.", ephemeral=True)
             return
+            
+        player_id = None
+        player_name = None
 
-        player_id = await self.get_user_id_from_name(username)
-        if not player_id:
-            await ctx.send(f"Could not find a user with the name `{username}`.", ephemeral=True)
-            return
+        if isinstance(user, discord.Member):
+            player_id = await get_player_id_from_discord(pool, user.id)
+            player_name = user.display_name
+            if not player_id:
+                await ctx.send(f"{user.mention} does not have a linked SS14 account.", ephemeral=True)
+                return
+        else:
+            player_id = await self.get_user_id_from_name(user)
+            player_name = user
+            if not player_id:
+                await ctx.send(f"Could not find a user with the name `{user}`.", ephemeral=True)
+                return
 
         if await set_player_currency(pool, player_id, amount):
             embed = discord.Embed(title="Balance Set", color=discord.Color.green())
-            embed.add_field(name="Player", value=username, inline=False)
+            embed.add_field(name="Player", value=player_name, inline=False)
             embed.add_field(name="New Balance", value=f"{amount} coins", inline=False)
             await ctx.send(embed=embed)
         else:
-            await ctx.send(f"Failed to set the balance for **{username}**.", ephemeral=True)
+            await ctx.send(f"Failed to set the balance for **{player_name}**.", ephemeral=True)
 
     @currency.command(name="add")
     @checks.admin_or_permissions(manage_guild=True)
-    async def add_coins(self, ctx: commands.Context, username: str, amount: int):
-        """Adds coins to a given SS14 username. Can be a negative number."""
+    async def add_coins(self, ctx: commands.Context, user: typing.Union[discord.Member, str], amount: int):
+        """Adds coins to a given SS14 username or linked Discord user. Can be a negative number."""
         pool = await self.get_pool_for_guild(ctx.guild.id)
         if not pool:
             await ctx.send("Database connection is not configured for this server.", ephemeral=True)
             return
+            
+        player_id = None
+        player_name = None
 
-        player_id = await self.get_user_id_from_name(username)
-        if not player_id:
-            await ctx.send(f"Could not find a user with the name `{username}`.", ephemeral=True)
-            return
+        if isinstance(user, discord.Member):
+            player_id = await get_player_id_from_discord(pool, user.id)
+            player_name = user.display_name
+            if not player_id:
+                await ctx.send(f"{user.mention} does not have a linked SS14 account.", ephemeral=True)
+                return
+        else:
+            player_id = await self.get_user_id_from_name(user)
+            player_name = user
+            if not player_id:
+                await ctx.send(f"Could not find a user with the name `{user}`.", ephemeral=True)
+                return
 
         if await add_player_currency(pool, player_id, amount):
             embed = discord.Embed(title="Balance Updated", color=discord.Color.green())
-            embed.add_field(name="Player", value=username, inline=False)
+            embed.add_field(name="Player", value=player_name, inline=False)
             embed.add_field(name="Amount Added", value=f"{amount} coins", inline=False)
             await ctx.send(embed=embed)
         else:
-            await ctx.send(f"Failed to add coins for **{username}**.", ephemeral=True)
+            await ctx.send(f"Failed to add coins for **{player_name}**.", ephemeral=True)
 
     @currency.command(name="leaderboard")
     async def leaderboard(self, ctx: commands.Context):
