@@ -1506,271 +1506,61 @@ class SS14Currency(commands.Cog):
                 inline=False
             )
         
-    @currency.command(name="createmarket")
-    @checks.admin_or_permissions(manage_guild=True)
-    async def create_market(self, ctx: commands.Context, *, question: str):
-        """Creates a new prediction market (Admin only).
-        
-        After creating the market, you'll be prompted to add options.
-        Example: /currency createmarket Will the server reach 100 players today?
-        """
-        if self.local_db is None:
-            await self.initialize_local_db()
-        
-        # Generate unique market ID
-        market_id = f"{ctx.guild.id}_{int(time.time())}_{ctx.author.id}"
-        
-        # Create the market
-        try:
-            await self.local_db.execute("""
-                INSERT INTO prediction_markets (guild_id, market_id, question, created_by_id, status)
-                VALUES (?, ?, ?, ?, 'setup')
-            """, (ctx.guild.id, market_id, question, ctx.author.id))
-            await self.local_db.commit()
-        except Exception as e:
-            log.error(f"Error creating market: {e}", exc_info=True)
-            await ctx.send("❌ Failed to create market.", ephemeral=True)
-            return
-        
-        # Show option entry view
-        view = MarketOptionsView(self, market_id, question, ctx.guild.id)
-        embed = discord.Embed(
-            title="📊 Creating Prediction Market",
-            description=f"**Question:** {question}\n\nAdd betting options using the buttons below.",
-            color=discord.Color.blue()
-        )
-        embed.add_field(name="Options Added", value="None yet", inline=False)
-        embed.set_footer(text="Add at least 2 options, then click 'Finish'")
-        
-        message = await ctx.send(embed=embed, view=view)
-        view.message = message
-
-    @currency.command(name="bet")
-    async def place_bet(self, ctx: commands.Context, market_id: str, option: int, amount: int):
-        """Place a bet on a prediction market.
-        
-        Args:
-            market_id: The ID of the market (from /currency markets)
-            option: The option number to bet on
-            amount: Amount of coins to wager
-        """
-        if amount <= 0:
-            await ctx.send("❌ You must bet a positive amount.", ephemeral=True)
-            return
-        
-        pool = await self.get_pool_for_guild(ctx.guild.id)
-        if not pool:
-            await ctx.send("❌ Database connection not configured.", ephemeral=True)
-            return
-        
-        if self.local_db is None:
-            await self.initialize_local_db()
-        
-        # Get player ID
-        player_id = await get_player_id_from_discord(pool, ctx.author.id)
-        if not player_id:
-            await ctx.send("❌ Your Discord account is not linked to an SS14 account.", ephemeral=True)
-            return
-        
-        # Check balance
-        balance = await get_player_currency(pool, player_id)
-        if balance < amount:
-            await ctx.send(f"❌ Insufficient funds. You have {balance:,} coins but need {amount:,}.", ephemeral=True)
-            return
-        
-        # Verify market exists and is open
-        async with self.local_db.execute("""
-            SELECT question, status FROM prediction_markets
-            WHERE market_id = ? AND guild_id = ?
-        """, (market_id, ctx.guild.id)) as cursor:
-            market = await cursor.fetchone()
-        
-        if not market:
-            await ctx.send("❌ Market not found.", ephemeral=True)
-            return
-        
-        if market[1] != 'open':
-            await ctx.send(f"❌ This market is {market[1]} and not accepting bets.", ephemeral=True)
-            return
-        
-        # Verify option exists
-        async with self.local_db.execute("""
-            SELECT option_text FROM market_options
-            WHERE market_id = ? AND option_index = ?
-        """, (market_id, option)) as cursor:
-            option_data = await cursor.fetchone()
-        
-        if not option_data:
-            await ctx.send(f"❌ Invalid option number {option}.", ephemeral=True)
-            return
-        
-        # Deduct coins from player (atomically)
-        success, old_balance, new_balance = await add_player_currency(pool, player_id, -amount)
-        if not success:
-            await ctx.send("❌ Failed to deduct coins. Please try again.", ephemeral=True)
-            return
-        
-        # Record the bet
-        try:
-            await self.local_db.execute("""
-                INSERT INTO prediction_bets (market_id, player_id, guild_id, option_index, amount)
-                VALUES (?, ?, ?, ?, ?)
-            """, (market_id, str(player_id), ctx.guild.id, option, amount))
-            await self.local_db.commit()
-            
-            # Log transaction
-            await self.log_transaction(
-                ctx.guild.id, "market_bet", amount,
-                from_player_id=player_id,
-                balance_before=old_balance,
-                balance_after=new_balance,
-                notes=f"Bet on market {market_id[:16]}... option {option}"
+        # Inequality metric
+        if median_wealth > 0:
+            inequality = ((avg_wealth - median_wealth) / median_wealth) * 100
+            status = "🟢 Low" if inequality < 50 else "🟡 Medium" if inequality < 100 else "🔴 High"
+            embed.add_field(
+                name="⚖️ Wealth Inequality",
+                value=f"{status} ({inequality:.1f}%)",
+                inline=True
             )
-            
-            embed = discord.Embed(
-                title="✅ Bet Placed",
-                description=f"**Question:** {market[0]}",
-                color=discord.Color.green()
-            )
-            embed.add_field(name="Your Bet", value=f"Option {option}: {option_data[0]}", inline=False)
-            embed.add_field(name="Amount Wagered", value=f"{amount:,} coins", inline=True)
-            embed.add_field(name="New Balance", value=f"{new_balance:,} coins", inline=True)
-            embed.set_footer(text=f"Market ID: {market_id}")
-            
-            await ctx.send(embed=embed)
-            
-        except Exception as e:
-            # Refund if bet recording fails
-            log.error(f"Error recording bet: {e}", exc_info=True)
-            await add_player_currency(pool, player_id, amount)
-            await ctx.send("❌ Failed to record bet. Your coins have been refunded.", ephemeral=True)
-
-class MarketOptionsView(View):
-    """View for adding options to a prediction market during creation."""
-    def __init__(self, cog: 'SS14Currency', market_id: str, question: str, guild_id: int):
-        super().__init__(timeout=300)
-        self.cog = cog
-        self.market_id = market_id
-        self.question = question
-        self.guild_id = guild_id
-        self.options = []
-        self.message = None
-    
-    async def update_embed(self):
-        """Update the embed to show current options."""
-        embed = discord.Embed(
-            title="📊 Creating Prediction Market",
-            description=f"**Question:** {self.question}\n\nAdd betting options using the buttons below.",
-            color=discord.Color.blue()
-        )
         
-        if self.options:
-            options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(self.options)])
-            embed.add_field(name="Options Added", value=options_text, inline=False)
+        # Health score (0-100)
+        health_score = 0
+        
+        # Active player participation (up to 30 points)
+        if total_players > 0:
+            health_score += min(30, total_players)
+        
+        # Transaction activity (up to 40 points)
+        if volume_24h['count'] > 0:
+            health_score += min(40, volume_24h['count'] * 2)
+        
+        # Wealth distribution (up to 30 points - lower inequality is better)
+        if median_wealth > 0:
+            inequality = ((avg_wealth - median_wealth) / median_wealth) * 100
+            if inequality < 50:
+                health_score += 30
+            elif inequality < 100:
+                health_score += 20
+            else:
+                health_score += 10
+        
+        health_score = min(100, health_score)
+        
+        if health_score >= 80:
+            health_status = "🟢 Excellent"
+            health_color = discord.Color.green()
+        elif health_score >= 60:
+            health_status = "🟡 Good"
+            health_color =discord.Color.gold()
+        elif health_score >= 40:
+            health_status = "🟠 Fair"
+            health_color = discord.Color.orange()
         else:
-            embed.add_field(name="Options Added", value="None yet", inline=False)
+            health_status = "🔴 Poor"
+            health_color = discord.Color.red()
         
-        embed.set_footer(text="Add at least 2 options, then click 'Finish'")
+        embed.add_field(
+            name="🏥 Economy Health Score",
+            value=f"{health_status} ({health_score}/100)",
+            inline=True
+        )
         
-        if self.message:
-            await self.message.edit(embed=embed)
-    
-    @discord.ui.button(label="Add Option", style=discord.ButtonStyle.green)
-    async def add_option(self, interaction: discord.Interaction, button: Button):
-        """Add a new option to the market."""
-        modal = AddOptionModal()
-        await interaction.response.send_modal(modal)
-        await modal.wait()
-        
-        if modal.option_text:
-            self.options.append(modal.option_text)
-            await self.update_embed()
-    
-    @discord.ui.button(label="Finish", style=discord.ButtonStyle.primary)
-    async def finish(self, interaction: discord.Interaction, button: Button):
-        """Finish creating the market."""
-        if len(self.options) < 2:
-            await interaction.response.send_message("❌ You need at least 2 options.", ephemeral=True)
-            return
-        
-        await interaction.response.defer()
-        
-        try:
-            # Add options to database
-            for i, option_text in enumerate(self.options):
-                await self.cog.local_db.execute("""
-                    INSERT INTO market_options (market_id, option_index, option_text)
-                    VALUES (?, ?, ?)
-                """, (self.market_id, i + 1, option_text))
-            
-            # Update market status to open
-            await self.cog.local_db.execute("""
-                UPDATE prediction_markets
-                SET status = 'open'
-                WHERE market_id = ?
-            """, (self.market_id,))
-            
-            await self.cog.local_db.commit()
-            
-            # Disable buttons
-            for item in self.children:
-                item.disabled = True
-            
-            embed = discord.Embed(
-                title="✅ Market Created",
-                description=f"**Question:** {self.question}",
-                color=discord.Color.green()
-            )
-            
-            options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(self.options)])
-            embed.add_field(name="Options", value=options_text, inline=False)
-            embed.add_field(name="Market ID", value=f"`{self.market_id}`", inline=False)
-            embed.add_field(name="Status", value="🟢 Open for betting", inline=False)
-            
-            await self.message.edit(embed=embed, view=self)
-            self.stop()
-            
-        except Exception as e:
-            log.error(f"Error finishing market creation: {e}", exc_info=True)
-            await interaction.followup.send("❌ Failed to create market.", ephemeral=True)
-    
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
-    async def cancel(self, interaction: discord.Interaction, button: Button):
-        """Cancel market creation."""
-        await interaction.response.defer()
-        
-        # Delete the market from database
-        await self.cog.local_db.execute("""
-            DELETE FROM prediction_markets WHERE market_id = ?
-        """, (self.market_id,))
-        await self.cog.local_db.commit()
-        
-        # Disable buttons
-        for item in self.children:
-            item.disabled = True
-        
-        await self.message.edit(content="❌ Market creation cancelled.", embed=None, view=self)
-        self.stop()
-
-
-class AddOptionModal(Modal, title="Add Market Option"):
-    """Modal for adding an option to a prediction market."""
-    
-    option_text = TextInput(
-        label="Option Description",
-        style=TextStyle.short,
-        placeholder="e.g., Yes, No, Maybe",
-        required=True,
-        max_length=200
-    )
-    
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.option_text = None
-    
-    async def on_submit(self, interaction: discord.Interaction):
-        self.option_text = self.option_text.value.strip()
-        await interaction.response.defer()
+        embed.color = health_color
+        embed.set_footer(text=f"Requested by {ctx.author.name}")
+        await ctx.send(embed=embed)
 
     @currency.command(name="markets")
     async def list_markets(self, ctx: commands.Context, status: str = "open"):
@@ -2120,62 +1910,6 @@ class AddOptionModal(Modal, title="Add Market Option"):
         
         await ctx.send(embed=embed)
 
-        # Inequality metric
-        if median_wealth > 0:
-            inequality = ((avg_wealth - median_wealth) / median_wealth) * 100
-            status = "🟢 Low" if inequality < 50 else "🟡 Medium" if inequality < 100 else "🔴 High"
-            embed.add_field(
-                name="⚖️ Wealth Inequality",
-                value=f"{status} ({inequality:.1f}%)",
-                inline=True
-            )
-        
-        # Health score (0-100)
-        health_score = 0
-        
-        # Active player participation (up to 30 points)
-        if total_players > 0:
-            health_score += min(30, total_players)
-        
-        # Transaction activity (up to 40 points)
-        if volume_24h['count'] > 0:
-            health_score += min(40, volume_24h['count'] * 2)
-        
-        # Wealth distribution (up to 30 points - lower inequality is better)
-        if median_wealth > 0:
-            inequality = ((avg_wealth - median_wealth) / median_wealth) * 100
-            if inequality < 50:
-                health_score += 30
-            elif inequality < 100:
-                health_score += 20
-            else:
-                health_score += 10
-        
-        health_score = min(100, health_score)
-        
-        if health_score >= 80:
-            health_status = "🟢 Excellent"
-            health_color = discord.Color.green()
-        elif health_score >= 60:
-            health_status = "🟡 Good"
-            health_color =discord.Color.gold()
-        elif health_score >= 40:
-            health_status = "🟠 Fair"
-            health_color = discord.Color.orange()
-        else:
-            health_status = "🔴 Poor"
-            health_color = discord.Color.red()
-        
-        embed.add_field(
-            name="🏥 Economy Health Score",
-            value=f"{health_status} ({health_score}/100)",
-            inline=True
-        )
-        
-        embed.color = health_color
-        embed.set_footer(text=f"Requested by {ctx.author.name}")
-        await ctx.send(embed=embed)
-
     @currency.command(name="gamblingstats")
     async def gambling_stats(self, ctx: commands.Context, user: Optional[discord.Member] = None):
         """Shows gambling statistics for yourself or another user."""
@@ -2216,6 +1950,272 @@ class AddOptionModal(Modal, title="Add Market Option"):
             embed.add_field(name=stat['game_type'].title(), value=value, inline=False)
         
         await ctx.send(embed=embed)
+        
+    @currency.command(name="createmarket")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def create_market(self, ctx: commands.Context, *, question: str):
+        """Creates a new prediction market (Admin only).
+        
+        After creating the market, you'll be prompted to add options.
+        Example: /currency createmarket Will the server reach 100 players today?
+        """
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        # Generate unique market ID
+        market_id = f"{ctx.guild.id}_{int(time.time())}_{ctx.author.id}"
+        
+        # Create the market
+        try:
+            await self.local_db.execute("""
+                INSERT INTO prediction_markets (guild_id, market_id, question, created_by_id, status)
+                VALUES (?, ?, ?, ?, 'setup')
+            """, (ctx.guild.id, market_id, question, ctx.author.id))
+            await self.local_db.commit()
+        except Exception as e:
+            log.error(f"Error creating market: {e}", exc_info=True)
+            await ctx.send("❌ Failed to create market.", ephemeral=True)
+            return
+        
+        # Show option entry view
+        view = MarketOptionsView(self, market_id, question, ctx.guild.id)
+        embed = discord.Embed(
+            title="📊 Creating Prediction Market",
+            description=f"**Question:** {question}\n\nAdd betting options using the buttons below.",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Options Added", value="None yet", inline=False)
+        embed.set_footer(text="Add at least 2 options, then click 'Finish'")
+        
+        message = await ctx.send(embed=embed, view=view)
+        view.message = message
+
+    @currency.command(name="bet")
+    async def place_bet(self, ctx: commands.Context, market_id: str, option: int, amount: int):
+        """Place a bet on a prediction market.
+        
+        Args:
+            market_id: The ID of the market (from /currency markets)
+            option: The option number to bet on
+            amount: Amount of coins to wager
+        """
+        if amount <= 0:
+            await ctx.send("❌ You must bet a positive amount.", ephemeral=True)
+            return
+        
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("❌ Database connection not configured.", ephemeral=True)
+            return
+        
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        # Get player ID
+        player_id = await get_player_id_from_discord(pool, ctx.author.id)
+        if not player_id:
+            await ctx.send("❌ Your Discord account is not linked to an SS14 account.", ephemeral=True)
+            return
+        
+        # Check balance
+        balance = await get_player_currency(pool, player_id)
+        if balance < amount:
+            await ctx.send(f"❌ Insufficient funds. You have {balance:,} coins but need {amount:,}.", ephemeral=True)
+            return
+        
+        # Verify market exists and is open
+        async with self.local_db.execute("""
+            SELECT question, status FROM prediction_markets
+            WHERE market_id = ? AND guild_id = ?
+        """, (market_id, ctx.guild.id)) as cursor:
+            market = await cursor.fetchone()
+        
+        if not market:
+            await ctx.send("❌ Market not found.", ephemeral=True)
+            return
+        
+        if market[1] != 'open':
+            await ctx.send(f"❌ This market is {market[1]} and not accepting bets.", ephemeral=True)
+            return
+        
+        # Verify option exists
+        async with self.local_db.execute("""
+            SELECT option_text FROM market_options
+            WHERE market_id = ? AND option_index = ?
+        """, (market_id, option)) as cursor:
+            option_data = await cursor.fetchone()
+        
+        if not option_data:
+            await ctx.send(f"❌ Invalid option number {option}.", ephemeral=True)
+            return
+        
+        # Deduct coins from player (atomically)
+        success, old_balance, new_balance = await add_player_currency(pool, player_id, -amount)
+        if not success:
+            await ctx.send("❌ Failed to deduct coins. Please try again.", ephemeral=True)
+            return
+        
+        # Record the bet
+        try:
+            await self.local_db.execute("""
+                INSERT INTO prediction_bets (market_id, player_id, guild_id, option_index, amount)
+                VALUES (?, ?, ?, ?, ?)
+            """, (market_id, str(player_id), ctx.guild.id, option, amount))
+            await self.local_db.commit()
+            
+            # Log transaction
+            await self.log_transaction(
+                ctx.guild.id, "market_bet", amount,
+                from_player_id=player_id,
+                balance_before=old_balance,
+                balance_after=new_balance,
+                notes=f"Bet on market {market_id[:16]}... option {option}"
+            )
+            
+            embed = discord.Embed(
+                title="✅ Bet Placed",
+                description=f"**Question:** {market[0]}",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Your Bet", value=f"Option {option}: {option_data[0]}", inline=False)
+            embed.add_field(name="Amount Wagered", value=f"{amount:,} coins", inline=True)
+            embed.add_field(name="New Balance", value=f"{new_balance:,} coins", inline=True)
+            embed.set_footer(text=f"Market ID: {market_id}")
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            # Refund if bet recording fails
+            log.error(f"Error recording bet: {e}", exc_info=True)
+            await add_player_currency(pool, player_id, amount)
+            await ctx.send("❌ Failed to record bet. Your coins have been refunded.", ephemeral=True)
+
+class MarketOptionsView(View):
+    """View for adding options to a prediction market during creation."""
+    def __init__(self, cog: 'SS14Currency', market_id: str, question: str, guild_id: int):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.market_id = market_id
+        self.question = question
+        self.guild_id = guild_id
+        self.options = []
+        self.message = None
+    
+    async def update_embed(self):
+        """Update the embed to show current options."""
+        embed = discord.Embed(
+            title="📊 Creating Prediction Market",
+            description=f"**Question:** {self.question}\n\nAdd betting options using the buttons below.",
+            color=discord.Color.blue()
+        )
+        
+        if self.options:
+            options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(self.options)])
+            embed.add_field(name="Options Added", value=options_text, inline=False)
+        else:
+            embed.add_field(name="Options Added", value="None yet", inline=False)
+        
+        embed.set_footer(text="Add at least 2 options, then click 'Finish'")
+        
+        if self.message:
+            await self.message.edit(embed=embed)
+    
+    @discord.ui.button(label="Add Option", style=discord.ButtonStyle.green)
+    async def add_option(self, interaction: discord.Interaction, button: Button):
+        """Add a new option to the market."""
+        modal = AddOptionModal()
+        await interaction.response.send_modal(modal)
+        await modal.wait()
+        
+        if modal.option_text:
+            self.options.append(modal.option_text)
+            await self.update_embed()
+    
+    @discord.ui.button(label="Finish", style=discord.ButtonStyle.primary)
+    async def finish(self, interaction: discord.Interaction, button: Button):
+        """Finish creating the market."""
+        if len(self.options) < 2:
+            await interaction.response.send_message("❌ You need at least 2 options.", ephemeral=True)
+            return
+        
+        await interaction.response.defer()
+        
+        try:
+            # Add options to database
+            for i, option_text in enumerate(self.options):
+                await self.cog.local_db.execute("""
+                    INSERT INTO market_options (market_id, option_index, option_text)
+                    VALUES (?, ?, ?)
+                """, (self.market_id, i + 1, option_text))
+            
+            # Update market status to open
+            await self.cog.local_db.execute("""
+                UPDATE prediction_markets
+                SET status = 'open'
+                WHERE market_id = ?
+            """, (self.market_id,))
+            
+            await self.cog.local_db.commit()
+            
+            # Disable buttons
+            for item in self.children:
+                item.disabled = True
+            
+            embed = discord.Embed(
+                title="✅ Market Created",
+                description=f"**Question:** {self.question}",
+                color=discord.Color.green()
+            )
+            
+            options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(self.options)])
+            embed.add_field(name="Options", value=options_text, inline=False)
+            embed.add_field(name="Market ID", value=f"`{self.market_id}`", inline=False)
+            embed.add_field(name="Status", value="🟢 Open for betting", inline=False)
+            
+            await self.message.edit(embed=embed, view=self)
+            self.stop()
+            
+        except Exception as e:
+            log.error(f"Error finishing market creation: {e}", exc_info=True)
+            await interaction.followup.send("❌ Failed to create market.", ephemeral=True)
+    
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
+    async def cancel(self, interaction: discord.Interaction, button: Button):
+        """Cancel market creation."""
+        await interaction.response.defer()
+        
+        # Delete the market from database
+        await self.cog.local_db.execute("""
+            DELETE FROM prediction_markets WHERE market_id = ?
+        """, (self.market_id,))
+        await self.cog.local_db.commit()
+        
+        # Disable buttons
+        for item in self.children:
+            item.disabled = True
+        
+        await self.message.edit(content="❌ Market creation cancelled.", embed=None, view=self)
+        self.stop()
+
+
+class AddOptionModal(Modal, title="Add Market Option"):
+    """Modal for adding an option to a prediction market."""
+    
+    option_text = TextInput(
+        label="Option Description",
+        style=TextStyle.short,
+        placeholder="e.g., Yes, No, Maybe",
+        required=True,
+        max_length=200
+    )
+    
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.option_text = None
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        self.option_text = self.option_text.value.strip()
+        await interaction.response.defer()
 
     @app_commands.command(name="coinsetdb")
     @app_commands.guild_only()
