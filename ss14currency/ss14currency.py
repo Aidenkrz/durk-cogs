@@ -1637,7 +1637,7 @@ class SS14Currency(commands.Cog):
             )
             
             embed.add_field(
-                name=question[:100],
+                name=discord.utils.escape_markdown(question[:100]),
                 value=field_value,
                 inline=False
             )
@@ -1687,7 +1687,7 @@ class SS14Currency(commands.Cog):
         
         embed = discord.Embed(
             title="📊 Market Information",
-            description=f"**{question}**",
+            description=f"**{discord.utils.escape_markdown(question)}**",
             color=discord.Color.blue() if status == 'open' else discord.Color.green() if status == 'resolved' else discord.Color.red()
         )
         
@@ -1705,7 +1705,7 @@ class SS14Currency(commands.Cog):
             
             winner_mark = " 🏆" if winning_option == option_idx else ""
             field_name = f"Option {option_idx}{winner_mark}"
-            field_value = f"{option_text}\n**Bets:** {bet_count} | **Wagered:** {wagered:,} coins"
+            field_value = f"{discord.utils.escape_markdown(option_text)}\n**Bets:** {bet_count} | **Wagered:** {wagered:,} coins"
             
             embed.add_field(name=field_name, value=field_value, inline=False)
         
@@ -1820,10 +1820,10 @@ class SS14Currency(commands.Cog):
         
         embed = discord.Embed(
             title="✅ Market Resolved",
-            description=f"**Question:** {market[0]}",
+            description=f"**Question:** {discord.utils.escape_markdown(market[0])}",
             color=discord.Color.green()
         )
-        embed.add_field(name="Winning Option", value=f"Option {winning_option}: {option[0]}", inline=False)
+        embed.add_field(name="Winning Option", value=f"Option {winning_option}: {discord.utils.escape_markdown(option[0])}", inline=False)
         embed.add_field(name="Total Pool", value=f"{total_pool:,} coins", inline=True)
         embed.add_field(name="Winners Paid", value=f"{winners_paid} player(s)", inline=True)
         embed.add_field(name="Total Distributed", value=f"{total_distributed:,} coins", inline=True)
@@ -1901,7 +1901,7 @@ class SS14Currency(commands.Cog):
         
         embed = discord.Embed(
             title="❌ Market Cancelled",
-            description=f"**Question:** {market[0]}",
+            description=f"**Question:** {discord.utils.escape_markdown(market[0])}",
             color=discord.Color.red()
         )
         embed.add_field(name="Players Refunded", value=f"{refunded_count} player(s)", inline=True)
@@ -1962,8 +1962,9 @@ class SS14Currency(commands.Cog):
         if self.local_db is None:
             await self.initialize_local_db()
         
-        # Generate unique market ID
-        market_id = f"{ctx.guild.id}_{int(time.time())}_{ctx.author.id}"
+        # Generate unique market ID (short 8-character hex)
+        import secrets
+        market_id = f"{ctx.guild.id}_{secrets.token_hex(4)}"
         
         # Create the market
         try:
@@ -1981,7 +1982,7 @@ class SS14Currency(commands.Cog):
         view = MarketOptionsView(self, market_id, question, ctx.guild.id)
         embed = discord.Embed(
             title="📊 Creating Prediction Market",
-            description=f"**Question:** {question}\n\nAdd betting options using the buttons below.",
+            description=f"**Question:** {discord.utils.escape_markdown(question)}\n\nAdd betting options using the buttons below.",
             color=discord.Color.blue()
         )
         embed.add_field(name="Options Added", value="None yet", inline=False)
@@ -2283,11 +2284,11 @@ class MarketOptionsView(View):
             
             embed = discord.Embed(
                 title="✅ Market Created",
-                description=f"**Question:** {self.question}",
+                description=f"**Question:** {discord.utils.escape_markdown(self.question)}",
                 color=discord.Color.green()
             )
             
-            options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(self.options)])
+            options_text = "\n".join([f"{i+1}. {discord.utils.escape_markdown(opt)}" for i, opt in enumerate(self.options)])
             embed.add_field(name="Options", value=options_text, inline=False)
             embed.add_field(name="Market ID", value=f"`{self.market_id}`", inline=False)
             embed.add_field(name="Status", value="🟢 Open for betting", inline=False)
