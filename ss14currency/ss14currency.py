@@ -81,21 +81,31 @@ async def get_user_name_from_id(session: aiohttp.ClientSession, user_id: uuid.UU
         log.error(f"Error querying auth API for {user_id}: {e}", exc_info=True)
         return None
 
-async def transfer_currency(pool: asyncpg.Pool, from_player_id: uuid.UUID, to_player_id: uuid.UUID, amount: int) -> bool:
-    """Atomically transfers currency from one player to another."""
+async def transfer_currency(pool: asyncpg.Pool, from_player_id: uuid.UUID, to_player_id: uuid.UUID, amount: int) -> Optional[Dict[str, int]]:
+    """Atomically transfers currency from one player to another and returns their old and new balances."""
     conn = await pool.acquire()
     try:
         async with conn.transaction():
             sender_balance = await conn.fetchval("SELECT server_currency FROM player WHERE user_id = $1 FOR UPDATE;", from_player_id)
             if sender_balance is None or sender_balance < amount:
-                return False
+                return None
+
+            recipient_balance = await conn.fetchval("SELECT server_currency FROM player WHERE user_id = $1 FOR UPDATE;", to_player_id)
+            if recipient_balance is None:
+                return None
 
             await conn.execute("UPDATE player SET server_currency = server_currency - $1 WHERE user_id = $2;", amount, from_player_id)
             await conn.execute("UPDATE player SET server_currency = server_currency + $1 WHERE user_id = $2;", amount, to_player_id)
-            return True
+
+            return {
+                "sender_old": sender_balance,
+                "sender_new": sender_balance - amount,
+                "recipient_old": recipient_balance,
+                "recipient_new": recipient_balance + amount
+            }
     except Exception as e:
         log.error(f"Error during currency transfer from {from_player_id} to {to_player_id}: {e}", exc_info=True)
-        return False
+        return None
     finally:
         await pool.release(conn)
 
@@ -379,19 +389,26 @@ class SS14Currency(commands.Cog):
             await ctx.send("You cannot transfer coins to yourself.", ephemeral=True)
             return
 
-        success = await transfer_currency(pool, sender_id, recipient_id, amount)
-        if success:
+        transfer_details = await transfer_currency(pool, sender_id, recipient_id, amount)
+        if transfer_details:
             sender_name = await get_user_name_from_id(self.session, sender_id)
             embed = discord.Embed(title="Transfer Successful", color=discord.Color.green())
-            embed.add_field(name="Sender", value=f"{ctx.author.display_name} ({sender_name})", inline=False)
+
+            sender_field_name = f"Sender: {ctx.author.display_name} ({sender_name})"
+            sender_field_value = f"`{transfer_details['sender_old']}` -> `{transfer_details['sender_new']}`"
+            embed.add_field(name=sender_field_name, value=sender_field_value, inline=False)
+
             if recipient_discord_name:
-                embed.add_field(name="Recipient", value=f"{recipient_discord_name} ({recipient_name})", inline=False)
+                recipient_field_name = f"Recipient: {recipient_discord_name} ({recipient_name})"
             else:
-                embed.add_field(name="Recipient", value=recipient_name, inline=False)
+                recipient_field_name = f"Recipient: {recipient_name}"
+            recipient_field_value = f"`{transfer_details['recipient_old']}` -> `{transfer_details['recipient_new']}`"
+            embed.add_field(name=recipient_field_name, value=recipient_field_value, inline=False)
+
             embed.add_field(name="Amount", value=f"{amount} coins", inline=False)
             await ctx.send(embed=embed)
         else:
-            await ctx.send("The transfer failed. This may be due to insufficient funds.", ephemeral=True)
+            await ctx.send("The transfer failed. This may be due to insufficient funds or an issue with the recipient's account.", ephemeral=True)
 
     @currency.command(name="leaderboard")
     async def leaderboard(self, ctx: commands.Context):
