@@ -2048,6 +2048,126 @@ class SS14Currency(commands.Cog):
         if not option_data:
             await ctx.send(f"❌ Invalid option number {option}.", ephemeral=True)
             return
+
+    @app_commands.command(name="coinsetdb")
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(manage_guild=True)
+    @app_commands.describe()
+    async def coinsetdb_slash(self, interaction: discord.Interaction):
+        """Opens a modal to configure the database connection for this server (Admins only)."""
+        if not interaction.guild_id:
+            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
+            return
+        await interaction.response.send_modal(DbConfigModal(self, interaction.guild_id))
+
+    async def cog_unload(self):
+        await self.session.close()
+        
+        # Close SS14 database pools
+        guild_ids = list(self.guild_pools.keys())
+        for guild_id in guild_ids:
+            pool = self.guild_pools.pop(guild_id)
+            if pool:
+                await pool.close()
+        
+        # Close local SQLite database
+        if self.local_db:
+            await self.local_db.close()
+        
+        log.info("All database connections closed.")
+
+    async def get_user_id_from_name(self, username: str) -> Optional[uuid.UUID]:
+        """Queries the SS14 auth API for a user's UUID by their username."""
+        url = f"https://auth.spacestation14.com/api/query/name?name={username}"
+        try:
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return uuid.UUID(data["userId"])
+                else:
+                    log.warning(f"API query for {username} failed with status {response.status}")
+                    return None
+        except aiohttp.ClientError as e:
+            log.error(f"Error querying auth API for {username}: {e}", exc_info=True)
+            return None
+
+    @currency.command(name="coinflip")
+    @commands.cooldown(rate=1, per=30.0, type=commands.BucketType.user)
+    async def coinflip(self, ctx: commands.Context, amount: int, opponent: discord.Member = None):
+        """Challenges another user to a coinfli for a specified amount.
+        
+        If no opponent is specified, the challenge will be open for anyone to accept.
+        """
+        if opponent and opponent.id == ctx.author.id:
+            await ctx.send("You cannot challenge yourself to a coinflip.", ephemeral=True)
+            return
+            
+        if opponent and opponent.bot:
+            await ctx.send("You cannot challenge a bot to a coinflip.", ephemeral=True)
+            return
+
+        if amount <= 0:
+            await ctx.send("You must wager a positive amount of coins.", ephemeral=True)
+            return
+
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("Database connection is not configured for this server.", ephemeral=True)
+            return
+
+        challenger_id = await get_player_id_from_discord(pool, ctx.author.id)
+        if not challenger_id:
+            await ctx.send("You must have a linked SS14 account to start a coinflip.", ephemeral=True)
+            return
+        
+        challenger_balance = await get_player_currency(pool, challenger_id)
+        if challenger_balance < amount:
+            await ctx.send(f"You do not have enough coins to wager {amount}.", ephemeral=True)
+            return
+
+        if opponent:
+            opponent_id = await get_player_id_from_discord(pool, opponent.id)
+            if not opponent_id:
+                await ctx.send(f"{opponent.mention} does not have a linked SS14 account and cannot be challenged.", ephemeral=True)
+                return
+
+            opponent_balance = await get_player_currency(pool, opponent_id)
+            if opponent_balance < amount:
+                await ctx.send(f"{opponent.mention} does not have enough coins to accept this wager.", ephemeral=True)
+                return
+            
+            view = CoinflipView(self, ctx.author, opponent, amount, pool, ctx.guild.id)
+            
+            embed = discord.Embed(
+                title="⚔️ Coinflip Challenge! ⚔️",
+                description=f"{ctx.author.mention} has challenged {opponent.mention} to a coinflip for **{amount}** coins!",
+                color=discord.Color.orange()
+            )
+            message = await ctx.send(embed=embed, view=view)
+            view.message = message
+        else:
+            view = OpenCoinflipView(self, ctx.author, amount, pool, ctx.guild.id)
+            embed = discord.Embed(
+                title="⚔️ Open Coinflip Challenge! ⚔️",
+                description=f"{ctx.author.mention} has started an open coinflip challenge for **{amount}** coins! Anyone can accept.",
+                color=discord.Color.blue()
+            )
+            message = await ctx.send(embed=embed, view=view)
+            view.message = message
+
+    @coinflip.error
+    async def coinflip_error(self, ctx: commands.Context, error):
+        if isinstance(error, commands.CommandOnCooldown):
+            ready_timestamp = int(time.time() + error.retry_after)
+            await ctx.send(
+                f"🎰 Slow down! You can gamble again <t:{ready_timestamp}:R>.",
+                ephemeral=True
+            )
+        else:
+            raise error
+
+# End of SS14Currency class
+
         
         # Deduct coins from player (atomically)
         success, old_balance, new_balance = await add_player_currency(pool, player_id, -amount)
@@ -2217,122 +2337,8 @@ class AddOptionModal(Modal, title="Add Market Option"):
         self.option_text = self.option_text.value.strip()
         await interaction.response.defer()
 
-    @app_commands.command(name="coinsetdb")
-    @app_commands.guild_only()
-    @app_commands.checks.has_permissions(manage_guild=True)
-    @app_commands.describe()
-    async def coinsetdb_slash(self, interaction: discord.Interaction):
-        """Opens a modal to configure the database connection for this server (Admins only)."""
-        if not interaction.guild_id:
-            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-            return
-        await interaction.response.send_modal(DbConfigModal(self, interaction.guild_id))
 
-    async def cog_unload(self):
-        await self.session.close()
-        
-        # Close SS14 database pools
-        guild_ids = list(self.guild_pools.keys())
-        for guild_id in guild_ids:
-            pool = self.guild_pools.pop(guild_id)
-            if pool:
-                await pool.close()
-        
-        # Close local SQLite database
-        if self.local_db:
-            await self.local_db.close()
-        
-        log.info("All database connections closed.")
-
-    async def get_user_id_from_name(self, username: str) -> Optional[uuid.UUID]:
-        """Queries the SS14 auth API for a user's UUID by their username."""
-        url = f"https://auth.spacestation14.com/api/query/name?name={username}"
-        try:
-            async with self.session.get(url) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return uuid.UUID(data["userId"])
-                else:
-                    log.warning(f"API query for {username} failed with status {response.status}")
-                    return None
-        except aiohttp.ClientError as e:
-            log.error(f"Error querying auth API for {username}: {e}", exc_info=True)
-            return None
-
-    @currency.command(name="coinflip")
-    @commands.cooldown(rate=1, per=30.0, type=commands.BucketType.user)
-    async def coinflip(self, ctx: commands.Context, amount: int, opponent: discord.Member = None):
-        """Challenges another user to a coinflip for a specified amount.
-        
-        If no opponent is specified, the challenge will be open for anyone to accept.
-        """
-        if opponent and opponent.id == ctx.author.id:
-            await ctx.send("You cannot challenge yourself to a coinflip.", ephemeral=True)
-            return
-            
-        if opponent and opponent.bot:
-            await ctx.send("You cannot challenge a bot to a coinflip.", ephemeral=True)
-            return
-
-        if amount <= 0:
-            await ctx.send("You must wager a positive amount of coins.", ephemeral=True)
-            return
-
-        pool = await self.get_pool_for_guild(ctx.guild.id)
-        if not pool:
-            await ctx.send("Database connection is not configured for this server.", ephemeral=True)
-            return
-
-        challenger_id = await get_player_id_from_discord(pool, ctx.author.id)
-        if not challenger_id:
-            await ctx.send("You must have a linked SS14 account to start a coinflip.", ephemeral=True)
-            return
-        
-        challenger_balance = await get_player_currency(pool, challenger_id)
-        if challenger_balance < amount:
-            await ctx.send(f"You do not have enough coins to wager {amount}.", ephemeral=True)
-            return
-
-        if opponent:
-            opponent_id = await get_player_id_from_discord(pool, opponent.id)
-            if not opponent_id:
-                await ctx.send(f"{opponent.mention} does not have a linked SS14 account and cannot be challenged.", ephemeral=True)
-                return
-
-            opponent_balance = await get_player_currency(pool, opponent_id)
-            if opponent_balance < amount:
-                await ctx.send(f"{opponent.mention} does not have enough coins to accept this wager.", ephemeral=True)
-                return
-            
-            view = CoinflipView(self, ctx.author, opponent, amount, pool, ctx.guild.id)
-            
-            embed = discord.Embed(
-                title="⚔️ Coinflip Challenge! ⚔️",
-                description=f"{ctx.author.mention} has challenged {opponent.mention} to a coinflip for **{amount}** coins!",
-                color=discord.Color.orange()
-            )
-            message = await ctx.send(embed=embed, view=view)
-            view.message = message
-        else:
-            view = OpenCoinflipView(self, ctx.author, amount, pool, ctx.guild.id)
-            embed = discord.Embed(
-                title="⚔️ Open Coinflip Challenge! ⚔️",
-                description=f"{ctx.author.mention} has started an open coinflip challenge for **{amount}** coins! Anyone can accept.",
-                color=discord.Color.blue()
-            )
-            message = await ctx.send(embed=embed, view=view)
-            view.message = message
-
-    @coinflip.error
-    async def coinflip_error(self, ctx: commands.Context, error):
-        if isinstance(error, commands.CommandOnCooldown):
-            ready_timestamp = int(time.time() + error.retry_after)
-            await ctx.send(
-                f"🎰 Slow down! You can gamble again <t:{ready_timestamp}:R>.",
-                ephemeral=True
-            )
-        else:
-            raise error
+# End of view/modal classes, continue with coinflip views below
 
 class OpenCoinflipView(View):
     def __init__(self, cog: 'SS14Currency', challenger: discord.Member, amount: int, pool: asyncpg.Pool, guild_id: int):
