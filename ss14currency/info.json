@@ -14,7 +14,8 @@
     ],
     "requirements": [
         "asyncpg",
-        "aiohttp"
+        "aiohttp",
+        "aiosqlite"
     ],
     "required_cogs": {},
     "min_bot_version": "3.5.0",
