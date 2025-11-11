@@ -2247,8 +2247,8 @@ class MarketOptionsView(View):
         await interaction.response.send_modal(modal)
         await modal.wait()
         
-        if modal.option_text:
-            self.options.append(modal.option_text)
+        if modal.submitted_text:
+            self.options.append(modal.submitted_text)
             await self.update_embed()
     
     @discord.ui.button(label="Finish", style=discord.ButtonStyle.primary)
