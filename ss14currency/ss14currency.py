@@ -968,12 +968,24 @@ class SS14Currency(commands.Cog):
             timestamp = tx['timestamp']
             notes = tx['notes'] or "N/A"
             
-            # Format transaction type
+            # Get other party information
+            other_party = ""
             if tx_type == "transfer":
                 if str(player_id) == tx['from_player_id']:
                     direction = "📤 Sent"
+                    if tx['to_player_id']:
+                        other_player_id = uuid.UUID(tx['to_player_id'])
+                        other_name = await get_user_name_from_id(self.session, other_player_id)
+                        other_party = f"**To:** {discord.utils.escape_markdown(other_name or 'Unknown')}\n"
                 else:
                     direction = "📥 Received"
+                    if tx['from_player_id']:
+                        other_player_id = uuid.UUID(tx['from_player_id'])
+                        other_name = await get_user_name_from_id(self.session, other_player_id)
+                        other_party = f"**From:** {discord.utils.escape_markdown(other_name or 'Unknown')}\n"
+            elif tx_type == "gambling":
+                direction = "🎲 Gambling"
+                # Amount will be positive for wins, negative for losses
             elif tx_type == "admin_set":
                 direction = "⚙️ Balance Set"
             elif tx_type == "admin_add":
@@ -983,13 +995,14 @@ class SS14Currency(commands.Cog):
             
             balance_info = ""
             if tx['balance_before'] is not None and tx['balance_after'] is not None:
-                balance_info = f"\nBalance: `{tx['balance_before']:,}` ➜ `{tx['balance_after']:,}`"
+                balance_info = f"**Balance:** `{tx['balance_before']:,}` ➜ `{tx['balance_after']:,}`\n"
             
             field_value = (
-                f"**Amount:** {amount:,} coins\n"
+                f"{other_party}"
+                f"**Amount:** {amount:+,} coins\n"
+                f"{balance_info}"
                 f"**Time:** {timestamp[:19]}\n"
                 f"**Notes:** {notes}"
-                f"{balance_info}"
             )
             
             embed.add_field(
@@ -1163,7 +1176,7 @@ class SS14Currency(commands.Cog):
                     inline=False
                 )
             
-        elif category in ["gambling", "gambler", "gamblers"]:
+        elif category in ["gambling", "gambler", "gamblers", "games"]:
             # Gambling leaderboard (most games played)
             if self.local_db is None:
                 await self.initialize_local_db()
@@ -1202,6 +1215,90 @@ class SS14Currency(commands.Cog):
                 embed.add_field(
                     name=f"{medal} {discord.utils.escape_markdown(username)}",
                     value=f"**Games:** {games:,} | **Net:** {net:+,} coins",
+                    inline=False
+                )
+        
+        elif category in ["profit", "winners", "lucky"]:
+            # Gambling profit leaderboard (biggest winners)
+            if self.local_db is None:
+                await self.initialize_local_db()
+            
+            async with self.local_db.execute("""
+                SELECT player_id, SUM(total_won - total_lost) as net_profit, SUM(total_games) as games
+                FROM gambling_stats
+                WHERE guild_id = ?
+                GROUP BY player_id
+                HAVING net_profit > 0
+                ORDER BY net_profit DESC
+                LIMIT 10
+            """, (ctx.guild.id,)) as cursor:
+                rows = await cursor.fetchall()
+            
+            if not rows:
+                await ctx.send("No gambling profit data available.")
+                return
+            
+            embed = discord.Embed(
+                title="💰 Gambling Profit Leaderboard",
+                description="Top 10 biggest winners",
+                color=discord.Color.green()
+            )
+            
+            for i, row in enumerate(rows, 1):
+                player_id = uuid.UUID(row[0])
+                username = await get_user_name_from_id(self.session, player_id)
+                if not username:
+                    username = str(player_id)[:8]
+                
+                profit = row[1]
+                games = row[2]
+                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                
+                embed.add_field(
+                    name=f"{medal} {discord.utils.escape_markdown(username)}",
+                    value=f"**Profit:** +{profit:,} coins | **Games:** {games:,}",
+                    inline=False
+                )
+        
+        elif category in ["losses", "losers", "unlucky"]:
+            # Gambling losses leaderboard (biggest losers)
+            if self.local_db is None:
+                await self.initialize_local_db()
+            
+            async with self.local_db.execute("""
+                SELECT player_id, SUM(total_won - total_lost) as net_profit, SUM(total_games) as games
+                FROM gambling_stats
+                WHERE guild_id = ?
+                GROUP BY player_id
+                HAVING net_profit < 0
+                ORDER BY net_profit ASC
+                LIMIT 10
+            """, (ctx.guild.id,)) as cursor:
+                rows = await cursor.fetchall()
+            
+            if not rows:
+                await ctx.send("No gambling loss data available.")
+                return
+            
+            embed = discord.Embed(
+                title="📉 Gambling Losses Leaderboard",
+                description="Top 10 biggest losers",
+                color=discord.Color.red()
+            )
+            
+            for i, row in enumerate(rows, 1):
+                player_id = uuid.UUID(row[0])
+                username = await get_user_name_from_id(self.session, player_id)
+                if not username:
+                    username = str(player_id)[:8]
+                
+                loss = row[1]  # Will be negative
+                games = row[2]
+                medal = "💸" if i <= 3 else f"{i}."
+                
+                embed.add_field(
+                    name=f"{medal} {discord.utils.escape_markdown(username)}",
+                    value=f"**Loss:** {loss:,} coins | **Games:** {games:,}",
                     inline=False
                 )
         
@@ -1252,12 +1349,24 @@ class SS14Currency(commands.Cog):
                     inline=False
                 )
         else:
-            await ctx.send(f"❌ Unknown category `{category}`. Valid categories: **wealth**, **gambling**, **activity**", ephemeral=True)
+            await ctx.send(
+                f"❌ Unknown category `{category}`.\n\n"
+                f"**Valid categories:**\n"
+                f"• `wealth` - Richest players\n"
+                f"• `gambling` - Most active gamblers\n"
+                f"• `profit` - Biggest gambling winners\n"
+                f"• `losses` - Biggest gambling losers\n"
+                f"• `activity` - Most active traders",
+                ephemeral=True
+            )
             return
         
         # Add available categories to description
         current_desc = embed.description or ""
-        embed.description = f"{current_desc}\n\n💡 **Available categories:** `wealth`, `gambling`, `activity`"
+        embed.description = (
+            f"{current_desc}\n\n"
+            f"💡 **Categories:** `wealth` • `gambling` • `profit` • `losses` • `activity`"
+        )
         embed.set_footer(text=f"Category: {category} | Requested by {ctx.author.name}")
         await ctx.send(embed=embed)
 
@@ -1600,6 +1709,9 @@ class OpenCoinflipView(View):
             item.disabled = True
 
         if transfer_details:
+            winner_name = await get_user_name_from_id(self.cog.session, winner_player_id)
+            loser_name = await get_user_name_from_id(self.cog.session, loser_player_id)
+            
             # Record gambling statistics
             await self.cog.record_gambling_result(
                 self.guild_id, winner_player_id, "coinflip",
@@ -1610,8 +1722,23 @@ class OpenCoinflipView(View):
                 self.amount, False, -self.amount
             )
             
-            winner_name = await get_user_name_from_id(self.cog.session, winner_player_id)
-            loser_name = await get_user_name_from_id(self.cog.session, loser_player_id)
+            # Log gambling transactions
+            await self.cog.log_transaction(
+                self.guild_id, "gambling", self.amount,
+                from_player_id=loser_player_id,
+                to_player_id=winner_player_id,
+                balance_before=transfer_details['recipient_old'],
+                balance_after=transfer_details['recipient_new'],
+                notes=f"Coinflip win vs {loser_name}"
+            )
+            await self.cog.log_transaction(
+                self.guild_id, "gambling", -self.amount,
+                from_player_id=loser_player_id,
+                to_player_id=winner_player_id,
+                balance_before=transfer_details['sender_old'],
+                balance_after=transfer_details['sender_new'],
+                notes=f"Coinflip loss vs {winner_name}"
+            )
 
             embed = discord.Embed(title="Coinflip Result!", color=discord.Color.gold())
             embed.description = f"**{discord.utils.escape_markdown(winner.display_name)}** won the coinflip against **{discord.utils.escape_markdown(loser.display_name)}**!"
@@ -1683,6 +1810,9 @@ class CoinflipView(View):
             item.disabled = True
         
         if transfer_details:
+            winner_name = await get_user_name_from_id(self.cog.session, winner_player_id)
+            loser_name = await get_user_name_from_id(self.cog.session, loser_player_id)
+            
             # Record gambling statistics
             await self.cog.record_gambling_result(
                 self.guild_id, winner_player_id, "coinflip",
@@ -1693,8 +1823,23 @@ class CoinflipView(View):
                 self.amount, False, -self.amount
             )
             
-            winner_name = await get_user_name_from_id(self.cog.session, winner_player_id)
-            loser_name = await get_user_name_from_id(self.cog.session, loser_player_id)
+            # Log gambling transactions
+            await self.cog.log_transaction(
+                self.guild_id, "gambling", self.amount,
+                from_player_id=loser_player_id,
+                to_player_id=winner_player_id,
+                balance_before=transfer_details['recipient_old'],
+                balance_after=transfer_details['recipient_new'],
+                notes=f"Coinflip win vs {loser_name}"
+            )
+            await self.cog.log_transaction(
+                self.guild_id, "gambling", -self.amount,
+                from_player_id=loser_player_id,
+                to_player_id=winner_player_id,
+                balance_before=transfer_details['sender_old'],
+                balance_after=transfer_details['sender_new'],
+                notes=f"Coinflip loss vs {winner_name}"
+            )
 
             embed = discord.Embed(title="Coinflip Result!", color=discord.Color.gold())
             embed.description = f"**{discord.utils.escape_markdown(winner.display_name)}** won the coinflip against **{discord.utils.escape_markdown(loser.display_name)}**!"
