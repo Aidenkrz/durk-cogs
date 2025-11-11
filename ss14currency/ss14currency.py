@@ -111,22 +111,6 @@ async def transfer_currency(pool: asyncpg.Pool, from_player_id: uuid.UUID, to_pl
     finally:
         await pool.release(conn)
 
-COINFLIP_FRAMES = [
-    "```\n( ● )\n```",
-    "```\n( o )\n```",
-    "```\n( O )\n```",
-    "```\n( o )\n```",
-    "```\n( ● )\n```",
-    "```\n(   )\n```",
-    "```\n( ● )\n```"
-]
-
-async def play_coinflip_animation(message: discord.Message):
-    """Plays a coinflip animation by editing a message."""
-    for frame in COINFLIP_FRAMES:
-        await message.edit(content=frame, embed=None, view=None)
-        await asyncio.sleep(0.3)
-
 class DbConfigModal(Modal, title="Database Configuration"):
 
     db_user = TextInput(label="Database Username", style=TextStyle.short, required=True)
@@ -601,7 +585,6 @@ class OpenCoinflipView(View):
             item.disabled = True
 
         if transfer_details:
-            await play_coinflip_animation(self.message)
             winner_name = await get_user_name_from_id(self.cog.session, winner_player_id)
             loser_name = await get_user_name_from_id(self.cog.session, loser_player_id)
 
@@ -674,7 +657,6 @@ class CoinflipView(View):
             item.disabled = True
         
         if transfer_details:
-            await play_coinflip_animation(self.message)
             winner_name = await get_user_name_from_id(self.cog.session, winner_player_id)
             loser_name = await get_user_name_from_id(self.cog.session, loser_player_id)
 
