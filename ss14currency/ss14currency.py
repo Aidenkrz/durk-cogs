@@ -26,27 +26,52 @@ async def get_player_currency(pool: asyncpg.Pool, player_id: uuid.UUID) -> Optio
         query = "SELECT server_currency FROM player WHERE user_id = $1;"
         return await conn.fetchval(query, player_id)
 
-async def set_player_currency(pool: asyncpg.Pool, player_id: uuid.UUID, amount: int) -> bool:
-    """Sets the currency for a given player ID to a specific amount."""
+async def set_player_currency(pool: asyncpg.Pool, player_id: uuid.UUID, amount: int) -> tuple[bool, Optional[int]]:
+    """Sets the currency for a given player ID to a specific amount. Returns (success, old_balance)."""
+    if amount < 0:
+        log.warning(f"Attempted to set negative balance {amount} for player {player_id}")
+        return False, None
+    
     try:
         async with pool.acquire() as conn:
+            # Get old balance
+            old_balance = await conn.fetchval("SELECT server_currency FROM player WHERE user_id = $1;", player_id)
+            if old_balance is None:
+                return False, None
+            
             query = "UPDATE player SET server_currency = $1 WHERE user_id = $2;"
             await conn.execute(query, amount, player_id)
-            return True
+            return True, old_balance
     except Exception as e:
         log.error(f"Error setting currency for player {player_id}: {e}", exc_info=True)
-        return False
+        return False, None
 
-async def add_player_currency(pool: asyncpg.Pool, player_id: uuid.UUID, amount: int) -> bool:
-    """Adds an amount of currency to a given player ID. Amount can be negative."""
+async def add_player_currency(pool: asyncpg.Pool, player_id: uuid.UUID, amount: int) -> tuple[bool, Optional[int], Optional[int]]:
+    """Adds an amount of currency to a given player ID. Returns (success, old_balance, new_balance). Prevents negative balances."""
     try:
         async with pool.acquire() as conn:
-            query = "UPDATE player SET server_currency = server_currency + $1 WHERE user_id = $2;"
-            await conn.execute(query, amount, player_id)
-            return True
+            async with conn.transaction():
+                # Get current balance with row lock
+                old_balance = await conn.fetchval(
+                    "SELECT server_currency FROM player WHERE user_id = $1 FOR UPDATE;",
+                    player_id
+                )
+                if old_balance is None:
+                    return False, None, None
+                
+                new_balance = old_balance + amount
+                
+                # Negative balance protection
+                if new_balance < 0:
+                    log.warning(f"Transaction would result in negative balance for {player_id}: {old_balance} + {amount} = {new_balance}")
+                    return False, old_balance, None
+                
+                query = "UPDATE player SET server_currency = $1 WHERE user_id = $2;"
+                await conn.execute(query, new_balance, player_id)
+                return True, old_balance, new_balance
     except Exception as e:
         log.error(f"Error adding currency for player {player_id}: {e}", exc_info=True)
-        return False
+        return False, None, None
 
 async def get_leaderboard(pool: asyncpg.Pool) -> list:
     """Gets the top 10 players by currency."""
@@ -233,11 +258,13 @@ class SS14Currency(commands.Cog):
                 return None
 
     async def initialize_local_db(self):
-        """Initialize the local SQLite database for gambling stats."""
+        """Initialize the local SQLite database for gambling stats and transaction history."""
         if self.local_db is not None:
             return
             
         self.local_db = await aiosqlite.connect(self.local_db_path)
+        
+        # Gambling stats table
         await self.local_db.execute("""
             CREATE TABLE IF NOT EXISTS gambling_stats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -261,8 +288,41 @@ class SS14Currency(commands.Cog):
             CREATE INDEX IF NOT EXISTS idx_gambling_stats_player
             ON gambling_stats(guild_id, player_id)
         """)
+        
+        # Transaction history table
+        await self.local_db.execute("""
+            CREATE TABLE IF NOT EXISTS transaction_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                transaction_type TEXT NOT NULL,
+                from_player_id TEXT,
+                to_player_id TEXT,
+                amount INTEGER NOT NULL,
+                balance_before INTEGER,
+                balance_after INTEGER,
+                notes TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await self.local_db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transaction_guild
+            ON transaction_history(guild_id)
+        """)
+        await self.local_db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transaction_from
+            ON transaction_history(from_player_id)
+        """)
+        await self.local_db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transaction_to
+            ON transaction_history(to_player_id)
+        """)
+        await self.local_db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_transaction_timestamp
+            ON transaction_history(timestamp)
+        """)
+        
         await self.local_db.commit()
-        log.info("Local gambling stats database initialized.")
+        log.info("Local database initialized with gambling stats and transaction history.")
 
     async def resolve_player(
         self,
@@ -488,6 +548,137 @@ class SS14Currency(commands.Cog):
             for row in rows
         ]
 
+    async def log_transaction(
+        self,
+        guild_id: int,
+        transaction_type: str,
+        amount: int,
+        from_player_id: Optional[uuid.UUID] = None,
+        to_player_id: Optional[uuid.UUID] = None,
+        balance_before: Optional[int] = None,
+        balance_after: Optional[int] = None,
+        notes: Optional[str] = None
+    ) -> bool:
+        """Logs a transaction to the local database."""
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        try:
+            await self.local_db.execute("""
+                INSERT INTO transaction_history
+                (guild_id, transaction_type, from_player_id, to_player_id, amount, balance_before, balance_after, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                guild_id,
+                transaction_type,
+                str(from_player_id) if from_player_id else None,
+                str(to_player_id) if to_player_id else None,
+                amount,
+                balance_before,
+                balance_after,
+                notes
+            ))
+            await self.local_db.commit()
+            return True
+        except Exception as e:
+            log.error(f"Error logging transaction: {e}", exc_info=True)
+            return False
+
+    async def get_transaction_history(
+        self,
+        guild_id: int,
+        player_id: Optional[uuid.UUID] = None,
+        limit: int = 10
+    ) -> list:
+        """Gets transaction history from local database."""
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        player_id_str = str(player_id) if player_id else None
+        
+        if player_id_str:
+            query = """
+                SELECT transaction_type, from_player_id, to_player_id, amount,
+                       balance_before, balance_after, notes, timestamp
+                FROM transaction_history
+                WHERE guild_id = ? AND (from_player_id = ? OR to_player_id = ?)
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """
+            params = (guild_id, player_id_str, player_id_str, limit)
+        else:
+            query = """
+                SELECT transaction_type, from_player_id, to_player_id, amount,
+                       balance_before, balance_after, notes, timestamp
+                FROM transaction_history
+                WHERE guild_id = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """
+            params = (guild_id, limit)
+        
+        async with self.local_db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+        
+        return [
+            {
+                'type': row[0],
+                'from_player_id': row[1],
+                'to_player_id': row[2],
+                'amount': row[3],
+                'balance_before': row[4],
+                'balance_after': row[5],
+                'notes': row[6],
+                'timestamp': row[7]
+            }
+            for row in rows
+        ]
+
+    async def get_wealth_distribution(self, pool: asyncpg.Pool) -> dict:
+        """Gets wealth distribution statistics."""
+        async with pool.acquire() as conn:
+            stats = await conn.fetchrow("""
+                SELECT
+                    COUNT(*) as total_players,
+                    SUM(server_currency) as total_wealth,
+                    AVG(server_currency) as avg_wealth,
+                    MIN(server_currency) as min_wealth,
+                    MAX(server_currency) as max_wealth,
+                    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY server_currency) as median_wealth,
+                    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY server_currency) as q1_wealth,
+                    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY server_currency) as q3_wealth
+                FROM player
+                WHERE server_currency > 0
+            """)
+            
+            return dict(stats) if stats else {}
+
+    async def get_transaction_volume(self, guild_id: int, hours: int = 24) -> dict:
+        """Gets transaction volume statistics for the specified time period."""
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        async with self.local_db.execute("""
+            SELECT
+                COUNT(*) as transaction_count,
+                SUM(amount) as total_volume,
+                AVG(amount) as avg_transaction,
+                MAX(amount) as largest_transaction
+            FROM transaction_history
+            WHERE guild_id = ?
+            AND timestamp >= datetime('now', '-' || ? || ' hours')
+        """, (guild_id, hours)) as cursor:
+            row = await cursor.fetchone()
+            
+        if row:
+            return {
+                'count': row[0] or 0,
+                'total': row[1] or 0,
+                'average': row[2] or 0,
+                'largest': row[3] or 0
+            }
+        return {'count': 0, 'total': 0, 'average': 0, 'largest': 0}
+
     @commands.group(name="currency")
     @commands.guild_only()
     async def currency(self, ctx: commands.Context):
@@ -570,17 +761,30 @@ class SS14Currency(commands.Cog):
         if not await self.confirm_large_transaction(ctx, amount, "set balance to", f"for {target_name}"):
             return
 
-        if await set_player_currency(pool, player_info.player_id, amount):
-            embed = discord.Embed(title="Balance Set", color=discord.Color.green())
+        success, old_balance = await set_player_currency(pool, player_info.player_id, amount)
+        if success:
+            # Log transaction
+            await self.log_transaction(
+                ctx.guild.id, "admin_set", amount,
+                to_player_id=player_info.player_id,
+                balance_before=old_balance,
+                balance_after=amount,
+                notes=f"Set by {ctx.author.name}"
+            )
+            
+            embed = discord.Embed(title="✅ Balance Set", color=discord.Color.green())
+            embed.set_footer(text=f"Set by {ctx.author.name}", icon_url=ctx.author.display_avatar.url)
             if player_info.discord_name:
-                embed.add_field(name="Discord User", value=discord.utils.escape_markdown(player_info.discord_name), inline=True)
-                embed.add_field(name="SS14 Username", value=discord.utils.escape_markdown(player_info.player_name), inline=True)
+                embed.add_field(name="👤 Discord User", value=discord.utils.escape_markdown(player_info.discord_name), inline=True)
+                embed.add_field(name="🎮 SS14 Username", value=discord.utils.escape_markdown(player_info.player_name), inline=True)
             else:
-                embed.add_field(name="Player", value=discord.utils.escape_markdown(player_info.player_name), inline=False)
-            embed.add_field(name="New Balance", value=f"{amount} coins", inline=False)
+                embed.add_field(name="🎮 Player", value=discord.utils.escape_markdown(player_info.player_name), inline=False)
+            embed.add_field(name="💰 Old Balance", value=f"{old_balance:,} coins", inline=True)
+            embed.add_field(name="💰 New Balance", value=f"{amount:,} coins", inline=True)
+            embed.add_field(name="📊 Change", value=f"{amount - old_balance:+,} coins", inline=True)
             await ctx.send(embed=embed)
         else:
-            await ctx.send(f"Failed to set the balance for **{player_info.player_name}**.", ephemeral=True)
+            await ctx.send(f"❌ Failed to set the balance for **{player_info.player_name}**.", ephemeral=True)
 
     @currency.command(name="add")
     @checks.admin_or_permissions(manage_guild=True)
@@ -605,17 +809,36 @@ class SS14Currency(commands.Cog):
             if not await self.confirm_large_transaction(ctx, amount, "add", f"to {target_name}"):
                 return
 
-        if await add_player_currency(pool, player_info.player_id, amount):
-            embed = discord.Embed(title="Balance Updated", color=discord.Color.green())
+        success, old_balance, new_balance = await add_player_currency(pool, player_info.player_id, amount)
+        if success:
+            # Log transaction
+            await self.log_transaction(
+                ctx.guild.id, "admin_add", amount,
+                to_player_id=player_info.player_id,
+                balance_before=old_balance,
+                balance_after=new_balance,
+                notes=f"Added by {ctx.author.name}"
+            )
+            
+            embed = discord.Embed(
+                title="✅ Balance Updated",
+                color=discord.Color.green() if amount > 0 else discord.Color.orange()
+            )
+            embed.set_footer(text=f"Modified by {ctx.author.name}", icon_url=ctx.author.display_avatar.url)
             if player_info.discord_name:
-                embed.add_field(name="Discord User", value=discord.utils.escape_markdown(player_info.discord_name), inline=True)
-                embed.add_field(name="SS14 Username", value=discord.utils.escape_markdown(player_info.player_name), inline=True)
+                embed.add_field(name="👤 Discord User", value=discord.utils.escape_markdown(player_info.discord_name), inline=True)
+                embed.add_field(name="🎮 SS14 Username", value=discord.utils.escape_markdown(player_info.player_name), inline=True)
             else:
-                embed.add_field(name="Player", value=discord.utils.escape_markdown(player_info.player_name), inline=False)
-            embed.add_field(name="Amount Added", value=f"{amount} coins", inline=False)
+                embed.add_field(name="🎮 Player", value=discord.utils.escape_markdown(player_info.player_name), inline=False)
+            embed.add_field(name="💰 Old Balance", value=f"{old_balance:,} coins", inline=True)
+            embed.add_field(name="💰 New Balance", value=f"{new_balance:,} coins", inline=True)
+            embed.add_field(name="📊 Amount Added", value=f"{amount:+,} coins", inline=True)
             await ctx.send(embed=embed)
         else:
-            await ctx.send(f"Failed to add coins for **{player_info.player_name}**.", ephemeral=True)
+            if old_balance is not None and old_balance + amount < 0:
+                await ctx.send(f"❌ Cannot add {amount} coins - would result in negative balance ({old_balance} + {amount} = {old_balance + amount}).", ephemeral=True)
+            else:
+                await ctx.send(f"❌ Failed to add coins for **{player_info.player_name}**.", ephemeral=True)
     @currency.command(name="transfer")
     async def transfer_coins(self, ctx: commands.Context, recipient: typing.Union[discord.Member, str], amount: int):
         """Transfers coins from your linked SS14 account to another player."""
@@ -661,28 +884,39 @@ class SS14Currency(commands.Cog):
 
         transfer_details = await transfer_currency(pool, sender_id, recipient_info.player_id, amount)
         if transfer_details:
+            # Log transaction
+            await self.log_transaction(
+                ctx.guild.id, "transfer", amount,
+                from_player_id=sender_id,
+                to_player_id=recipient_info.player_id,
+                balance_before=transfer_details['sender_old'],
+                balance_after=transfer_details['sender_new'],
+                notes=f"Transfer from {ctx.author.name}"
+            )
+            
             sender_name = await get_user_name_from_id(self.session, sender_id)
             sender_name_escaped = discord.utils.escape_markdown(sender_name)
             sender_discord_name_escaped = discord.utils.escape_markdown(ctx.author.display_name)
-            embed = discord.Embed(title="Transfer Successful", color=discord.Color.green())
+            embed = discord.Embed(title="✅ Transfer Successful", color=discord.Color.green())
+            embed.set_footer(text=f"Transfer completed", icon_url=ctx.author.display_avatar.url)
 
-            sender_field_name = f"Sender: {sender_discord_name_escaped} ({sender_name_escaped})"
-            sender_field_value = f"`{transfer_details['sender_old']}` -> `{transfer_details['sender_new']}`"
+            sender_field_name = f"📤 Sender: {sender_discord_name_escaped} ({sender_name_escaped})"
+            sender_field_value = f"`{transfer_details['sender_old']:,}` ➜ `{transfer_details['sender_new']:,}`"
             embed.add_field(name=sender_field_name, value=sender_field_value, inline=False)
 
             recipient_name_escaped = discord.utils.escape_markdown(recipient_info.player_name)
             if recipient_info.discord_name:
                 recipient_discord_name_escaped = discord.utils.escape_markdown(recipient_info.discord_name)
-                recipient_field_name = f"Recipient: {recipient_discord_name_escaped} ({recipient_name_escaped})"
+                recipient_field_name = f"📥 Recipient: {recipient_discord_name_escaped} ({recipient_name_escaped})"
             else:
-                recipient_field_name = f"Recipient: {recipient_name_escaped}"
-            recipient_field_value = f"`{transfer_details['recipient_old']}` -> `{transfer_details['recipient_new']}`"
+                recipient_field_name = f"📥 Recipient: {recipient_name_escaped}"
+            recipient_field_value = f"`{transfer_details['recipient_old']:,}` ➜ `{transfer_details['recipient_new']:,}`"
             embed.add_field(name=recipient_field_name, value=recipient_field_value, inline=False)
 
-            embed.add_field(name="Amount", value=f"{amount} coins", inline=False)
+            embed.add_field(name="💸 Amount", value=f"{amount:,} coins", inline=False)
             await ctx.send(embed=embed)
         else:
-            await ctx.send("The transfer failed. This may be due to insufficient funds or an issue with the recipient's account.", ephemeral=True)
+            await ctx.send("❌ The transfer failed. This may be due to insufficient funds or an issue with the recipient's account.", ephemeral=True)
 
     @currency.command(name="leaderboard")
     async def leaderboard(self, ctx: commands.Context):
@@ -699,6 +933,474 @@ class SS14Currency(commands.Cog):
 
         embed = discord.Embed(title="Top 10 Coin Holders", color=discord.Color.gold())
         for i, record in enumerate(leaderboard_data, 1):
+    @currency.command(name="history")
+    async def transaction_history(self, ctx: commands.Context, user: Optional[typing.Union[discord.Member, str]] = None, limit: int = 10):
+        """Shows transaction history for yourself or another user (admins only for others)."""
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("Database connection is not configured.", ephemeral=True)
+            return
+
+        # Determine target user
+        if user is None:
+            # Show own history
+            target = ctx.author
+            player_id = await get_player_id_from_discord(pool, target.id)
+            if not player_id:
+                await ctx.send("Your Discord account is not linked to an SS14 account.", ephemeral=True)
+                return
+            target_name = target.display_name
+        else:
+            # Check if user has permission to view others' history
+            if not ctx.author.guild_permissions.manage_guild:
+                await ctx.send("❌ You need Manage Server permissions to view other users' transaction history.", ephemeral=True)
+                return
+            
+            player_info = await self.resolve_player(user, pool)
+            if not player_info:
+                await ctx.send(f"Could not find user `{user}`.", ephemeral=True)
+                return
+            player_id = player_info.player_id
+            target_name = player_info.discord_name or player_info.player_name
+
+        # Limit to reasonable range
+        limit = max(5, min(limit, 50))
+        
+        history = await self.get_transaction_history(ctx.guild.id, player_id, limit)
+        if not history:
+            await ctx.send(f"No transaction history found for {target_name}.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title=f"📜 Transaction History for {target_name}",
+            description=f"Showing last {len(history)} transaction(s)",
+            color=discord.Color.blue()
+        )
+        
+        for i, tx in enumerate(history, 1):
+            tx_type = tx['type']
+            amount = tx['amount']
+            timestamp = tx['timestamp']
+            notes = tx['notes'] or "N/A"
+            
+            # Format transaction type
+            if tx_type == "transfer":
+                if str(player_id) == tx['from_player_id']:
+                    direction = "📤 Sent"
+                else:
+                    direction = "📥 Received"
+            elif tx_type == "admin_set":
+                direction = "⚙️ Balance Set"
+            elif tx_type == "admin_add":
+                direction = "⚙️ Admin Adjusted"
+            else:
+                direction = tx_type
+            
+            balance_info = ""
+            if tx['balance_before'] is not None and tx['balance_after'] is not None:
+                balance_info = f"\nBalance: `{tx['balance_before']:,}` ➜ `{tx['balance_after']:,}`"
+            
+            field_value = (
+                f"**Amount:** {amount:,} coins\n"
+                f"**Time:** {timestamp[:19]}\n"
+                f"**Notes:** {notes}"
+                f"{balance_info}"
+            )
+            
+            embed.add_field(
+                name=f"{i}. {direction}",
+                value=field_value,
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Requested by {ctx.author.name}")
+        await ctx.send(embed=embed)
+
+    @currency.command(name="wealth")
+    async def wealth_distribution(self, ctx: commands.Context):
+        """Shows wealth distribution statistics for the server."""
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+
+        if not pool:
+            await ctx.send("Database connection is not configured.", ephemeral=True)
+            return
+
+        stats = await self.get_wealth_distribution(pool)
+        if not stats or not stats.get('total_players'):
+            await ctx.send("No wealth data available.", ephemeral=True)
+            return
+
+        total = stats.get('total_players', 0)
+        total_wealth = stats.get('total_wealth', 0)
+        avg = stats.get('avg_wealth', 0)
+        median = stats.get('median_wealth', 0)
+        min_w = stats.get('min_wealth', 0)
+        max_w = stats.get('max_wealth', 0)
+        q1 = stats.get('q1_wealth', 0)
+        q3 = stats.get('q3_wealth', 0)
+
+        embed = discord.Embed(
+            title="📊 Wealth Distribution Analysis",
+            description=f"Statistics for {total:,} players with positive balances",
+            color=discord.Color.gold()
+        )
+        
+        embed.add_field(
+            name="💰 Total Wealth",
+            value=f"{int(total_wealth):,} coins",
+            inline=True
+        )
+        embed.add_field(
+            name="📈 Average",
+            value=f"{int(avg):,} coins",
+            inline=True
+        )
+        embed.add_field(
+            name="📊 Median",
+            value=f"{int(median):,} coins",
+            inline=True
+        )
+        embed.add_field(
+            name="📉 Minimum",
+            value=f"{int(min_w):,} coins",
+            inline=True
+        )
+        embed.add_field(
+            name="📈 Maximum",
+            value=f"{int(max_w):,} coins",
+            inline=True
+        )
+        embed.add_field(
+            name="🎯 Range",
+            value=f"{int(max_w - min_w):,} coins",
+            inline=True
+        )
+        embed.add_field(
+            name="📊 Q1 (25th percentile)",
+            value=f"{int(q1):,} coins",
+            inline=True
+        )
+        embed.add_field(
+            name="📊 Q3 (75th percentile)",
+            value=f"{int(q3):,} coins",
+            inline=True
+        )
+        embed.add_field(
+            name="📏 IQR (Interquartile Range)",
+            value=f"{int(q3 - q1):,} coins",
+            inline=True
+        )
+        
+        # Calculate wealth inequality (Gini-like metric using quartiles)
+        if median > 0:
+            inequality = ((avg - median) / median) * 100
+            embed.add_field(
+                name="⚖️ Inequality Index",
+                value=f"{inequality:.1f}% (avg/median deviation)",
+                inline=False
+            )
+        
+        embed.set_footer(text=f"Requested by {ctx.author.name}")
+        await ctx.send(embed=embed)
+
+    @currency.command(name="volume")
+    async def transaction_volume(self, ctx: commands.Context, hours: int = 24):
+        """Shows transaction volume statistics for the specified time period (default: 24 hours)."""
+        hours = max(1, min(hours, 168))  # Limit between 1 hour and 1 week
+        
+        stats = await self.get_transaction_volume(ctx.guild.id, hours)
+        
+        embed = discord.Embed(
+            title=f"📊 Transaction Volume ({hours}h)",
+            description=f"Statistics for the last {hours} hour(s)",
+            color=discord.Color.blue()
+        )
+        
+        embed.add_field(
+            name="🔢 Total Transactions",
+            value=f"{stats['count']:,}",
+            inline=True
+        )
+        embed.add_field(
+            name="💰 Total Volume",
+            value=f"{stats['total']:,} coins",
+            inline=True
+        )
+        embed.add_field(
+            name="📊 Average Transaction",
+            value=f"{int(stats['average']):,} coins" if stats['average'] else "N/A",
+            inline=True
+        )
+        embed.add_field(
+            name="🏆 Largest Transaction",
+            value=f"{stats['largest']:,} coins",
+            inline=True
+        )
+        
+        if stats['count'] > 0:
+            velocity = stats['total'] / hours
+            embed.add_field(
+                name="⚡ Velocity",
+                value=f"{int(velocity):,} coins/hour",
+                inline=True
+            )
+        
+        embed.set_footer(text=f"Requested by {ctx.author.name}")
+        await ctx.send(embed=embed)
+
+    @currency.command(name="leaderboards")
+    async def leaderboards(self, ctx: commands.Context, category: str = "wealth"):
+        """Shows various leaderboards. Categories: wealth, gambling, activity"""
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("Database connection is not configured.", ephemeral=True)
+            return
+
+        category = category.lower()
+        
+        if category in ["wealth", "rich", "coins", "balance"]:
+            # Existing wealth leaderboard
+            leaderboard_data = await get_leaderboard(pool)
+            if not leaderboard_data:
+                await ctx.send("The leaderboard is currently empty.")
+                return
+
+            embed = discord.Embed(
+                title="🏆 Wealth Leaderboard",
+                description="Top 10 richest players",
+                color=discord.Color.gold()
+            )
+            for i, record in enumerate(leaderboard_data, 1):
+                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                embed.add_field(
+                    name=f"{medal} {discord.utils.escape_markdown(record['last_seen_user_name'])}",
+                    value=f"{record['server_currency']:,} coins",
+                    inline=False
+                )
+            
+        elif category in ["gambling", "gambler", "gamblers"]:
+            # Gambling leaderboard (most games played)
+            if self.local_db is None:
+                await self.initialize_local_db()
+            
+            async with self.local_db.execute("""
+                SELECT player_id, SUM(total_games) as games, SUM(total_won - total_lost) as net_profit
+                FROM gambling_stats
+                WHERE guild_id = ?
+                GROUP BY player_id
+                ORDER BY games DESC
+                LIMIT 10
+            """, (ctx.guild.id,)) as cursor:
+                rows = await cursor.fetchall()
+            
+            if not rows:
+                await ctx.send("No gambling statistics available.")
+                return
+            
+            embed = discord.Embed(
+                title="🎰 Gambling Leaderboard",
+                description="Top 10 most active gamblers",
+                color=discord.Color.purple()
+            )
+            
+            for i, row in enumerate(rows, 1):
+                player_id = uuid.UUID(row[0])
+                # Try to get username from SS14
+                username = await get_user_name_from_id(self.session, player_id)
+                if not username:
+                    username = str(player_id)[:8]
+                
+                games = row[1]
+                net = row[2]
+                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                
+                embed.add_field(
+                    name=f"{medal} {discord.utils.escape_markdown(username)}",
+                    value=f"**Games:** {games:,} | **Net:** {net:+,} coins",
+                    inline=False
+                )
+        
+        elif category in ["activity", "active", "transactions"]:
+            # Most active traders (by transaction count)
+            if self.local_db is None:
+                await self.initialize_local_db()
+            
+            async with self.local_db.execute("""
+                SELECT 
+                    COALESCE(from_player_id, to_player_id) as player_id,
+                    COUNT(*) as tx_count,
+                    SUM(amount) as total_volume
+                FROM transaction_history
+                WHERE guild_id = ? AND transaction_type = 'transfer'
+                GROUP BY player_id
+                ORDER BY tx_count DESC
+                LIMIT 10
+            """, (ctx.guild.id,)) as cursor:
+                rows = await cursor.fetchall()
+            
+            if not rows:
+                await ctx.send("No transaction activity found.")
+                return
+            
+            embed = discord.Embed(
+                title="💸 Activity Leaderboard",
+                description="Top 10 most active traders",
+                color=discord.Color.green()
+            )
+            
+            for i, row in enumerate(rows, 1):
+                if row[0]:
+                    player_id = uuid.UUID(row[0])
+                    username = await get_user_name_from_id(self.session, player_id)
+                    if not username:
+                        username = str(player_id)[:8]
+                else:
+                    continue
+                
+                tx_count = row[1]
+                volume = row[2]
+                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                
+                embed.add_field(
+                    name=f"{medal} {discord.utils.escape_markdown(username)}",
+                    value=f"**Transactions:** {tx_count:,} | **Volume:** {volume:,} coins",
+                    inline=False
+                )
+        else:
+            await ctx.send(f"❌ Unknown category `{category}`. Valid categories: wealth, gambling, activity")
+            return
+        
+        embed.set_footer(text=f"Category: {category} | Requested by {ctx.author.name}")
+        await ctx.send(embed=embed)
+
+    @currency.command(name="economy")
+    async def economy_health(self, ctx: commands.Context):
+        """Shows overall economic health indicators for the server."""
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("Database connection is not configured.", ephemeral=True)
+            return
+
+        # Get wealth distribution
+        wealth_stats = await self.get_wealth_distribution(pool)
+        
+        # Get transaction volume (24h)
+        volume_24h = await self.get_transaction_volume(ctx.guild.id, 24)
+        
+        # Get transaction volume (7d)
+        volume_7d = await self.get_transaction_volume(ctx.guild.id, 168)
+        
+        if not wealth_stats or not wealth_stats.get('total_players'):
+            await ctx.send("Not enough data to calculate economic health.", ephemeral=True)
+            return
+
+        embed = discord.Embed(
+            title="🏦 Economic Health Dashboard",
+            description="Overall server economy statistics",
+            color=discord.Color.blue()
+        )
+        
+        # Wealth metrics
+        total_wealth = int(wealth_stats.get('total_wealth', 0))
+        total_players = wealth_stats.get('total_players', 0)
+        avg_wealth = int(wealth_stats.get('avg_wealth', 0))
+        median_wealth = int(wealth_stats.get('median_wealth', 0))
+        
+        embed.add_field(
+            name="💰 Total Wealth in Circulation",
+            value=f"{total_wealth:,} coins",
+            inline=False
+        )
+        embed.add_field(
+            name="👥 Active Players",
+            value=f"{total_players:,} players",
+            inline=True
+        )
+        embed.add_field(
+            name="📊 Wealth per Capita",
+            value=f"{avg_wealth:,} coins",
+            inline=True
+        )
+        
+        # Activity metrics
+        embed.add_field(
+            name="📈 24h Activity",
+            value=f"{volume_24h['count']:,} transactions\n{volume_24h['total']:,} coins moved",
+            inline=True
+        )
+        embed.add_field(
+            name="📊 7d Activity",
+            value=f"{volume_7d['count']:,} transactions\n{volume_7d['total']:,} coins moved",
+            inline=True
+        )
+        
+        # Velocity (economy turnover rate)
+        if total_wealth > 0:
+            daily_velocity = (volume_24h['total'] / total_wealth) * 100
+            weekly_velocity = (volume_7d['total'] / total_wealth) * 100
+            
+            embed.add_field(
+                name="⚡ Money Velocity",
+                value=f"**Daily:** {daily_velocity:.2f}% of total wealth\n**Weekly:** {weekly_velocity:.2f}% of total wealth",
+                inline=False
+            )
+        
+        # Inequality metric
+        if median_wealth > 0:
+            inequality = ((avg_wealth - median_wealth) / median_wealth) * 100
+            status = "🟢 Low" if inequality < 50 else "🟡 Medium" if inequality < 100 else "🔴 High"
+            embed.add_field(
+                name="⚖️ Wealth Inequality",
+                value=f"{status} ({inequality:.1f}%)",
+                inline=True
+            )
+        
+        # Health score (0-100)
+        health_score = 0
+        
+        # Active player participation (up to 30 points)
+        if total_players > 0:
+            health_score += min(30, total_players)
+        
+        # Transaction activity (up to 40 points)
+        if volume_24h['count'] > 0:
+            health_score += min(40, volume_24h['count'] * 2)
+        
+        # Wealth distribution (up to 30 points - lower inequality is better)
+        if median_wealth > 0:
+            inequality = ((avg_wealth - median_wealth) / median_wealth) * 100
+            if inequality < 50:
+                health_score += 30
+            elif inequality < 100:
+                health_score += 20
+            else:
+                health_score += 10
+        
+        health_score = min(100, health_score)
+        
+        if health_score >= 80:
+            health_status = "🟢 Excellent"
+            health_color = discord.Color.green()
+        elif health_score >= 60:
+            health_status = "🟡 Good"
+            health_color =discord.Color.gold()
+        elif health_score >= 40:
+            health_status = "🟠 Fair"
+            health_color = discord.Color.orange()
+        else:
+            health_status = "🔴 Poor"
+            health_color = discord.Color.red()
+        
+        embed.add_field(
+            name="🏥 Economy Health Score",
+            value=f"{health_status} ({health_score}/100)",
+            inline=True
+        )
+        
+        embed.color = health_color
+        embed.set_footer(text=f"Requested by {ctx.author.name}")
+        await ctx.send(embed=embed)
+
             embed.add_field(name=f"{i}. {discord.utils.escape_markdown(record['last_seen_user_name'])}", value=f"{record['server_currency']} coins", inline=False)
         await ctx.send(embed=embed)
 
