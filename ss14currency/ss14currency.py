@@ -918,24 +918,6 @@ class SS14Currency(commands.Cog):
         else:
             await ctx.send("❌ The transfer failed. This may be due to insufficient funds or an issue with the recipient's account.", ephemeral=True)
 
-    @currency.command(name="leaderboard")
-    async def leaderboard(self, ctx: commands.Context):
-        """Shows the top 10 players with the most coins."""
-        pool = await self.get_pool_for_guild(ctx.guild.id)
-        if not pool:
-            await ctx.send("Database connection is not configured for this server.", ephemeral=True)
-            return
-
-        leaderboard_data = await get_leaderboard(pool)
-        if not leaderboard_data:
-            await ctx.send("The leaderboard is currently empty.")
-            return
-
-        embed = discord.Embed(title="Top 10 Coin Holders", color=discord.Color.gold())
-        for i, record in enumerate(leaderboard_data, 1):
-            embed.add_field(name=f"{i}. {discord.utils.escape_markdown(record['last_seen_user_name'])}", value=f"{record['server_currency']} coins", inline=False)
-        await ctx.send(embed=embed)
-
     @currency.command(name="history")
     async def transaction_history(self, ctx: commands.Context, user: Optional[typing.Union[discord.Member, str]] = None, limit: int = 10):
         """Shows transaction history for yourself or another user (admins only for others)."""
@@ -1151,8 +1133,8 @@ class SS14Currency(commands.Cog):
         embed.set_footer(text=f"Requested by {ctx.author.name}")
         await ctx.send(embed=embed)
 
-    @currency.command(name="leaderboards")
-    async def leaderboards(self, ctx: commands.Context, category: str = "wealth"):
+    @currency.command(name="leaderboard")
+    async def leaderboard(self, ctx: commands.Context, category: str = "wealth"):
         """Shows various leaderboards. Categories: wealth, gambling, activity"""
         pool = await self.get_pool_for_guild(ctx.guild.id)
         if not pool:
@@ -1270,9 +1252,12 @@ class SS14Currency(commands.Cog):
                     inline=False
                 )
         else:
-            await ctx.send(f"❌ Unknown category `{category}`. Valid categories: wealth, gambling, activity")
+            await ctx.send(f"❌ Unknown category `{category}`. Valid categories: **wealth**, **gambling**, **activity**", ephemeral=True)
             return
         
+        # Add available categories to description
+        current_desc = embed.description or ""
+        embed.description = f"{current_desc}\n\n💡 **Available categories:** `wealth`, `gambling`, `activity`"
         embed.set_footer(text=f"Category: {category} | Requested by {ctx.author.name}")
         await ctx.send(embed=embed)
 
@@ -1303,15 +1288,15 @@ class SS14Currency(commands.Cog):
             color=discord.Color.blue()
         )
         
-        # Wealth metrics
-        total_wealth = int(wealth_stats.get('total_wealth', 0))
-        total_players = wealth_stats.get('total_players', 0)
-        avg_wealth = int(wealth_stats.get('avg_wealth', 0))
-        median_wealth = int(wealth_stats.get('median_wealth', 0))
+        # Wealth metrics (convert Decimal to float/int)
+        total_wealth = float(wealth_stats.get('total_wealth', 0) or 0)
+        total_players = int(wealth_stats.get('total_players', 0) or 0)
+        avg_wealth = float(wealth_stats.get('avg_wealth', 0) or 0)
+        median_wealth = float(wealth_stats.get('median_wealth', 0) or 0)
         
         embed.add_field(
             name="💰 Total Wealth in Circulation",
-            value=f"{total_wealth:,} coins",
+            value=f"{int(total_wealth):,} coins",
             inline=False
         )
         embed.add_field(
@@ -1321,7 +1306,7 @@ class SS14Currency(commands.Cog):
         )
         embed.add_field(
             name="📊 Wealth per Capita",
-            value=f"{avg_wealth:,} coins",
+            value=f"{int(avg_wealth):,} coins",
             inline=True
         )
         
