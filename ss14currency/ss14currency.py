@@ -54,6 +54,16 @@ async def get_leaderboard(pool: asyncpg.Pool) -> list:
         await pool.release(conn)
 
 class DbConfigModal(Modal, title="Database Configuration"):
+async def get_player_id_from_discord(pool: asyncpg.Pool, discord_id: int) -> Optional[uuid.UUID]:
+    """Gets the player's user_id from their discord ID."""
+    conn = await pool.acquire()
+    try:
+        query = "SELECT player_id FROM rmc_linked_accounts WHERE discord_id = $1;"
+        result = await conn.fetchval(query, discord_id)
+        return result
+    finally:
+        await pool.release(conn)
+
     db_user = TextInput(label="Database Username", style=TextStyle.short, required=True)
     db_pass = TextInput(label="Database Password", style=TextStyle.short, required=True)
     db_host = TextInput(label="Database Host (IP or Domain)", style=TextStyle.short, required=True)
@@ -150,27 +160,59 @@ class SS14Currency(commands.Cog):
         """Manage SS14 server currency."""
         pass
 
-    @currency.command(name="get")
-    async def get_coins(self, ctx: commands.Context, *, username: str):
-        """Gets the coin balance for a given SS14 username."""
+    @currency.command(name="self")
+    async def self_coins(self, ctx: commands.Context):
+        """Check your own coin balance if your account is linked."""
         pool = await self.get_pool_for_guild(ctx.guild.id)
         if not pool:
             await ctx.send("Database connection is not configured for this server.", ephemeral=True)
             return
 
-        player_id = await self.get_user_id_from_name(username)
+        player_id = await get_player_id_from_discord(pool, ctx.author.id)
         if not player_id:
-            await ctx.send(f"Could not find a user with the name `{username}`.", ephemeral=True)
+            await ctx.send("Your Discord account is not linked to an SS14 account.", ephemeral=True)
             return
 
         balance = await get_player_currency(pool, player_id)
         if balance is not None:
-            embed = discord.Embed(title="Coin Balance", color=discord.Color.blue())
-            embed.add_field(name="Player", value=username, inline=False)
+            embed = discord.Embed(title="Your Coin Balance", color=discord.Color.blue())
             embed.add_field(name="Balance", value=f"{balance} coins", inline=False)
             await ctx.send(embed=embed)
         else:
-            await ctx.send(f"Could not retrieve the balance for **{username}**.", ephemeral=True)
+            await ctx.send("Could not retrieve your balance.", ephemeral=True)
+
+    @currency.command(name="get")
+    async def get_coins(self, ctx: commands.Context, *, user: typing.Union[discord.Member, str]):
+        """Gets the coin balance for a given SS14 username or linked Discord user."""
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("Database connection is not configured for this server.", ephemeral=True)
+            return
+
+        player_id = None
+        player_name = None
+
+        if isinstance(user, discord.Member):
+            player_id = await get_player_id_from_discord(pool, user.id)
+            player_name = user.display_name
+            if not player_id:
+                await ctx.send(f"{user.mention} does not have a linked SS14 account.", ephemeral=True)
+                return
+        else:
+            player_id = await self.get_user_id_from_name(user)
+            player_name = user
+            if not player_id:
+                await ctx.send(f"Could not find a user with the name `{user}`.", ephemeral=True)
+                return
+
+        balance = await get_player_currency(pool, player_id)
+        if balance is not None:
+            embed = discord.Embed(title="Coin Balance", color=discord.Color.blue())
+            embed.add_field(name="Player", value=player_name, inline=False)
+            embed.add_field(name="Balance", value=f"{balance} coins", inline=False)
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send(f"Could not retrieve the balance for **{player_name}**.", ephemeral=True)
 
     @currency.command(name="set")
     @checks.admin_or_permissions(manage_guild=True)
