@@ -44,6 +44,15 @@ async def add_player_currency(pool: asyncpg.Pool, player_id: uuid.UUID, amount: 
         return True
     except Exception as e:
         log.error(f"Error adding currency for player {player_id}: {e}", exc_info=True)
+async def get_leaderboard(pool: asyncpg.Pool) -> list:
+    """Gets the top 10 players by currency."""
+    conn = await pool.acquire()
+    try:
+        query = "SELECT last_seen_user_name, server_currency FROM player ORDER BY server_currency DESC LIMIT 10;"
+        return await conn.fetch(query)
+    finally:
+        await pool.release(conn)
+
 class DbConfigModal(Modal, title="Database Configuration"):
     db_user = TextInput(label="Database Username", style=TextStyle.short, required=True)
     db_pass = TextInput(label="Database Password", style=TextStyle.short, required=True)
@@ -137,7 +146,6 @@ class SS14Currency(commands.Cog):
 
     @commands.group(name="currency")
     @commands.guild_only()
-    @checks.admin_or_permissions(manage_guild=True)
     async def currency(self, ctx: commands.Context):
         """Manage SS14 server currency."""
         pass
@@ -147,59 +155,88 @@ class SS14Currency(commands.Cog):
         """Gets the coin balance for a given SS14 username."""
         pool = await self.get_pool_for_guild(ctx.guild.id)
         if not pool:
-            await ctx.send("Database connection is not configured for this server.")
+            await ctx.send("Database connection is not configured for this server.", ephemeral=True)
             return
 
         player_id = await self.get_user_id_from_name(username)
         if not player_id:
-            await ctx.send(f"Could not find a user with the name `{username}`.")
+            await ctx.send(f"Could not find a user with the name `{username}`.", ephemeral=True)
             return
 
         balance = await get_player_currency(pool, player_id)
         if balance is not None:
-            await ctx.send(f"**{username}** has **{balance}** coins.")
+            embed = discord.Embed(title="Coin Balance", color=discord.Color.blue())
+            embed.add_field(name="Player", value=username, inline=False)
+            embed.add_field(name="Balance", value=f"{balance} coins", inline=False)
+            await ctx.send(embed=embed)
         else:
-            await ctx.send(f"Could not retrieve the balance for **{username}**.")
+            await ctx.send(f"Could not retrieve the balance for **{username}**.", ephemeral=True)
 
     @currency.command(name="set")
+    @checks.admin_or_permissions(manage_guild=True)
     async def set_coins(self, ctx: commands.Context, username: str, amount: int):
         """Sets the coin balance for a given SS14 username."""
         pool = await self.get_pool_for_guild(ctx.guild.id)
         if not pool:
-            await ctx.send("Database connection is not configured for this server.")
+            await ctx.send("Database connection is not configured for this server.", ephemeral=True)
             return
-            
+
         if amount < 0:
-            await ctx.send("You cannot set a negative coin balance.")
+            await ctx.send("You cannot set a negative coin balance.", ephemeral=True)
             return
 
         player_id = await self.get_user_id_from_name(username)
         if not player_id:
-            await ctx.send(f"Could not find a user with the name `{username}`.")
+            await ctx.send(f"Could not find a user with the name `{username}`.", ephemeral=True)
             return
 
         if await set_player_currency(pool, player_id, amount):
-            await ctx.send(f"Successfully set **{username}**'s balance to **{amount}** coins.")
+            embed = discord.Embed(title="Balance Set", color=discord.Color.green())
+            embed.add_field(name="Player", value=username, inline=False)
+            embed.add_field(name="New Balance", value=f"{amount} coins", inline=False)
+            await ctx.send(embed=embed)
         else:
-            await ctx.send(f"Failed to set the balance for **{username}**.")
+            await ctx.send(f"Failed to set the balance for **{username}**.", ephemeral=True)
 
     @currency.command(name="add")
+    @checks.admin_or_permissions(manage_guild=True)
     async def add_coins(self, ctx: commands.Context, username: str, amount: int):
         """Adds coins to a given SS14 username. Can be a negative number."""
         pool = await self.get_pool_for_guild(ctx.guild.id)
         if not pool:
-            await ctx.send("Database connection is not configured for this server.")
+            await ctx.send("Database connection is not configured for this server.", ephemeral=True)
             return
 
         player_id = await self.get_user_id_from_name(username)
         if not player_id:
-            await ctx.send(f"Could not find a user with the name `{username}`.")
+            await ctx.send(f"Could not find a user with the name `{username}`.", ephemeral=True)
             return
 
         if await add_player_currency(pool, player_id, amount):
-            await ctx.send(f"Successfully added **{amount}** coins to **{username}**.")
+            embed = discord.Embed(title="Balance Updated", color=discord.Color.green())
+            embed.add_field(name="Player", value=username, inline=False)
+            embed.add_field(name="Amount Added", value=f"{amount} coins", inline=False)
+            await ctx.send(embed=embed)
         else:
-            await ctx.send(f"Failed to add coins for **{username}**.")
+            await ctx.send(f"Failed to add coins for **{username}**.", ephemeral=True)
+
+    @currency.command(name="leaderboard")
+    async def leaderboard(self, ctx: commands.Context):
+        """Shows the top 10 players with the most coins."""
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("Database connection is not configured for this server.", ephemeral=True)
+            return
+
+        leaderboard_data = await get_leaderboard(pool)
+        if not leaderboard_data:
+            await ctx.send("The leaderboard is currently empty.")
+            return
+
+        embed = discord.Embed(title="Top 10 Coin Holders", color=discord.Color.gold())
+        for i, record in enumerate(leaderboard_data, 1):
+            embed.add_field(name=f"{i}. {record['last_seen_user_name']}", value=f"{record['server_currency']} coins", inline=False)
+        await ctx.send(embed=embed)
 
     @app_commands.command(name="coinsetdb")
     @app_commands.guild_only()
