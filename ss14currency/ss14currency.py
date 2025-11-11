@@ -933,6 +933,9 @@ class SS14Currency(commands.Cog):
 
         embed = discord.Embed(title="Top 10 Coin Holders", color=discord.Color.gold())
         for i, record in enumerate(leaderboard_data, 1):
+            embed.add_field(name=f"{i}. {discord.utils.escape_markdown(record['last_seen_user_name'])}", value=f"{record['server_currency']} coins", inline=False)
+        await ctx.send(embed=embed)
+
     @currency.command(name="history")
     async def transaction_history(self, ctx: commands.Context, user: Optional[typing.Union[discord.Member, str]] = None, limit: int = 10):
         """Shows transaction history for yourself or another user (admins only for others)."""
@@ -1399,9 +1402,6 @@ class SS14Currency(commands.Cog):
         
         embed.color = health_color
         embed.set_footer(text=f"Requested by {ctx.author.name}")
-        await ctx.send(embed=embed)
-
-            embed.add_field(name=f"{i}. {discord.utils.escape_markdown(record['last_seen_user_name'])}", value=f"{record['server_currency']} coins", inline=False)
         await ctx.send(embed=embed)
 
     @currency.command(name="gamblingstats")
