@@ -1,0 +1,22 @@
+{
+    "author": [
+        "Durk"
+    ],
+    "install_msg": "Thank you for installing the SS14Currency cog! Use `[p]help SS14Currency` for commands.",
+    "name": "SS14Currency",
+    "short": "Manages SS14 server currency.",
+    "description": "A cog to manage SS14 server currency for players, with admin commands to add, remove, and set coin amounts.",
+    "tags": [
+        "ss14",
+        "currency",
+        "utility",
+        "game"
+    ],
+    "requirements": [
+        "asyncpg",
+        "aiohttp"
+    ],
+    "required_cogs": {},
+    "min_bot_version": "3.5.0",
+    "end_user_data_statement": "This cog stores Discord user IDs and provided game account identifiers necessary for the currency management functionality, mapped per server."
+}
