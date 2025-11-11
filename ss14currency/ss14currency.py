@@ -69,6 +69,21 @@ async def get_player_id_from_discord(pool: asyncpg.Pool, discord_id: int) -> Opt
 class DbConfigModal(Modal, title="Database Configuration"):
 
     db_user = TextInput(label="Database Username", style=TextStyle.short, required=True)
+async def get_user_name_from_id(session: aiohttp.ClientSession, user_id: uuid.UUID) -> Optional[str]:
+    """Queries the SS14 auth API for a user's username by their UUID."""
+    url = f"https://auth.spacestation14.com/api/query/userid?userid={user_id}"
+    try:
+        async with session.get(url) as response:
+            if response.status == 200:
+                data = await response.json()
+                return data.get("userName")
+            else:
+                log.warning(f"API query for {user_id} failed with status {response.status}")
+                return None
+    except aiohttp.ClientError as e:
+        log.error(f"Error querying auth API for {user_id}: {e}", exc_info=True)
+        return None
+
     db_pass = TextInput(label="Database Password", style=TextStyle.short, required=True)
     db_host = TextInput(label="Database Host (IP or Domain)", style=TextStyle.short, required=True)
     db_port = TextInput(label="Database Port", style=TextStyle.short, required=True, default="5432")
@@ -174,7 +189,7 @@ class SS14Currency(commands.Cog):
 
         player_id = await get_player_id_from_discord(pool, ctx.author.id)
         if not player_id:
-            await ctx.send("Your Discord account is not linked to an SS14 account.", ephemeral=True)
+            await ctx.send("Your Discord account is not linked to an SS14 account. Please link your account in https://discord.com/channels/1202734573247795300/1330738082378551326.", ephemeral=True)
             return
 
         balance = await get_player_currency(pool, player_id)
@@ -195,13 +210,15 @@ class SS14Currency(commands.Cog):
 
         player_id = None
         player_name = None
+        discord_name = None
 
         if isinstance(user, discord.Member):
             player_id = await get_player_id_from_discord(pool, user.id)
-            player_name = user.display_name
             if not player_id:
-                await ctx.send(f"{user.mention} does not have a linked SS14 account.", ephemeral=True)
+                await ctx.send(f"{user.mention} does not have a linked SS14 account. They can link their account in https://discord.com/channels/1202734573247795300/1330738082378551326.", ephemeral=True)
                 return
+            player_name = await get_user_name_from_id(self.session, player_id)
+            discord_name = user.display_name
         else:
             player_id = await self.get_user_id_from_name(user)
             player_name = user
@@ -212,7 +229,11 @@ class SS14Currency(commands.Cog):
         balance = await get_player_currency(pool, player_id)
         if balance is not None:
             embed = discord.Embed(title="Coin Balance", color=discord.Color.blue())
-            embed.add_field(name="Player", value=player_name, inline=False)
+            if discord_name:
+                embed.add_field(name="Discord User", value=discord_name, inline=True)
+                embed.add_field(name="SS14 Username", value=player_name, inline=True)
+            else:
+                embed.add_field(name="Player", value=player_name, inline=False)
             embed.add_field(name="Balance", value=f"{balance} coins", inline=False)
             await ctx.send(embed=embed)
         else:
@@ -233,13 +254,15 @@ class SS14Currency(commands.Cog):
             
         player_id = None
         player_name = None
+        discord_name = None
 
         if isinstance(user, discord.Member):
             player_id = await get_player_id_from_discord(pool, user.id)
-            player_name = user.display_name
             if not player_id:
                 await ctx.send(f"{user.mention} does not have a linked SS14 account.", ephemeral=True)
                 return
+            player_name = await get_user_name_from_id(self.session, player_id)
+            discord_name = user.display_name
         else:
             player_id = await self.get_user_id_from_name(user)
             player_name = user
@@ -249,7 +272,11 @@ class SS14Currency(commands.Cog):
 
         if await set_player_currency(pool, player_id, amount):
             embed = discord.Embed(title="Balance Set", color=discord.Color.green())
-            embed.add_field(name="Player", value=player_name, inline=False)
+            if discord_name:
+                embed.add_field(name="Discord User", value=discord_name, inline=True)
+                embed.add_field(name="SS14 Username", value=player_name, inline=True)
+            else:
+                embed.add_field(name="Player", value=player_name, inline=False)
             embed.add_field(name="New Balance", value=f"{amount} coins", inline=False)
             await ctx.send(embed=embed)
         else:
@@ -266,13 +293,15 @@ class SS14Currency(commands.Cog):
             
         player_id = None
         player_name = None
+        discord_name = None
 
         if isinstance(user, discord.Member):
             player_id = await get_player_id_from_discord(pool, user.id)
-            player_name = user.display_name
             if not player_id:
                 await ctx.send(f"{user.mention} does not have a linked SS14 account.", ephemeral=True)
                 return
+            player_name = await get_user_name_from_id(self.session, player_id)
+            discord_name = user.display_name
         else:
             player_id = await self.get_user_id_from_name(user)
             player_name = user
@@ -282,7 +311,11 @@ class SS14Currency(commands.Cog):
 
         if await add_player_currency(pool, player_id, amount):
             embed = discord.Embed(title="Balance Updated", color=discord.Color.green())
-            embed.add_field(name="Player", value=player_name, inline=False)
+            if discord_name:
+                embed.add_field(name="Discord User", value=discord_name, inline=True)
+                embed.add_field(name="SS14 Username", value=player_name, inline=True)
+            else:
+                embed.add_field(name="Player", value=player_name, inline=False)
             embed.add_field(name="Amount Added", value=f"{amount} coins", inline=False)
             await ctx.send(embed=embed)
         else:
