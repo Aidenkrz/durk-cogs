@@ -66,9 +66,6 @@ async def get_player_id_from_discord(pool: asyncpg.Pool, discord_id: int) -> Opt
     finally:
         await pool.release(conn)
 
-class DbConfigModal(Modal, title="Database Configuration"):
-
-    db_user = TextInput(label="Database Username", style=TextStyle.short, required=True)
 async def get_user_name_from_id(session: aiohttp.ClientSession, user_id: uuid.UUID) -> Optional[str]:
     """Queries the SS14 auth API for a user's username by their UUID."""
     url = f"https://auth.spacestation14.com/api/query/userid?userid={user_id}"
@@ -102,6 +99,9 @@ async def transfer_currency(pool: asyncpg.Pool, from_player_id: uuid.UUID, to_pl
     finally:
         await pool.release(conn)
 
+class DbConfigModal(Modal, title="Database Configuration"):
+
+    db_user = TextInput(label="Database Username", style=TextStyle.short, required=True)
     db_pass = TextInput(label="Database Password", style=TextStyle.short, required=True)
     db_host = TextInput(label="Database Host (IP or Domain)", style=TextStyle.short, required=True)
     db_port = TextInput(label="Database Port", style=TextStyle.short, required=True, default="5432")
@@ -392,9 +392,6 @@ class SS14Currency(commands.Cog):
             await ctx.send(embed=embed)
         else:
             await ctx.send("The transfer failed. This may be due to insufficient funds.", ephemeral=True)
-
-        else:
-            await ctx.send(f"Failed to add coins for **{player_name}**.", ephemeral=True)
 
     @currency.command(name="leaderboard")
     async def leaderboard(self, ctx: commands.Context):
