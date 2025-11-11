@@ -14,6 +14,7 @@ from discord.ui import View, Button
 from dataclasses import dataclass
 from pathlib import Path
 import aiosqlite
+import time
 
 from redbot.core import commands, Config, checks, app_commands
 from redbot.core.bot import Red
@@ -854,7 +855,7 @@ class SS14Currency(commands.Cog):
         # Check rate limit
         if not await self.check_rate_limit(ctx.author.id, ctx.guild.id):
             wait_time = await self.get_rate_limit_wait_time(ctx.author.id, ctx.guild.id)
-            ready_timestamp = int(asyncio.get_event_loop().time() + wait_time)
+            ready_timestamp = int(time.time() + wait_time)
             await ctx.send(
                 f"⏱️ You're transferring too quickly! Try again <t:{ready_timestamp}:R>.",
                 ephemeral=True
@@ -1649,7 +1650,7 @@ class SS14Currency(commands.Cog):
     @coinflip.error
     async def coinflip_error(self, ctx: commands.Context, error):
         if isinstance(error, commands.CommandOnCooldown):
-            ready_timestamp = int(asyncio.get_event_loop().time() + error.retry_after)
+            ready_timestamp = int(time.time() + error.retry_after)
             await ctx.send(
                 f"🎰 Slow down! You can gamble again <t:{ready_timestamp}:R>.",
                 ephemeral=True
