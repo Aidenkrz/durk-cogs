@@ -86,6 +86,15 @@ class DbConfigModal(Modal, title="Database Configuration"):
 
 class SS14Currency(commands.Cog):
     """Cog for managing SS14 server currency."""
+    async def close_guild_pool(self, guild_id: int):
+        if guild_id in self.guild_pools:
+            pool = self.guild_pools.pop(guild_id)
+            if pool:
+                await pool.close()
+                log.info(f"Closed database connection pool for Guild {guild_id}.")
+        if guild_id in self.pool_locks:
+            del self.pool_locks[guild_id]
+
 
     DEFAULT_GUILD = {
         "db_connection_string": None,
