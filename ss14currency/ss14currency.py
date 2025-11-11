@@ -45,6 +45,8 @@ async def add_player_currency(pool: asyncpg.Pool, player_id: uuid.UUID, amount: 
         return True
     except Exception as e:
         log.error(f"Error adding currency for player {player_id}: {e}", exc_info=True)
+        return False
+
 async def get_leaderboard(pool: asyncpg.Pool) -> list:
     """Gets the top 10 players by currency."""
     conn = await pool.acquire()
@@ -54,7 +56,6 @@ async def get_leaderboard(pool: asyncpg.Pool) -> list:
     finally:
         await pool.release(conn)
 
-class DbConfigModal(Modal, title="Database Configuration"):
 async def get_player_id_from_discord(pool: asyncpg.Pool, discord_id: int) -> Optional[uuid.UUID]:
     """Gets the player's user_id from their discord ID."""
     conn = await pool.acquire()
@@ -64,6 +65,8 @@ async def get_player_id_from_discord(pool: asyncpg.Pool, discord_id: int) -> Opt
         return result
     finally:
         await pool.release(conn)
+
+class DbConfigModal(Modal, title="Database Configuration"):
 
     db_user = TextInput(label="Database Username", style=TextStyle.short, required=True)
     db_pass = TextInput(label="Database Password", style=TextStyle.short, required=True)
