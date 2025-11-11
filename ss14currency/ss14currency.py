@@ -137,18 +137,25 @@ class PlayerInfo:
 
 class ConfirmationView(View):
     """View for confirming large transactions."""
-    def __init__(self, timeout: float = 30.0):
+    def __init__(self, user_id: int, timeout: float = 30.0):
         super().__init__(timeout=timeout)
         self.value = None
+        self.user_id = user_id
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
     async def confirm(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Only the person who initiated this transaction can confirm it.", ephemeral=True)
+            return
         self.value = True
         self.stop()
         await interaction.response.defer()
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
     async def cancel(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("❌ Only the person who initiated this transaction can cancel it.", ephemeral=True)
+            return
         self.value = False
         self.stop()
         await interaction.response.defer()
@@ -211,8 +218,8 @@ class SS14Currency(commands.Cog):
         "db_connection_string": None,
         "transfer_rate_limit": 5,  # Max transfers per time window
         "transfer_rate_window": 60,  # Time window in seconds
-        "gambling_cooldown": 30,  # Seconds between gambling attempts
-        "large_transaction_threshold": 10000,  # Amount requiring confirmation
+        "gambling_cooldown": 10,  # Seconds between gambling attempts
+        "large_transaction_threshold": 1000,  # Amount requiring confirmation
     }
 
     def __init__(self, bot: Red):
@@ -427,7 +434,7 @@ class SS14Currency(commands.Cog):
             color=discord.Color.orange()
         )
         
-        view = ConfirmationView(timeout=30.0)
+        view = ConfirmationView(ctx.author.id, timeout=30.0)
         message = await ctx.send(embed=embed, view=view)
         
         await view.wait()
