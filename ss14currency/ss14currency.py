@@ -262,10 +262,10 @@ class SS14Currency(commands.Cog):
         if balance is not None:
             embed = discord.Embed(title="Coin Balance", color=discord.Color.blue())
             if discord_name:
-                embed.add_field(name="Discord User", value=discord_name, inline=True)
-                embed.add_field(name="SS14 Username", value=player_name, inline=True)
+                embed.add_field(name="Discord User", value=discord.utils.escape_markdown(discord_name), inline=True)
+                embed.add_field(name="SS14 Username", value=discord.utils.escape_markdown(player_name), inline=True)
             else:
-                embed.add_field(name="Player", value=player_name, inline=False)
+                embed.add_field(name="Player", value=discord.utils.escape_markdown(player_name), inline=False)
             embed.add_field(name="Balance", value=f"{balance} coins", inline=False)
             await ctx.send(embed=embed)
         else:
@@ -305,10 +305,10 @@ class SS14Currency(commands.Cog):
         if await set_player_currency(pool, player_id, amount):
             embed = discord.Embed(title="Balance Set", color=discord.Color.green())
             if discord_name:
-                embed.add_field(name="Discord User", value=discord_name, inline=True)
-                embed.add_field(name="SS14 Username", value=player_name, inline=True)
+                embed.add_field(name="Discord User", value=discord.utils.escape_markdown(discord_name), inline=True)
+                embed.add_field(name="SS14 Username", value=discord.utils.escape_markdown(player_name), inline=True)
             else:
-                embed.add_field(name="Player", value=player_name, inline=False)
+                embed.add_field(name="Player", value=discord.utils.escape_markdown(player_name), inline=False)
             embed.add_field(name="New Balance", value=f"{amount} coins", inline=False)
             await ctx.send(embed=embed)
         else:
@@ -344,10 +344,10 @@ class SS14Currency(commands.Cog):
         if await add_player_currency(pool, player_id, amount):
             embed = discord.Embed(title="Balance Updated", color=discord.Color.green())
             if discord_name:
-                embed.add_field(name="Discord User", value=discord_name, inline=True)
-                embed.add_field(name="SS14 Username", value=player_name, inline=True)
+                embed.add_field(name="Discord User", value=discord.utils.escape_markdown(discord_name), inline=True)
+                embed.add_field(name="SS14 Username", value=discord.utils.escape_markdown(player_name), inline=True)
             else:
-                embed.add_field(name="Player", value=player_name, inline=False)
+                embed.add_field(name="Player", value=discord.utils.escape_markdown(player_name), inline=False)
             embed.add_field(name="Amount Added", value=f"{amount} coins", inline=False)
             await ctx.send(embed=embed)
     @currency.command(name="transfer")
@@ -392,16 +392,20 @@ class SS14Currency(commands.Cog):
         transfer_details = await transfer_currency(pool, sender_id, recipient_id, amount)
         if transfer_details:
             sender_name = await get_user_name_from_id(self.session, sender_id)
+            sender_name_escaped = discord.utils.escape_markdown(sender_name)
+            sender_discord_name_escaped = discord.utils.escape_markdown(ctx.author.display_name)
             embed = discord.Embed(title="Transfer Successful", color=discord.Color.green())
 
-            sender_field_name = f"Sender: {ctx.author.display_name} ({sender_name})"
+            sender_field_name = f"Sender: {sender_discord_name_escaped} ({sender_name_escaped})"
             sender_field_value = f"`{transfer_details['sender_old']}` -> `{transfer_details['sender_new']}`"
             embed.add_field(name=sender_field_name, value=sender_field_value, inline=False)
 
+            recipient_name_escaped = discord.utils.escape_markdown(recipient_name)
             if recipient_discord_name:
-                recipient_field_name = f"Recipient: {recipient_discord_name} ({recipient_name})"
+                recipient_discord_name_escaped = discord.utils.escape_markdown(recipient_discord_name)
+                recipient_field_name = f"Recipient: {recipient_discord_name_escaped} ({recipient_name_escaped})"
             else:
-                recipient_field_name = f"Recipient: {recipient_name}"
+                recipient_field_name = f"Recipient: {recipient_name_escaped}"
             recipient_field_value = f"`{transfer_details['recipient_old']}` -> `{transfer_details['recipient_new']}`"
             embed.add_field(name=recipient_field_name, value=recipient_field_value, inline=False)
 
@@ -425,7 +429,7 @@ class SS14Currency(commands.Cog):
 
         embed = discord.Embed(title="Top 10 Coin Holders", color=discord.Color.gold())
         for i, record in enumerate(leaderboard_data, 1):
-            embed.add_field(name=f"{i}. {record['last_seen_user_name']}", value=f"{record['server_currency']} coins", inline=False)
+            embed.add_field(name=f"{i}. {discord.utils.escape_markdown(record['last_seen_user_name'])}", value=f"{record['server_currency']} coins", inline=False)
         await ctx.send(embed=embed)
 
     @app_commands.command(name="coinsetdb")
