@@ -2331,14 +2331,12 @@ class AddOptionModal(Modal, title="Add Market Option"):
     
     def __init__(self):
         super().__init__(timeout=None)
-        self.option_text = None
+        self.submitted_text = None
     
     async def on_submit(self, interaction: discord.Interaction):
-        self.option_text = self.option_text.value.strip()
+        self.submitted_text = self.option_text.value.strip()
         await interaction.response.defer()
 
-
-# End of view/modal classes, continue with coinflip views below
 
 class OpenCoinflipView(View):
     def __init__(self, cog: 'SS14Currency', challenger: discord.Member, amount: int, pool: asyncpg.Pool, guild_id: int):
