@@ -84,6 +84,24 @@ async def get_user_name_from_id(session: aiohttp.ClientSession, user_id: uuid.UU
         log.error(f"Error querying auth API for {user_id}: {e}", exc_info=True)
         return None
 
+async def transfer_currency(pool: asyncpg.Pool, from_player_id: uuid.UUID, to_player_id: uuid.UUID, amount: int) -> bool:
+    """Atomically transfers currency from one player to another."""
+    conn = await pool.acquire()
+    try:
+        async with conn.transaction():
+            sender_balance = await conn.fetchval("SELECT server_currency FROM player WHERE user_id = $1 FOR UPDATE;", from_player_id)
+            if sender_balance is None or sender_balance < amount:
+                return False
+
+            await conn.execute("UPDATE player SET server_currency = server_currency - $1 WHERE user_id = $2;", amount, from_player_id)
+            await conn.execute("UPDATE player SET server_currency = server_currency + $1 WHERE user_id = $2;", amount, to_player_id)
+            return True
+    except Exception as e:
+        log.error(f"Error during currency transfer from {from_player_id} to {to_player_id}: {e}", exc_info=True)
+        return False
+    finally:
+        await pool.release(conn)
+
     db_pass = TextInput(label="Database Password", style=TextStyle.short, required=True)
     db_host = TextInput(label="Database Host (IP or Domain)", style=TextStyle.short, required=True)
     db_port = TextInput(label="Database Port", style=TextStyle.short, required=True, default="5432")
@@ -214,11 +232,15 @@ class SS14Currency(commands.Cog):
 
         if isinstance(user, discord.Member):
             player_id = await get_player_id_from_discord(pool, user.id)
-            if not player_id:
-                await ctx.send(f"{user.mention} does not have a linked SS14 account. They can link their account in https://discord.com/channels/1202734573247795300/1330738082378551326.", ephemeral=True)
-                return
-            player_name = await get_user_name_from_id(self.session, player_id)
-            discord_name = user.display_name
+            if player_id:
+                player_name = await get_user_name_from_id(self.session, player_id)
+                discord_name = user.display_name
+            else:
+                player_id = await self.get_user_id_from_name(user.name)
+                player_name = user.name
+                if not player_id:
+                    await ctx.send(f"Could not find a linked SS14 account for {user.mention} or an SS14 account with the name `{user.name}`. They can link their account in https://discord.com/channels/1202734573247795300/1330738082378551326.", ephemeral=True)
+                    return
         else:
             player_id = await self.get_user_id_from_name(user)
             player_name = user
@@ -318,6 +340,59 @@ class SS14Currency(commands.Cog):
                 embed.add_field(name="Player", value=player_name, inline=False)
             embed.add_field(name="Amount Added", value=f"{amount} coins", inline=False)
             await ctx.send(embed=embed)
+    @currency.command(name="transfer")
+    async def transfer_coins(self, ctx: commands.Context, recipient: typing.Union[discord.Member, str], amount: int):
+        """Transfers coins from your linked SS14 account to another player."""
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("Database connection is not configured for this server.", ephemeral=True)
+            return
+
+        if amount <= 0:
+            await ctx.send("You must transfer a positive amount of coins.", ephemeral=True)
+            return
+
+        sender_id = await get_player_id_from_discord(pool, ctx.author.id)
+        if not sender_id:
+            await ctx.send("Your Discord account is not linked to an SS14 account. Please link your account in https://discord.com/channels/1202734573247795300/1330738082378551326.", ephemeral=True)
+            return
+
+        recipient_id = None
+        recipient_name = None
+        recipient_discord_name = None
+
+        if isinstance(recipient, discord.Member):
+            recipient_id = await get_player_id_from_discord(pool, recipient.id)
+            if not recipient_id:
+                await ctx.send(f"{recipient.mention} does not have a linked SS14 account. They can link their account in https://discord.com/channels/1202734573247795300/1330738082378551326.", ephemeral=True)
+                return
+            recipient_name = await get_user_name_from_id(self.session, recipient_id)
+            recipient_discord_name = recipient.display_name
+        else:
+            recipient_id = await self.get_user_id_from_name(recipient)
+            recipient_name = recipient
+            if not recipient_id:
+                await ctx.send(f"Could not find a user with the name `{recipient}`.", ephemeral=True)
+                return
+
+        if sender_id == recipient_id:
+            await ctx.send("You cannot transfer coins to yourself.", ephemeral=True)
+            return
+
+        success = await transfer_currency(pool, sender_id, recipient_id, amount)
+        if success:
+            sender_name = await get_user_name_from_id(self.session, sender_id)
+            embed = discord.Embed(title="Transfer Successful", color=discord.Color.green())
+            embed.add_field(name="Sender", value=f"{ctx.author.display_name} ({sender_name})", inline=False)
+            if recipient_discord_name:
+                embed.add_field(name="Recipient", value=f"{recipient_discord_name} ({recipient_name})", inline=False)
+            else:
+                embed.add_field(name="Recipient", value=recipient_name, inline=False)
+            embed.add_field(name="Amount", value=f"{amount} coins", inline=False)
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send("The transfer failed. This may be due to insufficient funds.", ephemeral=True)
+
         else:
             await ctx.send(f"Failed to add coins for **{player_name}**.", ephemeral=True)
 
