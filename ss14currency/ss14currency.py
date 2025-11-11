@@ -9,6 +9,8 @@ from discord.ui import Modal, TextInput
 from discord import TextStyle
 import typing
 from typing import Dict, Optional
+import random
+from discord.ui import View, Button
 
 from redbot.core import commands, Config, checks, app_commands
 from redbot.core.bot import Red
@@ -466,3 +468,142 @@ class SS14Currency(commands.Cog):
         except aiohttp.ClientError as e:
             log.error(f"Error querying auth API for {username}: {e}", exc_info=True)
             return None
+
+    @currency.command(name="coinflip")
+    async def coinflip(self, ctx: commands.Context, opponent: discord.Member, amount: int):
+        """Challenges another user to a coinflip for a specified amount."""
+        if opponent.id == ctx.author.id:
+            await ctx.send("You cannot challenge yourself to a coinflip.", ephemeral=True)
+            return
+            
+        if opponent.bot:
+            await ctx.send("You cannot challenge a bot to a coinflip.", ephemeral=True)
+            return
+
+        if amount <= 0:
+            await ctx.send("You must wager a positive amount of coins.", ephemeral=True)
+            return
+
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("Database connection is not configured for this server.", ephemeral=True)
+            return
+
+        challenger_id = await get_player_id_from_discord(pool, ctx.author.id)
+        if not challenger_id:
+            await ctx.send("You must have a linked SS14 account to start a coinflip.", ephemeral=True)
+            return
+
+        opponent_id = await get_player_id_from_discord(pool, opponent.id)
+        if not opponent_id:
+            await ctx.send(f"{opponent.mention} does not have a linked SS14 account and cannot be challenged.", ephemeral=True)
+            return
+
+        challenger_balance = await get_player_currency(pool, challenger_id)
+        if challenger_balance < amount:
+            await ctx.send(f"You do not have enough coins to wager {amount}.", ephemeral=True)
+            return
+
+        opponent_balance = await get_player_currency(pool, opponent_id)
+        if opponent_balance < amount:
+            await ctx.send(f"{opponent.mention} does not have enough coins to accept this wager.", ephemeral=True)
+            return
+            
+        view = CoinflipView(self, ctx.author, opponent, amount, pool)
+        
+        embed = discord.Embed(
+            title="⚔️ Coinflip Challenge! ⚔️",
+            description=f"{ctx.author.mention} has challenged {opponent.mention} to a coinflip for **{amount}** coins!",
+            color=discord.Color.orange()
+        )
+        message = await ctx.send(embed=embed, view=view)
+        view.message = message
+
+class CoinflipView(View):
+    def __init__(self, cog: 'SS14Currency', challenger: discord.Member, opponent: discord.Member, amount: int, pool: asyncpg.Pool):
+        super().__init__(timeout=60)
+        self.cog = cog
+        self.challenger = challenger
+        self.opponent = opponent
+        self.amount = amount
+        self.pool = pool
+        self.result = None
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        await self.message.edit(content="Coinflip challenge expired.", view=self)
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.green)
+    async def accept_button(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id != self.opponent.id:
+            await interaction.response.send_message("You are not the opponent in this coinflip.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        challenger_id = await get_player_id_from_discord(self.pool, self.challenger.id)
+        opponent_id = await get_player_id_from_discord(self.pool, self.opponent.id)
+
+        challenger_balance = await get_player_currency(self.pool, challenger_id)
+        opponent_balance = await get_player_currency(self.pool, opponent_id)
+
+        if challenger_balance < self.amount:
+            await interaction.followup.send(f"{self.challenger.mention} no longer has enough coins for this coinflip.", ephemeral=True)
+            self.stop()
+            return
+        if opponent_balance < self.amount:
+            await interaction.followup.send("You no longer have enough coins for this coinflip.", ephemeral=True)
+            self.stop()
+            return
+
+        winner = random.choice([self.challenger, self.opponent])
+        loser = self.opponent if winner.id == self.challenger.id else self.challenger
+        
+        winner_player_id = challenger_id if winner.id == self.challenger.id else opponent_id
+        loser_player_id = opponent_id if winner.id == self.challenger.id else challenger_id
+
+        transfer_details = await transfer_currency(self.pool, loser_player_id, winner_player_id, self.amount)
+
+        for item in self.children:
+            item.disabled = True
+        
+        if transfer_details:
+            winner_name = await get_user_name_from_id(self.cog.session, winner_player_id)
+            loser_name = await get_user_name_from_id(self.cog.session, loser_player_id)
+
+            embed = discord.Embed(title="Coinflip Result!", color=discord.Color.gold())
+            embed.description = f"**{discord.utils.escape_markdown(winner.display_name)}** won the coinflip against **{discord.utils.escape_markdown(loser.display_name)}**!"
+            
+            winner_field_name = f"Winner: {discord.utils.escape_markdown(winner.display_name)} ({discord.utils.escape_markdown(winner_name)})"
+            winner_field_value = f"`{transfer_details['recipient_old']}` -> `{transfer_details['recipient_new']}`"
+            embed.add_field(name=winner_field_name, value=winner_field_value, inline=False)
+            
+            loser_field_name = f"Loser: {discord.utils.escape_markdown(loser.display_name)} ({discord.utils.escape_markdown(loser_name)})"
+            loser_field_value = f"`{transfer_details['sender_old']}` -> `{transfer_details['sender_new']}`"
+            embed.add_field(name=loser_field_name, value=loser_field_value, inline=False)
+
+            embed.add_field(name="Wager", value=f"{self.amount} coins", inline=False)
+
+            await self.message.edit(content=None, embed=embed, view=self)
+        else:
+            await self.message.edit(content="An error occurred during the transfer.", view=self)
+        
+        self.stop()
+
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.red)
+    async def decline_button(self, interaction: discord.Interaction, button: Button):
+        if interaction.user.id not in (self.challenger.id, self.opponent.id):
+            await interaction.response.send_message("You are not part of this coinflip.", ephemeral=True)
+            return
+
+        for item in self.children:
+            item.disabled = True
+
+        if interaction.user.id == self.opponent.id:
+            await self.message.edit(content=f"{self.opponent.mention} has declined the coinflip.", view=self)
+        else: # Challenger cancelled
+             await self.message.edit(content=f"{self.challenger.mention} has cancelled the coinflip.", view=self)
+        
+        self.stop()
