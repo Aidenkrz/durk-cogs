@@ -757,34 +757,34 @@ class SS14Currency(commands.Cog):
             }
         return {'count': 0, 'total': 0, 'average': 0, 'largest': 0}
 
-        async def record_tax(self, guild_id: int, tax_type: str, amount: int) -> bool:
-            """Records tax revenue in the local database."""
-            if self.local_db is None:
-                await self.initialize_local_db()
-            
-            try:
-                await self.local_db.execute("""
-                    INSERT INTO tax_revenue (guild_id, tax_type, amount)
-                    VALUES (?, ?, ?)
-                """, (guild_id, tax_type, amount))
-                await self.local_db.commit()
-                return True
-            except Exception as e:
-                log.error(f"Error recording tax: {e}", exc_info=True)
-                return False
+    async def record_tax(self, guild_id: int, tax_type: str, amount: int) -> bool:
+        """Records tax revenue in the local database."""
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        try:
+            await self.local_db.execute("""
+                INSERT INTO tax_revenue (guild_id, tax_type, amount)
+                VALUES (?, ?, ?)
+            """, (guild_id, tax_type, amount))
+            await self.local_db.commit()
+            return True
+        except Exception as e:
+            log.error(f"Error recording tax: {e}", exc_info=True)
+            return False
 
-        async def get_total_tax_revenue(self, guild_id: int) -> int:
-            """Gets total tax revenue collected for a guild."""
-            if self.local_db is None:
-                await self.initialize_local_db()
-            
-            async with self.local_db.execute("""
-                SELECT COALESCE(SUM(amount), 0)
-                FROM tax_revenue
-                WHERE guild_id = ?
-            """, (guild_id,)) as cursor:
-                result = await cursor.fetchone()
-                return result[0] if result else 0
+    async def get_total_tax_revenue(self, guild_id: int) -> int:
+        """Gets total tax revenue collected for a guild."""
+        if self.local_db is None:
+            await self.initialize_local_db()
+        
+        async with self.local_db.execute("""
+            SELECT COALESCE(SUM(amount), 0)
+            FROM tax_revenue
+            WHERE guild_id = ?
+        """, (guild_id,)) as cursor:
+            result = await cursor.fetchone()
+            return result[0] if result else 0
 
     @commands.group(name="currency")
     @commands.guild_only()
