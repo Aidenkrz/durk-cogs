@@ -936,7 +936,7 @@ class SS14Currency(commands.Cog):
 
         # Deduct coins
         success, old_balance, new_balance = await add_player_currency(pool, player_info.player_id, -COST)
-        await self.cog.record_tax(self.guild_id, "flex", COST)
+        await record_tax(self.guild_id, "flex", COST)
         if not success:
             await ctx.send("❌ Failed to deduct coins.", ephemeral=True)
             return
