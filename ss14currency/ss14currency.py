@@ -929,7 +929,7 @@ class SS14Currency(commands.Cog):
             return
 
         # Check if user has enough coins
-        current_balance = await self.get_player_currency(pool, player_info.player_id)
+        current_balance = await get_player_currency(pool, player_info.player_id)
         if current_balance < COST:
             await ctx.send(f"❌ You need at least {COST:,} coins to flex (you have {current_balance:,}).", ephemeral=True)
             return
