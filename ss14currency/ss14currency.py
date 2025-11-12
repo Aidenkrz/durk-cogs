@@ -1584,46 +1584,142 @@ class SS14Currency(commands.Cog):
                 inline=True
             )
         
-        # Health score (0-100)
         health_score = 0
+        health_details = []
         
-        # Active player participation (up to 30 points)
+        # 1. PARTICIPATION RATE (0-25 points)
+        # Measures what % of players are economically active
+        # Uses logarithmic scaling so it's harder to max out
         if total_players > 0:
-            health_score += min(30, total_players)
+            # Log scale: log10(players) * 10, capped at 25
+            # 1 player = 0 points, 10 players = 10 points, 100 players = 20 points, 316+ players = 25 points
+            participation_score = min(25, math.log10(total_players) * 10)
+            health_score += participation_score
+            health_details.append(f"👥 Participation: {participation_score:.1f}/25")
         
-        # Transaction activity (up to 40 points)
-        if volume_24h['count'] > 0:
-            health_score += min(40, volume_24h['count'] * 2)
+        # 2. TRANSACTION ACTIVITY (0-25 points)
+        # Measures transactions per player per day (activity density)
+        if total_players > 0 and volume_24h['count'] > 0:
+            tx_per_player = volume_24h['count'] / total_players
+            # 0.5 tx/player/day = 12.5 points, 1 tx/player/day = 25 points
+            activity_score = min(25, tx_per_player * 25)
+            health_score += activity_score
+            health_details.append(f"📊 Activity: {activity_score:.1f}/25 ({tx_per_player:.2f} tx/player/day)")
+        else:
+            health_details.append(f"📊 Activity: 0/25 (no transactions)")
         
-        # Wealth distribution (up to 30 points - lower inequality is better)
+        # 3. MONEY VELOCITY (0-20 points)
+        # Measures how quickly money moves through the economy
+        if total_wealth > 0 and volume_24h['total'] > 0:
+            daily_velocity = (volume_24h['total'] / total_wealth) * 100
+            # 5% daily velocity = 10 points, 10% = 20 points
+            velocity_score = min(20, daily_velocity * 2)
+            health_score += velocity_score
+            health_details.append(f"⚡ Velocity: {velocity_score:.1f}/20 ({daily_velocity:.2f}% daily)")
+        else:
+            health_details.append(f"⚡ Velocity: 0/20 (no movement)")
+        
+        # 4. WEALTH DISTRIBUTION (0-20 points)
+        # Lower inequality is better
         if median_wealth > 0:
             inequality = ((avg_wealth - median_wealth) / median_wealth) * 100
-            if inequality < 50:
-                health_score += 30
+            # Inverse scoring: lower inequality = more points
+            if inequality < 25:
+                distribution_score = 20
+            elif inequality < 50:
+                distribution_score = 18
+            elif inequality < 75:
+                distribution_score = 15
             elif inequality < 100:
-                health_score += 20
+                distribution_score = 12
+            elif inequality < 150:
+                distribution_score = 8
             else:
-                health_score += 10
+                distribution_score = 5
+            health_score += distribution_score
+            health_details.append(f"⚖️ Distribution: {distribution_score}/20 ({inequality:.1f}% inequality)")
+        else:
+            health_details.append(f"⚖️ Distribution: 0/20")
+        
+        # 5. ECONOMIC DIVERSITY (0-10 points)
+        # Measures variety of transaction types (gambling, transfers, markets)
+        transaction_types = 0
+        if volume_24h['count'] > 0:
+            transaction_types += 1  # Has transfers
+        
+        # Check for gambling activity
+        if self.local_db:
+            async with self.local_db.execute("""
+                SELECT COUNT(*) FROM transaction_history
+                WHERE guild_id = ? AND transaction_type = 'gambling'
+                AND timestamp >= datetime('now', '-24 hours')
+            """, (ctx.guild.id,)) as cursor:
+                gambling_count = (await cursor.fetchone())[0]
+                if gambling_count > 0:
+                    transaction_types += 1
+            
+            # Check for market activity
+            async with self.local_db.execute("""
+                SELECT COUNT(*) FROM transaction_history
+                WHERE guild_id = ? AND transaction_type IN ('market_bet', 'market_win')
+                AND timestamp >= datetime('now', '-24 hours')
+            """, (ctx.guild.id,)) as cursor:
+                market_count = (await cursor.fetchone())[0]
+                if market_count > 0:
+                    transaction_types += 1
+        
+        # 1 type = 3 points, 2 types = 7 points, 3 types = 10 points
+        diversity_map = {0: 0, 1: 3, 2: 7, 3: 10}
+        diversity_score = diversity_map.get(transaction_types, 0)
+        health_score += diversity_score
+        
+        type_names = []
+        if volume_24h['count'] > 0:
+            type_names.append("transfers")
+        if self.local_db and gambling_count > 0:
+            type_names.append("gambling")
+        if self.local_db and market_count > 0:
+            type_names.append("markets")
+        
+        types_text = ", ".join(type_names) if type_names else "none"
+        health_details.append(f"🎯 Diversity: {diversity_score}/10 ({types_text})")
         
         health_score = min(100, health_score)
         
-        if health_score >= 80:
+        # Determine health status and color
+        if health_score >= 85:
             health_status = "🟢 Excellent"
             health_color = discord.Color.green()
-        elif health_score >= 60:
-            health_status = "🟡 Good"
-            health_color =discord.Color.gold()
+            health_desc = "Thriving economy with high participation and activity"
+        elif health_score >= 70:
+            health_status = "🟢 Good"
+            health_color = discord.Color.green()
+            health_desc = "Healthy economy with solid fundamentals"
+        elif health_score >= 55:
+            health_status = "🟡 Fair"
+            health_color = discord.Color.gold()
+            health_desc = "Moderate economy with room for growth"
         elif health_score >= 40:
-            health_status = "🟠 Fair"
+            health_status = "🟠 Needs Improvement"
             health_color = discord.Color.orange()
+            health_desc = "Struggling economy requiring attention"
         else:
             health_status = "🔴 Poor"
             health_color = discord.Color.red()
+            health_desc = "Weak economy needing significant intervention"
         
         embed.add_field(
             name="🏥 Economy Health Score",
-            value=f"{health_status} ({health_score}/100)",
-            inline=True
+            value=f"{health_status} ({health_score:.1f}/100)\n*{health_desc}*",
+            inline=False
+        )
+        
+        # Add breakdown
+        breakdown = "\n".join(health_details)
+        embed.add_field(
+            name="📋 Score Breakdown",
+            value=breakdown,
+            inline=False
         )
         
         embed.color = health_color
