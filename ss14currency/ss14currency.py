@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import aiosqlite
 import time
+import secrets
 
 from redbot.core import commands, Config, checks, app_commands
 from redbot.core.bot import Red
@@ -1963,8 +1964,7 @@ class SS14Currency(commands.Cog):
             await self.initialize_local_db()
         
         # Generate unique market ID (short 8-character hex)
-        import secrets
-        market_id = f"{ctx.guild.id}_{secrets.token_hex(4)}"
+        market_id = f"{secrets.token_hex(6)}"
         
         # Create the market
         try:
