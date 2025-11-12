@@ -16,6 +16,7 @@ from pathlib import Path
 import aiosqlite
 import time
 import secrets
+import math
 
 from redbot.core import commands, Config, checks, app_commands
 from redbot.core.bot import Red
