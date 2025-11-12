@@ -2320,7 +2320,8 @@ class MarketOptionsView(View):
     
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
     async def cancel(self, interaction: discord.Interaction, button: Button):
-        """Cancel market creation."""        if interaction.user.id != self.creator_id:
+        """Cancel market creation."""
+        if interaction.user.id != self.creator_id:
             await interaction.response.send_message("❌ Only the market creator can cancel setup.", ephemeral=True)
             return
             
