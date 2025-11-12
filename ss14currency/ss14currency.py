@@ -949,14 +949,24 @@ class SS14Currency(commands.Cog):
 
         transfer_details = await transfer_currency(pool, sender_id, recipient_info.player_id, amount)
         if transfer_details:
-            # Log transaction
+            # Log transaction for sender
             await self.log_transaction(
-                ctx.guild.id, "transfer", amount,
+                ctx.guild.id, "transfer", -amount,
                 from_player_id=sender_id,
                 to_player_id=recipient_info.player_id,
                 balance_before=transfer_details['sender_old'],
                 balance_after=transfer_details['sender_new'],
-                notes=f"Transfer from {ctx.author.name}"
+                notes=f"Sent to {recipient_info.player_name}"
+            )
+            
+            # Log transaction for recipient
+            await self.log_transaction(
+                ctx.guild.id, "transfer", amount,
+                from_player_id=sender_id,
+                to_player_id=recipient_info.player_id,
+                balance_before=transfer_details['recipient_old'],
+                balance_after=transfer_details['recipient_new'],
+                notes=f"Received from {ctx.author.name}"
             )
             
             sender_name = await get_user_name_from_id(self.session, sender_id)
@@ -1979,7 +1989,7 @@ class SS14Currency(commands.Cog):
             return
         
         # Show option entry view
-        view = MarketOptionsView(self, market_id, question, ctx.guild.id)
+        view = MarketOptionsView(self, market_id, question, ctx.guild.id, ctx.author.id)
         embed = discord.Embed(
             title="📊 Creating Prediction Market",
             description=f"**Question:** {discord.utils.escape_markdown(question)}\n\nAdd betting options using the buttons below.",
@@ -2049,6 +2059,47 @@ class SS14Currency(commands.Cog):
         if not option_data:
             await ctx.send(f"❌ Invalid option number {option}.", ephemeral=True)
             return
+        
+        # Deduct coins from player (atomically)
+        success, old_balance, new_balance = await add_player_currency(pool, player_id, -amount)
+        if not success:
+            await ctx.send("❌ Failed to deduct coins. Please try again.", ephemeral=True)
+            return
+        
+        # Record the bet
+        try:
+            await self.local_db.execute("""
+                INSERT INTO prediction_bets (market_id, player_id, guild_id, option_index, amount)
+                VALUES (?, ?, ?, ?, ?)
+            """, (market_id, str(player_id), ctx.guild.id, option, amount))
+            await self.local_db.commit()
+            
+            # Log transaction
+            await self.log_transaction(
+                ctx.guild.id, "market_bet", amount,
+                from_player_id=player_id,
+                balance_before=old_balance,
+                balance_after=new_balance,
+                notes=f"Bet on market {market_id} option {option}"
+            )
+            
+            embed = discord.Embed(
+                title="✅ Bet Placed",
+                description=f"**Question:** {discord.utils.escape_markdown(market[0])}",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="Your Bet", value=f"Option {option}: {discord.utils.escape_markdown(option_data[0])}", inline=False)
+            embed.add_field(name="Amount Wagered", value=f"{amount:,} coins", inline=True)
+            embed.add_field(name="New Balance", value=f"{new_balance:,} coins", inline=True)
+            embed.set_footer(text=f"Market ID: {market_id}")
+            
+            await ctx.send(embed=embed)
+            
+        except Exception as e:
+            # Refund if bet recording fails
+            log.error(f"Error recording bet: {e}", exc_info=True)
+            await add_player_currency(pool, player_id, amount)
+            await ctx.send("❌ Failed to record bet. Your coins have been refunded.", ephemeral=True)
 
     @app_commands.command(name="coinsetdb")
     @app_commands.guild_only()
@@ -2095,7 +2146,7 @@ class SS14Currency(commands.Cog):
     @currency.command(name="coinflip")
     @commands.cooldown(rate=1, per=30.0, type=commands.BucketType.user)
     async def coinflip(self, ctx: commands.Context, amount: int, opponent: discord.Member = None):
-        """Challenges another user to a coinfli for a specified amount.
+        """Challenges another user to a coinflip for a specified amount.
         
         If no opponent is specified, the challenge will be open for anyone to accept.
         """
@@ -2169,56 +2220,15 @@ class SS14Currency(commands.Cog):
 
 # End of SS14Currency class
 
-        
-        # Deduct coins from player (atomically)
-        success, old_balance, new_balance = await add_player_currency(pool, player_id, -amount)
-        if not success:
-            await ctx.send("❌ Failed to deduct coins. Please try again.", ephemeral=True)
-            return
-        
-        # Record the bet
-        try:
-            await self.local_db.execute("""
-                INSERT INTO prediction_bets (market_id, player_id, guild_id, option_index, amount)
-                VALUES (?, ?, ?, ?, ?)
-            """, (market_id, str(player_id), ctx.guild.id, option, amount))
-            await self.local_db.commit()
-            
-            # Log transaction
-            await self.log_transaction(
-                ctx.guild.id, "market_bet", amount,
-                from_player_id=player_id,
-                balance_before=old_balance,
-                balance_after=new_balance,
-                notes=f"Bet on market {market_id[:16]}... option {option}"
-            )
-            
-            embed = discord.Embed(
-                title="✅ Bet Placed",
-                description=f"**Question:** {market[0]}",
-                color=discord.Color.green()
-            )
-            embed.add_field(name="Your Bet", value=f"Option {option}: {option_data[0]}", inline=False)
-            embed.add_field(name="Amount Wagered", value=f"{amount:,} coins", inline=True)
-            embed.add_field(name="New Balance", value=f"{new_balance:,} coins", inline=True)
-            embed.set_footer(text=f"Market ID: {market_id}")
-            
-            await ctx.send(embed=embed)
-            
-        except Exception as e:
-            # Refund if bet recording fails
-            log.error(f"Error recording bet: {e}", exc_info=True)
-            await add_player_currency(pool, player_id, amount)
-            await ctx.send("❌ Failed to record bet. Your coins have been refunded.", ephemeral=True)
-
 class MarketOptionsView(View):
     """View for adding options to a prediction market during creation."""
-    def __init__(self, cog: 'SS14Currency', market_id: str, question: str, guild_id: int):
+    def __init__(self, cog: 'SS14Currency', market_id: str, question: str, guild_id: int, creator_id: int):
         super().__init__(timeout=300)
         self.cog = cog
         self.market_id = market_id
         self.question = question
         self.guild_id = guild_id
+        self.creator_id = creator_id
         self.options = []
         self.message = None
     
@@ -2226,12 +2236,12 @@ class MarketOptionsView(View):
         """Update the embed to show current options."""
         embed = discord.Embed(
             title="📊 Creating Prediction Market",
-            description=f"**Question:** {self.question}\n\nAdd betting options using the buttons below.",
+            description=f"**Question:** {discord.utils.escape_markdown(self.question)}\n\nAdd betting options using the buttons below.",
             color=discord.Color.blue()
         )
         
         if self.options:
-            options_text = "\n".join([f"{i+1}. {opt}" for i, opt in enumerate(self.options)])
+            options_text = "\n".join([f"{i+1}. {discord.utils.escape_markdown(opt)}" for i, opt in enumerate(self.options)])
             embed.add_field(name="Options Added", value=options_text, inline=False)
         else:
             embed.add_field(name="Options Added", value="None yet", inline=False)
@@ -2244,6 +2254,10 @@ class MarketOptionsView(View):
     @discord.ui.button(label="Add Option", style=discord.ButtonStyle.green)
     async def add_option(self, interaction: discord.Interaction, button: Button):
         """Add a new option to the market."""
+        if interaction.user.id != self.creator_id:
+            await interaction.response.send_message("❌ Only the market creator can add options.", ephemeral=True)
+            return
+            
         modal = AddOptionModal()
         await interaction.response.send_modal(modal)
         await modal.wait()
@@ -2255,6 +2269,10 @@ class MarketOptionsView(View):
     @discord.ui.button(label="Finish", style=discord.ButtonStyle.primary)
     async def finish(self, interaction: discord.Interaction, button: Button):
         """Finish creating the market."""
+        if interaction.user.id != self.creator_id:
+            await interaction.response.send_message("❌ Only the market creator can finish setup.", ephemeral=True)
+            return
+            
         if len(self.options) < 2:
             await interaction.response.send_message("❌ You need at least 2 options.", ephemeral=True)
             return
@@ -2302,7 +2320,10 @@ class MarketOptionsView(View):
     
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
     async def cancel(self, interaction: discord.Interaction, button: Button):
-        """Cancel market creation."""
+        """Cancel market creation."""        if interaction.user.id != self.creator_id:
+            await interaction.response.send_message("❌ Only the market creator can cancel setup.", ephemeral=True)
+            return
+            
         await interaction.response.defer()
         
         # Delete the market from database
