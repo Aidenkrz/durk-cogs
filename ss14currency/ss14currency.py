@@ -85,7 +85,7 @@ async def get_leaderboard(pool: asyncpg.Pool) -> list:
 async def get_leaderboardasc(pool: asyncpg.Pool) -> list:
     """Gets the top 10 players by currency."""
     async with pool.acquire() as conn:
-        query = "SELECT last_seen_user_name, server_currency FROM player ORDER BY server_currency ASC LIMIT 10;"
+        query = "SELECT last_seen_user_name, server_currency FROM player WHERE server_currency != 0 ORDER BY server_currency ASC LIMIT 10;"
         return await conn.fetch(query)
 
 async def get_player_id_from_discord(pool: asyncpg.Pool, discord_id: int) -> Optional[uuid.UUID]:
