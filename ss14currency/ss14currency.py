@@ -384,7 +384,21 @@ class SS14Currency(commands.Cog):
             CREATE INDEX IF NOT EXISTS idx_bets_player
             ON prediction_bets(player_id, guild_id)
         """)
-        
+
+        await self.local_db.execute("""
+            CREATE TABLE IF NOT EXISTS tax_revenue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                tax_type TEXT NOT NULL,
+                amount INTEGER NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await self.local_db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_tax_guild
+            ON tax_revenue(guild_id)
+        """)
+
         await self.local_db.commit()
         log.info("Local database initialized with gambling stats, transaction history, and prediction markets.")
 
@@ -742,6 +756,35 @@ class SS14Currency(commands.Cog):
                 'largest': row[3] or 0
             }
         return {'count': 0, 'total': 0, 'average': 0, 'largest': 0}
+
+        async def record_tax(self, guild_id: int, tax_type: str, amount: int) -> bool:
+            """Records tax revenue in the local database."""
+            if self.local_db is None:
+                await self.initialize_local_db()
+            
+            try:
+                await self.local_db.execute("""
+                    INSERT INTO tax_revenue (guild_id, tax_type, amount)
+                    VALUES (?, ?, ?)
+                """, (guild_id, tax_type, amount))
+                await self.local_db.commit()
+                return True
+            except Exception as e:
+                log.error(f"Error recording tax: {e}", exc_info=True)
+                return False
+
+        async def get_total_tax_revenue(self, guild_id: int) -> int:
+            """Gets total tax revenue collected for a guild."""
+            if self.local_db is None:
+                await self.initialize_local_db()
+            
+            async with self.local_db.execute("""
+                SELECT COALESCE(SUM(amount), 0)
+                FROM tax_revenue
+                WHERE guild_id = ?
+            """, (guild_id,)) as cursor:
+                result = await cursor.fetchone()
+                return result[0] if result else 0
 
     @commands.group(name="currency")
     @commands.guild_only()
@@ -1457,6 +1500,9 @@ class SS14Currency(commands.Cog):
             await ctx.send("Database connection is not configured.", ephemeral=True)
             return
 
+        # Get tax revenue
+        tax_revenue = await self.get_total_tax_revenue(ctx.guild.id)
+
         # Get wealth distribution
         wealth_stats = await self.get_wealth_distribution(pool)
         
@@ -1481,7 +1527,7 @@ class SS14Currency(commands.Cog):
         total_players = int(wealth_stats.get('total_players', 0) or 0)
         avg_wealth = float(wealth_stats.get('avg_wealth', 0) or 0)
         median_wealth = float(wealth_stats.get('median_wealth', 0) or 0)
-        
+
         embed.add_field(
             name="💰 Total Wealth in Circulation",
             value=f"{int(total_wealth):,} coins",
@@ -1520,7 +1566,14 @@ class SS14Currency(commands.Cog):
                 value=f"**Daily:** {daily_velocity:.2f}% of total wealth\n**Weekly:** {weekly_velocity:.2f}% of total wealth",
                 inline=False
             )
-        
+
+        # Tax Revenue
+        embed.add_field(
+            name="🏦 Total Tax Revenue",
+            value=f"{tax_revenue:,} coins collected",
+            inline=False
+        )
+
         # Inequality metric
         if median_wealth > 0:
             inequality = ((avg_wealth - median_wealth) / median_wealth) * 100
@@ -2418,9 +2471,16 @@ class OpenCoinflipView(View):
         
         winner_player_id = challenger_id if winner.id == self.challenger.id else opponent_id
         loser_player_id = opponent_id if winner.id == self.challenger.id else challenger_id
-
-        transfer_details = await transfer_currency(self.pool, loser_player_id, winner_player_id, self.amount)
         
+        tax_amount = int(self.amount * 0.05)
+        winner_receives = self.amount - tax_amount
+
+        transfer_details = await transfer_currency(self.pool, loser_player_id, winner_player_id, winner_receives)
+        
+        for item in self.children:
+            item.disabled = True
+
+
         for item in self.children:
             item.disabled = True
 
@@ -2428,10 +2488,13 @@ class OpenCoinflipView(View):
             winner_name = await get_user_name_from_id(self.cog.session, winner_player_id)
             loser_name = await get_user_name_from_id(self.cog.session, loser_player_id)
             
-            # Record gambling statistics
+            # Record tax
+            await self.cog.record_tax(self.guild_id, "coinflip", tax_amount)
+            
+            # Record gambling statistics (net for winner is reduced by tax)
             await self.cog.record_gambling_result(
                 self.guild_id, winner_player_id, "coinflip",
-                self.amount, True, self.amount
+                self.amount, True, winner_receives
             )
             await self.cog.record_gambling_result(
                 self.guild_id, loser_player_id, "coinflip",
@@ -2440,12 +2503,12 @@ class OpenCoinflipView(View):
             
             # Log gambling transactions
             await self.cog.log_transaction(
-                self.guild_id, "gambling", self.amount,
+                self.guild_id, "gambling", winner_receives,
                 from_player_id=loser_player_id,
                 to_player_id=winner_player_id,
                 balance_before=transfer_details['recipient_old'],
                 balance_after=transfer_details['recipient_new'],
-                notes=f"Coinflip win vs {loser_name}"
+                notes=f"Coinflip win vs {loser_name} (after {tax_amount} tax)"
             )
             await self.cog.log_transaction(
                 self.guild_id, "gambling", -self.amount,
@@ -2456,18 +2519,20 @@ class OpenCoinflipView(View):
                 notes=f"Coinflip loss vs {winner_name}"
             )
 
-            embed = discord.Embed(title="Coinflip Result!", color=discord.Color.gold())
+            embed = discord.Embed(title="🪙 Coinflip Result!", color=discord.Color.gold())
             embed.description = f"**{discord.utils.escape_markdown(winner.display_name)}** won the coinflip against **{discord.utils.escape_markdown(loser.display_name)}**!"
             
-            winner_field_name = f"Winner: {discord.utils.escape_markdown(winner.display_name)} ({discord.utils.escape_markdown(winner_name)})"
-            winner_field_value = f"`{transfer_details['recipient_old']}` -> `{transfer_details['recipient_new']}`"
+            winner_field_name = f"🏆 Winner: {discord.utils.escape_markdown(winner.display_name)} ({discord.utils.escape_markdown(winner_name)})"
+            winner_field_value = f"`{transfer_details['recipient_old']:,}` ➜ `{transfer_details['recipient_new']:,}`"
             embed.add_field(name=winner_field_name, value=winner_field_value, inline=False)
             
-            loser_field_name = f"Loser: {discord.utils.escape_markdown(loser.display_name)} ({discord.utils.escape_markdown(loser_name)})"
-            loser_field_value = f"`{transfer_details['sender_old']}` -> `{transfer_details['sender_new']}`"
+            loser_field_name = f"💸 Loser: {discord.utils.escape_markdown(loser.display_name)} ({discord.utils.escape_markdown(loser_name)})"
+            loser_field_value = f"`{transfer_details['sender_old']:,}` ➜ `{transfer_details['sender_new']:,}`"
             embed.add_field(name=loser_field_name, value=loser_field_value, inline=False)
 
-            embed.add_field(name="Wager", value=f"{self.amount} coins", inline=False)
+            embed.add_field(name="💰 Total Wager", value=f"{self.amount:,} coins", inline=True)
+            embed.add_field(name="🏦 Tax (5%)", value=f"{tax_amount:,} coins", inline=True)
+            embed.add_field(name="✨ Winner Receives", value=f"{winner_receives:,} coins", inline=True)
             
             await self.message.edit(content=None, embed=embed, view=self)
         else:
@@ -2526,19 +2591,29 @@ class CoinflipView(View):
         winner_player_id = challenger_id if winner.id == self.challenger.id else opponent_id
         loser_player_id = opponent_id if winner.id == self.challenger.id else challenger_id
 
-        transfer_details = await transfer_currency(self.pool, loser_player_id, winner_player_id, self.amount)
+        tax_amount = int(self.amount * 0.05)
+        winner_receives = self.amount - tax_amount
+
+        transfer_details = await transfer_currency(self.pool, loser_player_id, winner_player_id, winner_receives)
+        
+        for item in self.children:
+            item.disabled = True
+
 
         for item in self.children:
             item.disabled = True
-        
+
         if transfer_details:
             winner_name = await get_user_name_from_id(self.cog.session, winner_player_id)
             loser_name = await get_user_name_from_id(self.cog.session, loser_player_id)
             
-            # Record gambling statistics
+            # Record tax
+            await self.cog.record_tax(self.guild_id, "coinflip", tax_amount)
+            
+            # Record gambling statistics (net for winner is reduced by tax)
             await self.cog.record_gambling_result(
                 self.guild_id, winner_player_id, "coinflip",
-                self.amount, True, self.amount
+                self.amount, True, winner_receives
             )
             await self.cog.record_gambling_result(
                 self.guild_id, loser_player_id, "coinflip",
@@ -2547,12 +2622,12 @@ class CoinflipView(View):
             
             # Log gambling transactions
             await self.cog.log_transaction(
-                self.guild_id, "gambling", self.amount,
+                self.guild_id, "gambling", winner_receives,
                 from_player_id=loser_player_id,
                 to_player_id=winner_player_id,
                 balance_before=transfer_details['recipient_old'],
                 balance_after=transfer_details['recipient_new'],
-                notes=f"Coinflip win vs {loser_name}"
+                notes=f"Coinflip win vs {loser_name} (after {tax_amount} tax)"
             )
             await self.cog.log_transaction(
                 self.guild_id, "gambling", -self.amount,
@@ -2563,19 +2638,21 @@ class CoinflipView(View):
                 notes=f"Coinflip loss vs {winner_name}"
             )
 
-            embed = discord.Embed(title="Coinflip Result!", color=discord.Color.gold())
+            embed = discord.Embed(title="🪙 Coinflip Result!", color=discord.Color.gold())
             embed.description = f"**{discord.utils.escape_markdown(winner.display_name)}** won the coinflip against **{discord.utils.escape_markdown(loser.display_name)}**!"
             
-            winner_field_name = f"Winner: {discord.utils.escape_markdown(winner.display_name)} ({discord.utils.escape_markdown(winner_name)})"
-            winner_field_value = f"`{transfer_details['recipient_old']}` -> `{transfer_details['recipient_new']}`"
+            winner_field_name = f"🏆 Winner: {discord.utils.escape_markdown(winner.display_name)} ({discord.utils.escape_markdown(winner_name)})"
+            winner_field_value = f"`{transfer_details['recipient_old']:,}` ➜ `{transfer_details['recipient_new']:,}`"
             embed.add_field(name=winner_field_name, value=winner_field_value, inline=False)
             
-            loser_field_name = f"Loser: {discord.utils.escape_markdown(loser.display_name)} ({discord.utils.escape_markdown(loser_name)})"
-            loser_field_value = f"`{transfer_details['sender_old']}` -> `{transfer_details['sender_new']}`"
+            loser_field_name = f"💸 Loser: {discord.utils.escape_markdown(loser.display_name)} ({discord.utils.escape_markdown(loser_name)})"
+            loser_field_value = f"`{transfer_details['sender_old']:,}` ➜ `{transfer_details['sender_new']:,}`"
             embed.add_field(name=loser_field_name, value=loser_field_value, inline=False)
 
-            embed.add_field(name="Wager", value=f"{self.amount} coins", inline=False)
-
+            embed.add_field(name="💰 Total Wager", value=f"{self.amount:,} coins", inline=True)
+            embed.add_field(name="🏦 Tax (5%)", value=f"{tax_amount:,} coins", inline=True)
+            embed.add_field(name="✨ Winner Receives", value=f"{winner_receives:,} coins", inline=True)
+            
             await self.message.edit(content=None, embed=embed, view=self)
         else:
             await self.message.edit(content="An error occurred during the transfer.", view=self)
