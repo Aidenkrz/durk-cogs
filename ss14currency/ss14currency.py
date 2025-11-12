@@ -2595,8 +2595,9 @@ class OpenCoinflipView(View):
         winner_player_id = challenger_id if winner.id == self.challenger.id else opponent_id
         loser_player_id = opponent_id if winner.id == self.challenger.id else challenger_id
         
-        tax_amount = int(self.amount * 0.05)
-        winner_receives = self.amount - tax_amount
+        total_pot = self.amount * 2
+        tax_amount = int(total_pot * 0.05)
+        winner_receives = total_pot - tax_amount
 
         transfer_details = await transfer_currency(self.pool, loser_player_id, winner_player_id, winner_receives)
         
@@ -2611,13 +2612,13 @@ class OpenCoinflipView(View):
             winner_name = await get_user_name_from_id(self.cog.session, winner_player_id)
             loser_name = await get_user_name_from_id(self.cog.session, loser_player_id)
             
-            # Record tax
+            # Record tax (on total pot)
             await self.cog.record_tax(self.guild_id, "coinflip", tax_amount)
-            
-            # Record gambling statistics (net for winner is reduced by tax)
+
+            # Record gambling results
             await self.cog.record_gambling_result(
                 self.guild_id, winner_player_id, "coinflip",
-                self.amount, True, winner_receives
+                self.amount, True, winner_receives - self.amount
             )
             await self.cog.record_gambling_result(
                 self.guild_id, loser_player_id, "coinflip",
