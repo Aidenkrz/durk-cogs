@@ -2148,7 +2148,7 @@ class SS14Currency(commands.Cog):
             return None
 
     @currency.command(name="coinflip")
-    @commands.cooldown(rate=1, per=30.0, type=commands.BucketType.user)
+    @commands.cooldown(rate=1, per=10.0, type=commands.BucketType.user)
     async def coinflip(self, ctx: commands.Context, amount: int, opponent: discord.Member = None):
         """Challenges another user to a coinflip for a specified amount.
         
