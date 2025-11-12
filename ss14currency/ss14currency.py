@@ -2598,29 +2598,35 @@ class OpenCoinflipView(View):
         tax_amount = int(self.amount * 0.05)
         winner_receives = self.amount - tax_amount
 
+        tax_amount = int(self.amount * 0.05)
+        winner_receives = self.amount - tax_amount
+
         loser_details = None
         winner_details = None
         transfer_details = None
         
         try:
-
             loser_details = await add_player_currency(self.pool, loser_player_id, -self.amount)
             
-            if loser_details:
+            if loser_details[0]:
                 winner_details = await add_player_currency(self.pool, winner_player_id, winner_receives)
+                if winner_details[0]: 
+                    transfer_details = {
+                        'sender_old': loser_details[1],
+                        'sender_new': loser_details[2],
+                        'recipient_old': winner_details[1],
+                        'recipient_new': winner_details[2],
+                    }
+                else:
+                    print("Coinflip transfer failed: Winner transaction failed. Refunding loser.")
+                    await add_player_currency(self.pool, loser_player_id, self.amount)
             
-            if loser_details and winner_details:
-                transfer_details = {
-                    'sender_old': loser_details['old'],
-                    'sender_new': loser_details['new'],
-                    'recipient_old': winner_details['old'],
-                    'recipient_new': winner_details['new'],
-                }
             else:
-                print("Coinflip transfer failed: Loser or winner transaction failed.")
+                print("Coinflip transfer failed: Loser transaction failed (likely insufficient funds).")
 
         except Exception as e:
             print(f"Coinflip transfer error: {e}")
+            transfer_details = None
 
         for item in self.children:
             item.disabled = True
