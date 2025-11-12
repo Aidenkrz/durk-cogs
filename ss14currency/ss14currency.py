@@ -1065,6 +1065,10 @@ class SS14Currency(commands.Cog):
                 direction = "⚙️ Balance Set"
             elif tx_type == "admin_add":
                 direction = "⚙️ Admin Adjusted"
+            elif tx_type == "market_bet":
+                direction = "📈 Market Bet"
+            elif tx_type == "market_win":
+                direction = "💰 Market Win"
             else:
                 direction = tx_type
             
