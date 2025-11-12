@@ -900,6 +900,73 @@ class SS14Currency(commands.Cog):
         else:
             await ctx.send(f"❌ Failed to set the balance for **{player_info.player_name}**.", ephemeral=True)
 
+    @currency.command(name="flex")
+    async def flex(self, ctx: commands.Context):
+        """Spend 10,000 coins to get the '1%' role."""
+        FLEX_ROLE_ID = 1438219169165348875
+        COST = 10_000
+
+        # Check if user already has the role
+        flex_role = ctx.guild.get_role(FLEX_ROLE_ID)
+        if not flex_role:
+            await ctx.send("❌ Flex role does not exist on this server.", ephemeral=True)
+            return
+
+        if flex_role in ctx.author.roles:
+            await ctx.send("❌ You already have the flex role!", ephemeral=True)
+            return
+
+        # Get user's currency pool
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("Database connection is not configured for this server.", ephemeral=True)
+            return
+
+        # Resolve player info
+        player_info = await self.resolve_player(ctx.author, pool)
+        if not player_info:
+            await ctx.send("You do not have a linked SS14 account.", ephemeral=True)
+            return
+
+        # Check if user has enough coins
+        current_balance = await self.get_player_balance(pool, player_info.player_id)
+        if current_balance < COST:
+            await ctx.send(f"❌ You need at least {COST:,} coins to flex (you have {current_balance:,}).", ephemeral=True)
+            return
+
+        # Deduct coins
+        success, old_balance, new_balance = await add_player_currency(pool, player_info.player_id, -COST)
+        if not success:
+            await ctx.send("❌ Failed to deduct coins.", ephemeral=True)
+            return
+
+        # Give role
+        try:
+            await ctx.author.add_roles(flex_role, reason="Used flex command")
+        except discord.Forbidden:
+            await ctx.send("❌ I do not have permission to assign roles.", ephemeral=True)
+            return
+
+        # Log transaction
+        await self.log_transaction(
+            ctx.guild.id, "gambling", -COST,
+            from_player_id=player_info.player_id,
+            balance_before=old_balance,
+            balance_after=new_balance,
+            notes="Used flex command"
+        )
+
+        # Send confirmation
+        embed = discord.Embed(
+            title="💪 Flex Successful!",
+            color=discord.Color.gold()
+        )
+        embed.add_field(name="👤 User", value=ctx.author.mention)
+        embed.add_field(name="💰 Cost", value=f"-{COST:,} coins", inline=True)
+        embed.add_field(name="💰 New Balance", value=f"{new_balance:,} coins", inline=True)
+        embed.add_field(name="🏆 Role Granted", value=flex_role.mention)
+        await ctx.send(embed=embed)
+
     @currency.command(name="add")
     @checks.admin_or_permissions(manage_guild=True)
     async def add_coins(self, ctx: commands.Context, user: typing.Union[discord.Member, str], amount: int):
