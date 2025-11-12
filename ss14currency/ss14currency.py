@@ -1305,7 +1305,7 @@ class SS14Currency(commands.Cog):
                     inline=False
                 )
 
-        elif category in ["poor", "broke", "destitue"]:
+        elif category in ["poor", "broke", "destitute"]:
             # Existing wealth leaderboard
             leaderboard_data = await get_leaderboardasc(pool)
             if not leaderboard_data:
