@@ -82,6 +82,12 @@ async def get_leaderboard(pool: asyncpg.Pool) -> list:
         query = "SELECT last_seen_user_name, server_currency FROM player ORDER BY server_currency DESC LIMIT 10;"
         return await conn.fetch(query)
 
+async def get_leaderboardasc(pool: asyncpg.Pool) -> list:
+    """Gets the top 10 players by currency."""
+    async with pool.acquire() as conn:
+        query = "SELECT last_seen_user_name, server_currency FROM player ORDER BY server_currency ASC LIMIT 10;"
+        return await conn.fetch(query)
+
 async def get_player_id_from_discord(pool: asyncpg.Pool, discord_id: int) -> Optional[uuid.UUID]:
     """Gets the player's user_id from their discord ID."""
     async with pool.acquire() as conn:
@@ -1298,7 +1304,27 @@ class SS14Currency(commands.Cog):
                     value=f"{record['server_currency']:,} coins",
                     inline=False
                 )
-            
+
+        elif category in ["poor", "broke", "destitue"]:
+            # Existing wealth leaderboard
+            leaderboard_data = await get_leaderboardasc(pool)
+            if not leaderboard_data:
+                await ctx.send("The leaderboard is currently empty.")
+                return
+
+            embed = discord.Embed(
+                title="🏆 Broke Leaderboard",
+                description="Top 10 poorest players",
+                color=discord.Color.red()
+            )
+            for i, record in enumerate(leaderboard_data, 1):
+                medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                embed.add_field(
+                    name=f"{medal} {discord.utils.escape_markdown(record['last_seen_user_name'])}",
+                    value=f"{record['server_currency']:,} coins",
+                    inline=False
+                )
+
         elif category in ["gambling", "gambler", "gamblers", "games"]:
             # Gambling leaderboard (most games played)
             if self.local_db is None:
