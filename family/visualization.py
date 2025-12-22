@@ -674,7 +674,7 @@ class FamilyTreeVisualizer:
             if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
                 edges.append((uid1, uid2, edge_type))
 
-        async def collect_ancestors(uid: int, current_level: int, max_level: int, node_type: str = 'parent'):
+        async def collect_ancestors(uid: int, current_level: int, max_level: int, is_blood: bool = True):
             """Collect parents and grandparents (going up)."""
             if uid in processed_ancestors or current_level < -max_level:
                 return
@@ -682,9 +682,14 @@ class FamilyTreeVisualizer:
 
             parents = await db.get_parents(uid)
             for parent_id in parents:
-                parent_type = node_type
-                if current_level - 1 < -1:
-                    parent_type = 'grandparent' if node_type == 'parent' else 'in_law'
+                # Determine the type based on level and blood relation
+                if is_blood:
+                    if current_level - 1 == -1:
+                        parent_type = 'parent'
+                    else:
+                        parent_type = 'grandparent'
+                else:
+                    parent_type = 'in_law'
 
                 if parent_id not in nodes:
                     nodes[parent_id] = {
@@ -694,7 +699,7 @@ class FamilyTreeVisualizer:
                     levels[parent_id] = current_level - 1
 
                 add_edge(parent_id, uid, 'parent_child')
-                await collect_ancestors(parent_id, current_level - 1, max_level, node_type)
+                await collect_ancestors(parent_id, current_level - 1, max_level, is_blood)
 
         async def collect_descendants(uid: int, current_level: int, max_level: int,
                                      is_blood_relative: bool = True, collect_in_laws: bool = True):
@@ -705,9 +710,14 @@ class FamilyTreeVisualizer:
 
             children = await db.get_children(uid)
             for child_id in children:
-                child_type = 'child' if is_blood_relative else 'in_law'
-                if current_level + 1 > 1:
-                    child_type = 'grandchild' if is_blood_relative else 'in_law'
+                # Determine type based on level and blood relation
+                if is_blood_relative:
+                    if current_level + 1 == 1:
+                        child_type = 'child'
+                    else:
+                        child_type = 'grandchild'
+                else:
+                    child_type = 'in_law'
 
                 if child_id not in nodes:
                     nodes[child_id] = {
@@ -730,10 +740,10 @@ class FamilyTreeVisualizer:
                             levels[spouse_id] = current_level + 1
                         add_edge(child_id, spouse_id, 'marriage')
 
-                        # Get the in-law's parents
-                        await collect_ancestors(spouse_id, current_level + 1, max_level, 'in_law')
+                        # Get the in-law's parents (not blood related)
+                        await collect_ancestors(spouse_id, current_level + 1, max_level, is_blood=False)
 
-                        # Get descendants of child's spouse
+                        # Get descendants of child's spouse (not blood related to central user)
                         await collect_descendants(spouse_id, current_level + 1, max_level,
                                                  is_blood_relative=False, collect_in_laws=False)
 
@@ -758,7 +768,7 @@ class FamilyTreeVisualizer:
             add_edge(user_id, spouse_id, 'marriage')
 
             # Get spouse's parents (parents-in-law)
-            await collect_ancestors(spouse_id, 0, depth, 'in_law')
+            await collect_ancestors(spouse_id, 0, depth, is_blood=False)
 
         # Add siblings at same level
         siblings = await db.get_siblings(user_id)
@@ -782,7 +792,7 @@ class FamilyTreeVisualizer:
                 add_edge(sibling_id, spouse_id, 'marriage')
 
         # Collect ancestors (parents, grandparents)
-        await collect_ancestors(user_id, 0, depth, 'parent')
+        await collect_ancestors(user_id, 0, depth, is_blood=True)
 
         # Collect descendants (children, grandchildren) - this now includes in-laws
         await collect_descendants(user_id, 0, depth, is_blood_relative=True, collect_in_laws=True)
