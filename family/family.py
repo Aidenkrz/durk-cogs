@@ -789,6 +789,63 @@ class Family(commands.Cog):
 
         await ctx.send(embed=embed)
 
+    @commands.command(name="familyhelp")
+    @commands.guild_only()
+    async def familyhelp(self, ctx: commands.Context):
+        """Show all family commands."""
+        prefix = ctx.clean_prefix
+
+        embed = discord.Embed(
+            title="\U0001f46a Family Commands",
+            description="Create and manage your virtual family!",
+            color=await ctx.embed_color()
+        )
+
+        # Relationship commands
+        relationship_cmds = (
+            f"`{prefix}marry @user` - Propose marriage\n"
+            f"`{prefix}divorce @user` - Divorce your spouse\n"
+            f"`{prefix}adopt @user` - Adopt someone as your child\n"
+            f"`{prefix}disown @user` - Disown your child\n"
+            f"`{prefix}runaway` - Run away from a parent\n"
+            f"`{prefix}sire @coparent @child` - Add a co-parent to your child"
+        )
+        embed.add_field(
+            name="\U0001f48d Relationships",
+            value=relationship_cmds,
+            inline=False
+        )
+
+        # Info commands
+        info_cmds = (
+            f"`{prefix}family [@user]` - View family members\n"
+            f"`{prefix}tree [@user]` - View family tree image\n"
+            f"`{prefix}relationship @user1 @user2` - Check relationship\n"
+            f"`{prefix}proposals` - View pending proposals"
+        )
+        embed.add_field(
+            name="\U0001f4cb Information",
+            value=info_cmds,
+            inline=False
+        )
+
+        # Settings commands
+        settings_cmds = (
+            f"`{prefix}familyset polyamory [on/off]` - Toggle multiple marriages\n"
+            f"`{prefix}familyset incest [on/off]` - Toggle family marriages\n"
+            f"`{prefix}familyset timeout [seconds]` - Set proposal timeout\n"
+            f"`{prefix}familyset settings` - View current settings"
+        )
+        embed.add_field(
+            name="\u2699\ufe0f Settings (Admin)",
+            value=settings_cmds,
+            inline=False
+        )
+
+        embed.set_footer(text="Proposals require the other person to accept!")
+
+        await ctx.send(embed=embed)
+
     # === Settings Commands ===
 
     @commands.group()

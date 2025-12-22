@@ -13,7 +13,9 @@
         "tree"
     ],
     "requirements": [
-        "aiosqlite"
+        "aiosqlite",
+        "networkx",
+        "matplotlib"
     ],
     "required_cogs": {},
     "min_bot_version": "3.5.0",
