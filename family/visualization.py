@@ -223,11 +223,10 @@ class FamilyTreeVisualizer:
         """Draw a modern styled node with gradient and shadow."""
         main_color, dark_color = colors
         half_w, half_h = w // 2, h // 2
-        radius = h // 3
+        radius = min(h // 3, half_h - 2)  # Ensure radius doesn't exceed half height
 
         # Shadow
         shadow_offset = 4
-        shadow_color = (0, 0, 0, 80)
         self._draw_rounded_rect_filled(
             draw,
             x - half_w + shadow_offset, y - half_h + shadow_offset,
@@ -235,7 +234,7 @@ class FamilyTreeVisualizer:
             radius, (20, 20, 20)
         )
 
-        # Main node body with gradient effect (simulate with two rectangles)
+        # Main node body
         self._draw_rounded_rect_filled(
             draw,
             x - half_w, y - half_h,
@@ -243,16 +242,22 @@ class FamilyTreeVisualizer:
             radius, main_color
         )
 
-        # Bottom darker section for depth
-        self._draw_rounded_rect_filled(
-            draw,
-            x - half_w, y,
-            x + half_w, y + half_h,
-            radius, dark_color
-        )
-
-        # Re-draw top portion to fix corners
-        draw.rectangle([x - half_w + radius, y - half_h, x + half_w - radius, y], fill=main_color)
+        # Bottom darker section for depth (only if there's enough space)
+        bottom_section_top = y + 2
+        bottom_section_bottom = y + half_h
+        if bottom_section_bottom > bottom_section_top + radius:
+            # Draw darker bottom portion
+            draw.rectangle(
+                [x - half_w + radius, bottom_section_top,
+                 x + half_w - radius, bottom_section_bottom],
+                fill=dark_color
+            )
+            # Bottom corners
+            if bottom_section_bottom - radius * 2 >= bottom_section_top:
+                draw.ellipse([x - half_w, bottom_section_bottom - radius * 2,
+                             x - half_w + radius * 2, bottom_section_bottom], fill=dark_color)
+                draw.ellipse([x + half_w - radius * 2, bottom_section_bottom - radius * 2,
+                             x + half_w, bottom_section_bottom], fill=dark_color)
 
         # Subtle highlight on top
         highlight_color = tuple(min(255, c + 30) for c in main_color)
@@ -317,9 +322,20 @@ class FamilyTreeVisualizer:
         x1, x2 = min(x1, x2), max(x1, x2)
         y1, y2 = min(y1, y2), max(y1, y2)
 
+        # Ensure radius is valid
+        max_radius = min((x2 - x1) / 2, (y2 - y1) / 2)
+        radius = max(0, min(radius, max_radius))
+
+        if radius < 1:
+            # Just draw a simple rectangle
+            draw.rectangle([x1, y1, x2, y2], fill=fill)
+            return
+
         # Main rectangles
-        draw.rectangle([x1 + radius, y1, x2 - radius, y2], fill=fill)
-        draw.rectangle([x1, y1 + radius, x2, y2 - radius], fill=fill)
+        if x2 - radius > x1 + radius:
+            draw.rectangle([x1 + radius, y1, x2 - radius, y2], fill=fill)
+        if y2 - radius > y1 + radius:
+            draw.rectangle([x1, y1 + radius, x2, y2 - radius], fill=fill)
 
         # Corners
         draw.ellipse([x1, y1, x1 + radius * 2, y1 + radius * 2], fill=fill)
