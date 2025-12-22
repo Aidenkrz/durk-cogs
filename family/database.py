@@ -378,3 +378,11 @@ class FamilyDatabase:
         spouses = await self.get_spouses(user_id)
         relatives.update(spouses)
         return len(relatives)
+
+    async def reset_all(self):
+        """Delete all family data (marriages, parent-child relationships, proposals)."""
+        await self.db.execute("DELETE FROM marriages")
+        await self.db.execute("DELETE FROM parent_child")
+        await self.db.execute("DELETE FROM pending_proposals")
+        await self.db.execute("DELETE FROM users")
+        await self.db.commit()

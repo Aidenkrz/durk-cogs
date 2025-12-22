@@ -289,25 +289,30 @@ class Family(commands.Cog):
             )
             return
 
+        proposer_id = proposal["proposer_id"]
         coparent_id = proposal["target_id"]
         child_id = proposal["child_id"]
+
+        # Check if proposer is already a parent, if not add them too
+        proposer_is_parent = await self.db.is_parent_of(proposer_id, child_id)
+        if not proposer_is_parent:
+            await self.db.create_parent_child(proposer_id, child_id, "sire")
 
         # Create the parent-child relationship for the co-parent
         await self.db.create_parent_child(coparent_id, child_id, "sire")
         await self.db.delete_proposal(proposal_id)
 
-        proposer = self.bot.get_user(proposal["proposer_id"])
+        proposer = self.bot.get_user(proposer_id)
         coparent = self.bot.get_user(coparent_id)
         child = self.bot.get_user(child_id)
 
-        proposer_name = proposer.display_name if proposer else f"User {proposal['proposer_id']}"
+        proposer_name = proposer.display_name if proposer else f"User {proposer_id}"
         coparent_name = coparent.display_name if coparent else f"User {coparent_id}"
         child_name = child.display_name if child else f"User {child_id}"
 
         embed = discord.Embed(
             title="\U0001f46a Family Formed! \U0001f46a",
-            description=f"**{coparent_name}** is now a parent of **{child_name}**!\n\n"
-                        f"Parents: **{proposer_name}** & **{coparent_name}**",
+            description=f"**{proposer_name}** and **{coparent_name}** are now parents of **{child_name}**!",
             color=discord.Color.blue()
         )
 
@@ -563,10 +568,11 @@ class Family(commands.Cog):
     @commands.guild_only()
     async def sire(self, ctx: commands.Context, coparent: discord.Member, child: discord.Member):
         """
-        Add a co-parent to your child.
+        Declare yourself and a co-parent as parents of a child.
 
-        You must already be a parent of the child.
         Both the co-parent and child must accept.
+        If you're already a parent, this adds a co-parent.
+        If neither of you are parents, both become parents.
         """
         # Validation
         if coparent.bot or child.bot:
@@ -581,9 +587,12 @@ class Family(commands.Cog):
             await ctx.send("The child must be a different person!")
             return
 
-        # Check if author is parent of child
-        if not await self.db.is_parent_of(ctx.author.id, child.id):
-            await ctx.send(f"You must already be a parent of {child.display_name} to use this command!")
+        # Check current parent situation
+        author_is_parent = await self.db.is_parent_of(ctx.author.id, child.id)
+        coparent_is_parent = await self.db.is_parent_of(coparent.id, child.id)
+
+        if author_is_parent and coparent_is_parent:
+            await ctx.send(f"You and {coparent.display_name} are already both parents of {child.display_name}!")
             return
 
         # Check if child already has 2 parents
@@ -592,9 +601,9 @@ class Family(commands.Cog):
             await ctx.send(f"{child.display_name} already has 2 parents!")
             return
 
-        # Check if coparent is already a parent
-        if await self.db.is_parent_of(coparent.id, child.id):
-            await ctx.send(f"{coparent.display_name} is already a parent of {child.display_name}!")
+        # If neither is a parent but child has 1 parent, can't add 2 more
+        if not author_is_parent and not coparent_is_parent and parent_count == 1:
+            await ctx.send(f"{child.display_name} already has a parent. Use `.adopt` to become their second parent.")
             return
 
         # Check incest
@@ -1002,3 +1011,16 @@ class Family(commands.Cog):
         embed.add_field(name="Max Children", value=str(max_children), inline=True)
 
         await ctx.send(embed=embed)
+
+    @familysetglobal.command(name="resetall")
+    async def familysetglobal_resetall(self, ctx: commands.Context, confirm: str = None):
+        """Reset ALL family data globally. Use with 'confirm' to execute."""
+        if confirm != "confirm":
+            await ctx.send(
+                "⚠️ **WARNING**: This will delete ALL family data (marriages, adoptions, proposals) globally!\n\n"
+                f"To confirm, run: `{ctx.prefix}familysetglobal resetall confirm`"
+            )
+            return
+
+        await self.db.reset_all()
+        await ctx.send("✅ All family data has been reset.")
