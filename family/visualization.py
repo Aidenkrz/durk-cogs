@@ -36,8 +36,9 @@ class FamilyTreeVisualizer:
     }
 
     # Background color (Discord dark theme)
-    BG_COLOR = (47, 49, 54)
-    TEXT_COLOR = (255, 255, 255)
+    BG_COLOR = (54, 57, 63)
+    TEXT_COLOR = (0, 0, 0)  # Black text for contrast on colored nodes
+    LABEL_BG = (47, 49, 54)  # Dark background for labels below nodes
 
     def __init__(self):
         if not PILLOW_AVAILABLE:
@@ -85,31 +86,36 @@ class FamilyTreeVisualizer:
         # Calculate positions using a simple force-directed layout
         positions = self._calculate_positions(nodes, edges)
 
-        # Determine image size based on positions
-        min_x = min(p[0] for p in positions.values()) - 100
-        max_x = max(p[0] for p in positions.values()) + 100
-        min_y = min(p[1] for p in positions.values()) - 60
-        max_y = max(p[1] for p in positions.values()) + 60
+        # Scale factor for higher resolution
+        scale = 2.0
 
-        width = max(600, int(max_x - min_x + 200))
-        height = max(400, int(max_y - min_y + 150))
+        # Determine image size based on positions
+        min_x = min(p[0] for p in positions.values()) - 150
+        max_x = max(p[0] for p in positions.values()) + 150
+        min_y = min(p[1] for p in positions.values()) - 100
+        max_y = max(p[1] for p in positions.values()) + 100
+
+        width = max(800, int((max_x - min_x + 300) * scale))
+        height = max(600, int((max_y - min_y + 200) * scale))
 
         # Offset positions to fit in image
-        offset_x = -min_x + 100
-        offset_y = -min_y + 80
+        offset_x = (-min_x + 150) * scale
+        offset_y = (-min_y + 100) * scale
 
         # Create image
         img = Image.new('RGB', (width, height), self.BG_COLOR)
         draw = ImageDraw.Draw(img)
 
         # Try to load a font, fall back to default
+        font_size = int(16 * scale)
+        title_font_size = int(24 * scale)
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
-            title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+            title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", title_font_size)
         except (OSError, IOError):
             try:
-                font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans.ttf", 14)
-                title_font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 18)
+                font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", font_size)
+                title_font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", title_font_size)
             except (OSError, IOError):
                 font = ImageFont.load_default()
                 title_font = font
@@ -119,63 +125,78 @@ class FamilyTreeVisualizer:
         title = f"Family Tree for {central_name}"
         title_bbox = draw.textbbox((0, 0), title, font=title_font)
         title_width = title_bbox[2] - title_bbox[0]
-        draw.text(((width - title_width) // 2, 15), title, fill=self.TEXT_COLOR, font=title_font)
+        draw.text(((width - title_width) // 2, int(20 * scale)), title, fill=(255, 255, 255), font=title_font)
+
+        # Node size - smaller nodes
+        node_radius = int(22 * scale)
 
         # Draw edges first (so they're behind nodes)
         for user1_id, user2_id, edge_type in edges:
             if user1_id in positions and user2_id in positions:
                 x1, y1 = positions[user1_id]
                 x2, y2 = positions[user2_id]
-                x1, y1 = x1 + offset_x, y1 + offset_y
-                x2, y2 = x2 + offset_x, y2 + offset_y
+                x1, y1 = x1 * scale + offset_x, y1 * scale + offset_y
+                x2, y2 = x2 * scale + offset_x, y2 * scale + offset_y
 
                 color = self.EDGE_COLORS.get(edge_type, (128, 128, 128))
+                line_width = int(3 * scale)
 
                 if edge_type == 'marriage':
                     # Solid thick line for marriage
-                    draw.line([(x1, y1), (x2, y2)], fill=color, width=3)
+                    draw.line([(x1, y1), (x2, y2)], fill=color, width=line_width)
                 else:
                     # Dashed line for parent-child
-                    self._draw_dashed_line(draw, x1, y1, x2, y2, color, width=2)
-
+                    self._draw_dashed_line(draw, x1, y1, x2, y2, color, width=int(2 * scale))
         # Draw nodes
-        node_radius = 35
         for uid, node_data in nodes.items():
             if uid not in positions:
                 continue
 
             x, y = positions[uid]
-            x, y = x + offset_x, y + offset_y
+            x, y = x * scale + offset_x, y * scale + offset_y
 
             color = self.COLORS.get(node_data['type'], self.COLORS['extended'])
 
-            # Draw circle
+            # Draw circle with white outline
             draw.ellipse(
                 [(x - node_radius, y - node_radius),
                  (x + node_radius, y + node_radius)],
                 fill=color,
-                outline=self.TEXT_COLOR,
-                width=2
+                outline=(255, 255, 255),
+                width=int(2 * scale)
             )
 
-            # Draw name (truncate if needed)
+            # Draw name below the node
             name = node_data['name']
-            if len(name) > 12:
-                name = name[:10] + ".."
+            if len(name) > 14:
+                name = name[:12] + ".."
 
             text_bbox = draw.textbbox((0, 0), name, font=font)
             text_width = text_bbox[2] - text_bbox[0]
             text_height = text_bbox[3] - text_bbox[1]
 
+            # Position text below the node
+            text_x = x - text_width // 2
+            text_y = y + node_radius + int(5 * scale)
+
+            # Draw text background for readability
+            padding = int(4 * scale)
+            draw.rectangle(
+                [(text_x - padding, text_y - padding),
+                 (text_x + text_width + padding, text_y + text_height + padding)],
+                fill=(30, 32, 36)
+            )
+
+            # Draw white text
             draw.text(
-                (x - text_width // 2, y - text_height // 2),
+                (text_x, text_y),
                 name,
-                fill=self.TEXT_COLOR,
+                fill=(255, 255, 255),
                 font=font
             )
 
         # Draw legend
-        legend_y = height - 35
+        legend_y = height - int(50 * scale)
         legend_items = [
             ('You', self.COLORS['self']),
             ('Spouse', self.COLORS['spouse']),
@@ -184,11 +205,12 @@ class FamilyTreeVisualizer:
             ('Sibling', self.COLORS['sibling']),
         ]
 
-        legend_x = 20
+        legend_x = int(30 * scale)
+        dot_size = int(18 * scale)
         for label, color in legend_items:
-            draw.ellipse([(legend_x, legend_y), (legend_x + 15, legend_y + 15)], fill=color)
-            draw.text((legend_x + 20, legend_y), label, fill=self.TEXT_COLOR, font=font)
-            legend_x += 90
+            draw.ellipse([(legend_x, legend_y), (legend_x + dot_size, legend_y + dot_size)], fill=color, outline=(255, 255, 255), width=2)
+            draw.text((legend_x + dot_size + int(8 * scale), legend_y), label, fill=(255, 255, 255), font=font)
+            legend_x += int(110 * scale)
 
         # Save to BytesIO
         buffer = BytesIO()
@@ -228,20 +250,22 @@ class FamilyTreeVisualizer:
         if not nodes:
             return {}
 
-        # Initialize positions in a circle
+        # Initialize positions in a circle with more spacing
         positions = {}
         n = len(nodes)
         node_ids = list(nodes.keys())
 
+        # Larger initial radius for more spacing
+        initial_radius = max(200, n * 40)
         for i, uid in enumerate(node_ids):
             angle = 2 * math.pi * i / n
-            positions[uid] = (math.cos(angle) * 150, math.sin(angle) * 150)
+            positions[uid] = (math.cos(angle) * initial_radius, math.sin(angle) * initial_radius)
 
-        # Simple force-directed iterations
-        for _ in range(50):
+        # More iterations for better layout
+        for _ in range(80):
             forces = {uid: [0.0, 0.0] for uid in node_ids}
 
-            # Repulsion between all nodes
+            # Stronger repulsion between all nodes
             for i, uid1 in enumerate(node_ids):
                 for uid2 in node_ids[i + 1:]:
                     x1, y1 = positions[uid1]
@@ -251,8 +275,13 @@ class FamilyTreeVisualizer:
                     dy = y2 - y1
                     dist = math.sqrt(dx * dx + dy * dy) + 0.1
 
-                    # Repulsion force
-                    force = 5000 / (dist * dist)
+                    # Minimum distance to prevent overlap
+                    min_dist = 120
+                    if dist < min_dist:
+                        dist = min_dist
+
+                    # Stronger repulsion force
+                    force = 15000 / (dist * dist)
                     fx = -force * dx / dist
                     fy = -force * dy / dist
 
@@ -261,7 +290,7 @@ class FamilyTreeVisualizer:
                     forces[uid2][0] -= fx
                     forces[uid2][1] -= fy
 
-            # Attraction along edges
+            # Attraction along edges (weaker to allow more spacing)
             for uid1, uid2, _ in edges:
                 if uid1 not in positions or uid2 not in positions:
                     continue
@@ -273,15 +302,17 @@ class FamilyTreeVisualizer:
                 dy = y2 - y1
                 dist = math.sqrt(dx * dx + dy * dy) + 0.1
 
-                # Attraction force
-                force = dist * 0.05
-                fx = force * dx / dist
-                fy = force * dy / dist
+                # Only attract if too far apart
+                ideal_dist = 150
+                if dist > ideal_dist:
+                    force = (dist - ideal_dist) * 0.03
+                    fx = force * dx / dist
+                    fy = force * dy / dist
 
-                forces[uid1][0] += fx
-                forces[uid1][1] += fy
-                forces[uid2][0] -= fx
-                forces[uid2][1] -= fy
+                    forces[uid1][0] += fx
+                    forces[uid1][1] += fy
+                    forces[uid2][0] -= fx
+                    forces[uid2][1] -= fy
 
             # Apply forces with damping
             for uid in node_ids:
@@ -290,9 +321,9 @@ class FamilyTreeVisualizer:
 
                 # Limit force magnitude
                 mag = math.sqrt(fx * fx + fy * fy)
-                if mag > 10:
-                    fx = fx / mag * 10
-                    fy = fy / mag * 10
+                if mag > 15:
+                    fx = fx / mag * 15
+                    fy = fy / mag * 15
 
                 positions[uid] = (x + fx, y + fy)
 

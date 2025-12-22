@@ -414,8 +414,11 @@ class Family(commands.Cog):
         )
         embed.set_footer(text=f"This proposal expires in {timeout // 60} minutes")
 
-        # Send message first to get ID
-        message = await ctx.send(embed=embed)
+        # Create view first (we'll set proposal_id after getting message)
+        view = ProposalView(self, 0, user.id, "marriage", timeout=float(timeout))
+
+        # Send message with view attached
+        message = await ctx.send(embed=embed, view=view)
 
         # Create proposal in database
         proposal_id = await self.db.create_proposal(
@@ -428,9 +431,8 @@ class Family(commands.Cog):
             expires_at=expires_at
         )
 
-        # Create and attach view
-        view = ProposalView(self, proposal_id, user.id, "marriage", timeout=timeout)
-        await message.edit(view=view)
+        # Update view with proposal ID
+        view.proposal_id = proposal_id
 
     @commands.command()
     @commands.guild_only()
@@ -474,7 +476,11 @@ class Family(commands.Cog):
         )
         embed.set_footer(text=f"This request expires in {timeout // 60} minutes")
 
-        message = await ctx.send(embed=embed)
+        # Create view first
+        view = ProposalView(self, 0, user.id, "adoption", timeout=float(timeout))
+
+        # Send with view attached
+        message = await ctx.send(embed=embed, view=view)
 
         proposal_id = await self.db.create_proposal(
             proposal_type="adoption",
@@ -486,8 +492,8 @@ class Family(commands.Cog):
             expires_at=expires_at
         )
 
-        view = ProposalView(self, proposal_id, user.id, "adoption", timeout=timeout)
-        await message.edit(view=view)
+        # Update view with proposal ID
+        view.proposal_id = proposal_id
 
     @commands.command()
     @commands.guild_only()
@@ -618,7 +624,11 @@ class Family(commands.Cog):
         )
         embed.set_footer(text=f"This request expires in {timeout // 60} minutes")
 
-        message = await ctx.send(embed=embed)
+        # Create view first
+        view = SireProposalView(self, 0, coparent.id, child.id, timeout=float(timeout))
+
+        # Send with view attached
+        message = await ctx.send(embed=embed, view=view)
 
         proposal_id = await self.db.create_proposal(
             proposal_type="sire",
@@ -631,8 +641,8 @@ class Family(commands.Cog):
             expires_at=expires_at
         )
 
-        view = SireProposalView(self, proposal_id, coparent.id, child.id, timeout=timeout)
-        await message.edit(view=view)
+        # Update view with proposal ID
+        view.proposal_id = proposal_id
 
     # === Information Commands ===
 
