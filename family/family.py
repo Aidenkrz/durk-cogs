@@ -1,0 +1,924 @@
+import discord
+import logging
+from pathlib import Path
+from datetime import datetime, timedelta
+from typing import Optional
+
+from redbot.core import commands, Config, checks
+from redbot.core.bot import Red
+from discord.ext import tasks
+
+from .database import FamilyDatabase
+from .views import (
+    ProposalView,
+    SireProposalView,
+    RunawaySelectView,
+    PersistentProposalView,
+    PersistentSireView,
+)
+from .visualization import FamilyTreeVisualizer
+
+log = logging.getLogger("red.DurkCogs.Family")
+
+
+class Family(commands.Cog):
+    """
+    A comprehensive family system with marriage, adoption, and family trees.
+
+    Create relationships through marriage and adoption, view family trees,
+    and manage your virtual family across Discord servers.
+    """
+
+    DEFAULT_GLOBAL = {
+        "polyamory_enabled": False,
+        "incest_enabled": False,
+        "proposal_timeout": 300,
+        "max_spouses": 5,
+        "max_children": 10,
+    }
+
+    DEFAULT_GUILD = {
+        "override_polyamory": None,
+        "override_incest": None,
+        "override_proposal_timeout": None,
+    }
+
+    def __init__(self, bot: Red):
+        self.bot = bot
+        self.config = Config.get_conf(self, identifier=8675309420, force_registration=True)
+        self.config.register_global(**self.DEFAULT_GLOBAL)
+        self.config.register_guild(**self.DEFAULT_GUILD)
+
+        self.db_path = Path(__file__).parent / "family.db"
+        self.db: Optional[FamilyDatabase] = None
+        self.visualizer = FamilyTreeVisualizer()
+
+        # Start background task for proposal cleanup
+        self.cleanup_proposals_task.start()
+
+    async def cog_load(self):
+        """Initialize database and register persistent views when cog loads."""
+        self.db = FamilyDatabase(self.db_path)
+        await self.db.initialize()
+
+        # Register persistent views for button handling after restart
+        self.bot.add_view(PersistentProposalView(self))
+        self.bot.add_view(PersistentSireView(self))
+
+        log.info("Family cog loaded and database initialized.")
+
+    async def cog_unload(self):
+        """Cleanup when cog unloads."""
+        self.cleanup_proposals_task.cancel()
+        if self.db:
+            await self.db.close()
+        log.info("Family cog unloaded.")
+
+    @tasks.loop(minutes=1)
+    async def cleanup_proposals_task(self):
+        """Clean up expired proposals."""
+        if not self.db:
+            return
+
+        try:
+            expired = await self.db.get_expired_proposals()
+            for proposal in expired:
+                try:
+                    channel = self.bot.get_channel(proposal["channel_id"])
+                    if channel:
+                        try:
+                            message = await channel.fetch_message(proposal["message_id"])
+                            embed = discord.Embed(
+                                title="Proposal Expired",
+                                description="This proposal has expired due to no response.",
+                                color=discord.Color.greyple()
+                            )
+                            await message.edit(embed=embed, view=None)
+                        except discord.NotFound:
+                            pass
+                        except discord.Forbidden:
+                            pass
+                    await self.db.delete_proposal(proposal["id"])
+                except Exception as e:
+                    log.error(f"Error cleaning up proposal {proposal['id']}: {e}")
+        except Exception as e:
+            log.error(f"Error in cleanup task: {e}")
+
+    @cleanup_proposals_task.before_loop
+    async def before_cleanup_task(self):
+        await self.bot.wait_until_ready()
+
+    # === Helper Methods ===
+
+    async def get_effective_setting(self, guild_id: int, setting: str):
+        """Get effective setting considering guild overrides."""
+        override_key = f"override_{setting}"
+        guild_val = await self.config.guild_from_id(guild_id).get_attr(override_key)()
+        if guild_val is not None:
+            return guild_val
+        return await self.config.get_attr(setting)()
+
+    async def _validate_marriage(
+        self, ctx: commands.Context, user: discord.Member
+    ) -> Optional[str]:
+        """Validate a marriage proposal. Returns error message or None if valid."""
+        if user.bot:
+            return "You can't marry a bot!"
+
+        if user.id == ctx.author.id:
+            return "You can't marry yourself!"
+
+        if await self.db.are_married(ctx.author.id, user.id):
+            return f"You're already married to {user.display_name}!"
+
+        # Check polyamory
+        polyamory = await self.get_effective_setting(ctx.guild.id, "polyamory_enabled")
+        if not polyamory:
+            author_spouses = await self.db.get_marriage_count(ctx.author.id)
+            if author_spouses > 0:
+                return "You're already married! (Polyamory is disabled on this server)"
+
+            target_spouses = await self.db.get_marriage_count(user.id)
+            if target_spouses > 0:
+                return f"{user.display_name} is already married! (Polyamory is disabled on this server)"
+        else:
+            max_spouses = await self.config.max_spouses()
+            author_spouses = await self.db.get_marriage_count(ctx.author.id)
+            if author_spouses >= max_spouses:
+                return f"You've reached the maximum number of spouses ({max_spouses})!"
+
+        # Check incest
+        incest = await self.get_effective_setting(ctx.guild.id, "incest_enabled")
+        if not incest:
+            if await self.db.are_related(ctx.author.id, user.id):
+                return f"You can't marry {user.display_name} - you're related! (Incest is disabled on this server)"
+
+        # Check for pending proposal
+        if await self.db.has_pending_proposal(ctx.author.id, user.id, "marriage"):
+            return f"You already have a pending marriage proposal to {user.display_name}!"
+
+        return None
+
+    async def _validate_adoption(
+        self, ctx: commands.Context, child: discord.Member
+    ) -> Optional[str]:
+        """Validate an adoption proposal. Returns error message or None if valid."""
+        if child.bot:
+            return "You can't adopt a bot!"
+
+        if child.id == ctx.author.id:
+            return "You can't adopt yourself!"
+
+        # Check if already parent
+        if await self.db.is_parent_of(ctx.author.id, child.id):
+            return f"You're already a parent of {child.display_name}!"
+
+        # Check if child already has 2 parents
+        parent_count = await self.db.get_parent_count(child.id)
+        if parent_count >= 2:
+            return f"{child.display_name} already has 2 parents!"
+
+        # Check max children
+        max_children = await self.config.max_children()
+        current_children = len(await self.db.get_children(ctx.author.id))
+        if current_children >= max_children:
+            return f"You've reached the maximum number of children ({max_children})!"
+
+        # Check incest - can't adopt your parent or spouse
+        incest = await self.get_effective_setting(ctx.guild.id, "incest_enabled")
+        if not incest:
+            # Can't adopt your parent
+            if child.id in await self.db.get_parents(ctx.author.id):
+                return f"You can't adopt your own parent!"
+            # Can't adopt your spouse (unless incest enabled)
+            if await self.db.are_married(ctx.author.id, child.id):
+                return f"You can't adopt your spouse! (Incest is disabled on this server)"
+
+        # Check for pending proposal
+        if await self.db.has_pending_proposal(ctx.author.id, child.id, "adoption"):
+            return f"You already have a pending adoption proposal to {child.display_name}!"
+
+        return None
+
+    # === Proposal Handlers ===
+
+    async def handle_marriage_accept(self, interaction: discord.Interaction, proposal_id: int):
+        """Handle marriage proposal acceptance."""
+        proposal = await self.db.get_proposal(proposal_id)
+        if not proposal:
+            await interaction.response.send_message(
+                "This proposal no longer exists.",
+                ephemeral=True
+            )
+            return
+
+        proposer_id = proposal["proposer_id"]
+        target_id = proposal["target_id"]
+
+        # Create the marriage
+        await self.db.create_marriage(proposer_id, target_id)
+        await self.db.delete_proposal(proposal_id)
+
+        proposer = self.bot.get_user(proposer_id)
+        target = self.bot.get_user(target_id)
+
+        proposer_name = proposer.display_name if proposer else f"User {proposer_id}"
+        target_name = target.display_name if target else f"User {target_id}"
+
+        embed = discord.Embed(
+            title="\U0001f492 Marriage Announcement! \U0001f492",
+            description=f"**{proposer_name}** and **{target_name}** are now married!",
+            color=discord.Color.magenta()
+        )
+        embed.set_footer(text="Congratulations to the happy couple!")
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    async def handle_adoption_accept(self, interaction: discord.Interaction, proposal_id: int):
+        """Handle adoption proposal acceptance."""
+        proposal = await self.db.get_proposal(proposal_id)
+        if not proposal:
+            await interaction.response.send_message(
+                "This proposal no longer exists.",
+                ephemeral=True
+            )
+            return
+
+        parent_id = proposal["proposer_id"]
+        child_id = proposal["target_id"]
+
+        # Create the parent-child relationship
+        await self.db.create_parent_child(parent_id, child_id, "adoption")
+        await self.db.delete_proposal(proposal_id)
+
+        parent = self.bot.get_user(parent_id)
+        child = self.bot.get_user(child_id)
+
+        parent_name = parent.display_name if parent else f"User {parent_id}"
+        child_name = child.display_name if child else f"User {child_id}"
+
+        embed = discord.Embed(
+            title="\U0001f476 Adoption Announcement! \U0001f476",
+            description=f"**{parent_name}** has adopted **{child_name}**!",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="Welcome to the family!")
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    async def handle_sire_complete(self, interaction: discord.Interaction, proposal_id: int):
+        """Handle sire proposal completion (both parties accepted)."""
+        proposal = await self.db.get_proposal(proposal_id)
+        if not proposal:
+            await interaction.response.send_message(
+                "This proposal no longer exists.",
+                ephemeral=True
+            )
+            return
+
+        coparent_id = proposal["target_id"]
+        child_id = proposal["child_id"]
+
+        # Create the parent-child relationship for the co-parent
+        await self.db.create_parent_child(coparent_id, child_id, "sire")
+        await self.db.delete_proposal(proposal_id)
+
+        proposer = self.bot.get_user(proposal["proposer_id"])
+        coparent = self.bot.get_user(coparent_id)
+        child = self.bot.get_user(child_id)
+
+        proposer_name = proposer.display_name if proposer else f"User {proposal['proposer_id']}"
+        coparent_name = coparent.display_name if coparent else f"User {coparent_id}"
+        child_name = child.display_name if child else f"User {child_id}"
+
+        embed = discord.Embed(
+            title="\U0001f46a Family Formed! \U0001f46a",
+            description=f"**{coparent_name}** is now a parent of **{child_name}**!\n\n"
+                        f"Parents: **{proposer_name}** & **{coparent_name}**",
+            color=discord.Color.blue()
+        )
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    async def handle_proposal_decline(
+        self, interaction: discord.Interaction, proposal_id: int, proposal_type: str
+    ):
+        """Handle proposal decline."""
+        proposal = await self.db.get_proposal(proposal_id)
+        if not proposal:
+            await interaction.response.send_message(
+                "This proposal no longer exists.",
+                ephemeral=True
+            )
+            return
+
+        await self.db.delete_proposal(proposal_id)
+
+        proposer = self.bot.get_user(proposal["proposer_id"])
+        proposer_name = proposer.display_name if proposer else f"User {proposal['proposer_id']}"
+
+        type_text = {
+            "marriage": "marriage proposal",
+            "adoption": "adoption request",
+            "sire": "co-parenting request"
+        }.get(proposal_type, "proposal")
+
+        embed = discord.Embed(
+            title="Proposal Declined",
+            description=f"The {type_text} from **{proposer_name}** was declined.",
+            color=discord.Color.red()
+        )
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    async def handle_proposal_timeout(self, proposal_id: int):
+        """Handle proposal timeout (called from view timeout)."""
+        proposal = await self.db.get_proposal(proposal_id)
+        if not proposal:
+            return
+
+        try:
+            channel = self.bot.get_channel(proposal["channel_id"])
+            if channel:
+                try:
+                    message = await channel.fetch_message(proposal["message_id"])
+                    embed = discord.Embed(
+                        title="Proposal Expired",
+                        description="This proposal has expired due to no response.",
+                        color=discord.Color.greyple()
+                    )
+                    await message.edit(embed=embed, view=None)
+                except (discord.NotFound, discord.Forbidden):
+                    pass
+        except Exception as e:
+            log.error(f"Error handling proposal timeout: {e}")
+
+        await self.db.delete_proposal(proposal_id)
+
+    async def execute_runaway(
+        self, interaction: discord.Interaction, child_id: int, parent_id: int
+    ):
+        """Execute the runaway action."""
+        success = await self.db.delete_parent_child(parent_id, child_id)
+
+        if not success:
+            await interaction.response.send_message(
+                "Failed to run away - relationship not found.",
+                ephemeral=True
+            )
+            return
+
+        parent = self.bot.get_user(parent_id)
+        parent_name = parent.display_name if parent else f"User {parent_id}"
+
+        embed = discord.Embed(
+            title="\U0001f3c3 Ran Away!",
+            description=f"You have run away from **{parent_name}**!",
+            color=discord.Color.orange()
+        )
+
+        await interaction.response.edit_message(embed=embed, view=None)
+
+    # === Marriage Commands ===
+
+    @commands.command()
+    @commands.guild_only()
+    async def marry(self, ctx: commands.Context, user: discord.Member):
+        """Propose marriage to another user."""
+        error = await self._validate_marriage(ctx, user)
+        if error:
+            await ctx.send(error)
+            return
+
+        timeout = await self.get_effective_setting(ctx.guild.id, "proposal_timeout")
+        expires_at = (datetime.utcnow() + timedelta(seconds=timeout)).timestamp()
+
+        embed = discord.Embed(
+            title="\U0001f48d Marriage Proposal! \U0001f48d",
+            description=f"**{ctx.author.display_name}** is proposing to **{user.display_name}**!\n\n"
+                        f"{user.mention}, do you accept?",
+            color=discord.Color.magenta()
+        )
+        embed.set_footer(text=f"This proposal expires in {timeout // 60} minutes")
+
+        # Send message first to get ID
+        message = await ctx.send(embed=embed)
+
+        # Create proposal in database
+        proposal_id = await self.db.create_proposal(
+            proposal_type="marriage",
+            proposer_id=ctx.author.id,
+            target_id=user.id,
+            message_id=message.id,
+            channel_id=ctx.channel.id,
+            guild_id=ctx.guild.id,
+            expires_at=expires_at
+        )
+
+        # Create and attach view
+        view = ProposalView(self, proposal_id, user.id, "marriage", timeout=timeout)
+        await message.edit(view=view)
+
+    @commands.command()
+    @commands.guild_only()
+    async def divorce(self, ctx: commands.Context, user: discord.Member):
+        """Divorce your spouse."""
+        if not await self.db.are_married(ctx.author.id, user.id):
+            await ctx.send(f"You're not married to {user.display_name}!")
+            return
+
+        success = await self.db.delete_marriage(ctx.author.id, user.id)
+
+        if success:
+            embed = discord.Embed(
+                title="\U0001f494 Divorce",
+                description=f"**{ctx.author.display_name}** and **{user.display_name}** are no longer married.",
+                color=discord.Color.dark_gray()
+            )
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send("Something went wrong processing the divorce.")
+
+    # === Adoption Commands ===
+
+    @commands.command()
+    @commands.guild_only()
+    async def adopt(self, ctx: commands.Context, user: discord.Member):
+        """Adopt another user as your child."""
+        error = await self._validate_adoption(ctx, user)
+        if error:
+            await ctx.send(error)
+            return
+
+        timeout = await self.get_effective_setting(ctx.guild.id, "proposal_timeout")
+        expires_at = (datetime.utcnow() + timedelta(seconds=timeout)).timestamp()
+
+        embed = discord.Embed(
+            title="\U0001f476 Adoption Request! \U0001f476",
+            description=f"**{ctx.author.display_name}** wants to adopt **{user.display_name}**!\n\n"
+                        f"{user.mention}, do you accept?",
+            color=discord.Color.green()
+        )
+        embed.set_footer(text=f"This request expires in {timeout // 60} minutes")
+
+        message = await ctx.send(embed=embed)
+
+        proposal_id = await self.db.create_proposal(
+            proposal_type="adoption",
+            proposer_id=ctx.author.id,
+            target_id=user.id,
+            message_id=message.id,
+            channel_id=ctx.channel.id,
+            guild_id=ctx.guild.id,
+            expires_at=expires_at
+        )
+
+        view = ProposalView(self, proposal_id, user.id, "adoption", timeout=timeout)
+        await message.edit(view=view)
+
+    @commands.command()
+    @commands.guild_only()
+    async def disown(self, ctx: commands.Context, user: discord.Member):
+        """Disown your child."""
+        if not await self.db.is_parent_of(ctx.author.id, user.id):
+            await ctx.send(f"{user.display_name} is not your child!")
+            return
+
+        success = await self.db.delete_parent_child(ctx.author.id, user.id)
+
+        if success:
+            embed = discord.Embed(
+                title="\U0001f6aa Disowned",
+                description=f"**{ctx.author.display_name}** has disowned **{user.display_name}**.",
+                color=discord.Color.dark_gray()
+            )
+            await ctx.send(embed=embed)
+        else:
+            await ctx.send("Something went wrong.")
+
+    @commands.command()
+    @commands.guild_only()
+    async def runaway(self, ctx: commands.Context):
+        """Run away from one of your parents."""
+        parents = await self.db.get_parents(ctx.author.id)
+
+        if not parents:
+            await ctx.send("You don't have any parents to run away from!")
+            return
+
+        if len(parents) == 1:
+            # Only one parent, auto-select
+            parent_id = parents[0]
+            success = await self.db.delete_parent_child(parent_id, ctx.author.id)
+
+            if success:
+                parent = self.bot.get_user(parent_id)
+                parent_name = parent.display_name if parent else f"User {parent_id}"
+                embed = discord.Embed(
+                    title="\U0001f3c3 Ran Away!",
+                    description=f"You have run away from **{parent_name}**!",
+                    color=discord.Color.orange()
+                )
+                await ctx.send(embed=embed)
+            else:
+                await ctx.send("Something went wrong.")
+            return
+
+        # Multiple parents - show selection
+        parent_data = []
+        for parent_id in parents:
+            parent = self.bot.get_user(parent_id)
+            parent_name = parent.display_name if parent else f"User {parent_id}"
+            parent_data.append({"id": parent_id, "name": parent_name})
+
+        embed = discord.Embed(
+            title="\U0001f3c3 Run Away",
+            description="Select which parent you want to run away from:",
+            color=discord.Color.orange()
+        )
+
+        view = RunawaySelectView(self, ctx.author.id, parent_data)
+        await ctx.send(embed=embed, view=view)
+
+    @commands.command()
+    @commands.guild_only()
+    async def sire(self, ctx: commands.Context, coparent: discord.Member, child: discord.Member):
+        """
+        Add a co-parent to your child.
+
+        You must already be a parent of the child.
+        Both the co-parent and child must accept.
+        """
+        # Validation
+        if coparent.bot or child.bot:
+            await ctx.send("Bots cannot be part of family relationships!")
+            return
+
+        if coparent.id == ctx.author.id:
+            await ctx.send("You can't be your own co-parent!")
+            return
+
+        if child.id == ctx.author.id or child.id == coparent.id:
+            await ctx.send("The child must be a different person!")
+            return
+
+        # Check if author is parent of child
+        if not await self.db.is_parent_of(ctx.author.id, child.id):
+            await ctx.send(f"You must already be a parent of {child.display_name} to use this command!")
+            return
+
+        # Check if child already has 2 parents
+        parent_count = await self.db.get_parent_count(child.id)
+        if parent_count >= 2:
+            await ctx.send(f"{child.display_name} already has 2 parents!")
+            return
+
+        # Check if coparent is already a parent
+        if await self.db.is_parent_of(coparent.id, child.id):
+            await ctx.send(f"{coparent.display_name} is already a parent of {child.display_name}!")
+            return
+
+        # Check incest
+        incest = await self.get_effective_setting(ctx.guild.id, "incest_enabled")
+        if not incest:
+            if await self.db.are_related(coparent.id, child.id):
+                await ctx.send(
+                    f"{coparent.display_name} and {child.display_name} are already related! "
+                    "(Incest is disabled on this server)"
+                )
+                return
+
+        timeout = await self.get_effective_setting(ctx.guild.id, "proposal_timeout")
+        expires_at = (datetime.utcnow() + timedelta(seconds=timeout)).timestamp()
+
+        embed = discord.Embed(
+            title="\U0001f46a Co-Parenting Request! \U0001f46a",
+            description=f"**{ctx.author.display_name}** wants **{coparent.display_name}** "
+                        f"to become a co-parent of **{child.display_name}**!\n\n"
+                        f"Both {coparent.mention} and {child.mention} must accept.",
+            color=discord.Color.blue()
+        )
+        embed.add_field(
+            name="Acceptance Status",
+            value=f"\u23f3 {coparent.display_name} (Co-parent)\n\u23f3 {child.display_name} (Child)",
+            inline=False
+        )
+        embed.set_footer(text=f"This request expires in {timeout // 60} minutes")
+
+        message = await ctx.send(embed=embed)
+
+        proposal_id = await self.db.create_proposal(
+            proposal_type="sire",
+            proposer_id=ctx.author.id,
+            target_id=coparent.id,
+            child_id=child.id,
+            message_id=message.id,
+            channel_id=ctx.channel.id,
+            guild_id=ctx.guild.id,
+            expires_at=expires_at
+        )
+
+        view = SireProposalView(self, proposal_id, coparent.id, child.id, timeout=timeout)
+        await message.edit(view=view)
+
+    # === Information Commands ===
+
+    @commands.command()
+    @commands.guild_only()
+    async def tree(self, ctx: commands.Context, user: discord.Member = None):
+        """Display a visual family tree."""
+        target = user or ctx.author
+
+        if not self.visualizer.available:
+            await ctx.send(
+                "Family tree visualization is not available. "
+                "The bot owner needs to install `networkx` and `matplotlib`."
+            )
+            return
+
+        async with ctx.typing():
+            image_buffer = await self.visualizer.generate_tree(
+                self.db, target.id, self.bot, depth=2
+            )
+
+            if not image_buffer:
+                await ctx.send(f"{target.display_name} has no family connections yet!")
+                return
+
+            file = discord.File(image_buffer, filename="family_tree.png")
+
+            embed = discord.Embed(
+                title=f"Family Tree for {target.display_name}",
+                color=await ctx.embed_color()
+            )
+            embed.set_image(url="attachment://family_tree.png")
+
+            await ctx.send(embed=embed, file=file)
+
+    @commands.command()
+    @commands.guild_only()
+    async def family(self, ctx: commands.Context, user: discord.Member = None):
+        """Display family information for a user."""
+        target = user or ctx.author
+
+        spouses = await self.db.get_spouses(target.id)
+        parents = await self.db.get_parents(target.id)
+        children = await self.db.get_children(target.id)
+        siblings = await self.db.get_siblings(target.id)
+
+        embed = discord.Embed(
+            title=f"Family of {target.display_name}",
+            color=await ctx.embed_color()
+        )
+
+        if spouses:
+            spouse_names = []
+            for s in spouses:
+                user_obj = self.bot.get_user(s)
+                spouse_names.append(user_obj.display_name if user_obj else f"User {s}")
+            embed.add_field(
+                name=f"\U0001f48d Spouse{'s' if len(spouses) > 1 else ''} ({len(spouses)})",
+                value="\n".join(spouse_names),
+                inline=True
+            )
+
+        if parents:
+            parent_names = []
+            for p in parents:
+                user_obj = self.bot.get_user(p)
+                parent_names.append(user_obj.display_name if user_obj else f"User {p}")
+            embed.add_field(
+                name=f"\U0001f9d1 Parent{'s' if len(parents) > 1 else ''} ({len(parents)})",
+                value="\n".join(parent_names),
+                inline=True
+            )
+
+        if children:
+            child_names = []
+            for c in children:
+                user_obj = self.bot.get_user(c)
+                child_names.append(user_obj.display_name if user_obj else f"User {c}")
+            embed.add_field(
+                name=f"\U0001f476 Child{'ren' if len(children) > 1 else ''} ({len(children)})",
+                value="\n".join(child_names),
+                inline=True
+            )
+
+        if siblings:
+            sibling_names = []
+            for s in siblings:
+                user_obj = self.bot.get_user(s)
+                sibling_names.append(user_obj.display_name if user_obj else f"User {s}")
+            embed.add_field(
+                name=f"\U0001f9d1\u200d\U0001f91d\u200d\U0001f9d1 Sibling{'s' if len(siblings) > 1 else ''} ({len(siblings)})",
+                value="\n".join(sibling_names),
+                inline=True
+            )
+
+        if not any([spouses, parents, children, siblings]):
+            embed.description = "This user has no family connections yet."
+
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    @commands.guild_only()
+    async def relationship(self, ctx: commands.Context, user1: discord.Member, user2: discord.Member):
+        """Check the relationship between two users."""
+        if user1.id == user2.id:
+            await ctx.send("That's the same person!")
+            return
+
+        rel_type = await self.db.get_relationship_type(user1.id, user2.id)
+
+        if rel_type:
+            await ctx.send(
+                f"**{user2.display_name}** is **{user1.display_name}**'s {rel_type}."
+            )
+        elif await self.db.are_related(user1.id, user2.id):
+            await ctx.send(
+                f"**{user1.display_name}** and **{user2.display_name}** are related (extended family)."
+            )
+        else:
+            await ctx.send(
+                f"**{user1.display_name}** and **{user2.display_name}** are not related."
+            )
+
+    @commands.command()
+    @commands.guild_only()
+    async def proposals(self, ctx: commands.Context):
+        """View your pending proposals."""
+        pending = await self.db.get_pending_proposals_for_user(ctx.author.id)
+
+        if not pending:
+            await ctx.send("You have no pending proposals.")
+            return
+
+        embed = discord.Embed(
+            title="Your Pending Proposals",
+            color=await ctx.embed_color()
+        )
+
+        for p in pending:
+            proposer = self.bot.get_user(p["proposer_id"])
+            proposer_name = proposer.display_name if proposer else f"User {p['proposer_id']}"
+
+            type_emoji = {
+                "marriage": "\U0001f48d",
+                "adoption": "\U0001f476",
+                "sire": "\U0001f46a"
+            }.get(p["proposal_type"], "\u2753")
+
+            embed.add_field(
+                name=f"{type_emoji} {p['proposal_type'].title()} from {proposer_name}",
+                value=f"[Jump to message](https://discord.com/channels/{p['guild_id']}/{p['channel_id']}/{p['message_id']})",
+                inline=False
+            )
+
+        await ctx.send(embed=embed)
+
+    # === Settings Commands ===
+
+    @commands.group()
+    @commands.guild_only()
+    @checks.admin_or_permissions(manage_guild=True)
+    async def familyset(self, ctx: commands.Context):
+        """Configure family cog settings for this server."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help(ctx.command)
+
+    @familyset.command(name="polyamory")
+    async def familyset_polyamory(self, ctx: commands.Context, enabled: bool = None):
+        """Enable or disable polyamory (multiple marriages) for this server."""
+        if enabled is None:
+            current = await self.get_effective_setting(ctx.guild.id, "polyamory_enabled")
+            status = "enabled" if current else "disabled"
+            await ctx.send(f"Polyamory is currently **{status}** for this server.")
+        else:
+            await self.config.guild(ctx.guild).override_polyamory.set(enabled)
+            status = "enabled" if enabled else "disabled"
+            await ctx.send(f"Polyamory has been **{status}** for this server.")
+
+    @familyset.command(name="incest")
+    async def familyset_incest(self, ctx: commands.Context, enabled: bool = None):
+        """Enable or disable incest (marriage between family members) for this server."""
+        if enabled is None:
+            current = await self.get_effective_setting(ctx.guild.id, "incest_enabled")
+            status = "enabled" if current else "disabled"
+            await ctx.send(f"Incest is currently **{status}** for this server.")
+        else:
+            await self.config.guild(ctx.guild).override_incest.set(enabled)
+            status = "enabled" if enabled else "disabled"
+            await ctx.send(f"Incest has been **{status}** for this server.")
+
+    @familyset.command(name="timeout")
+    async def familyset_timeout(self, ctx: commands.Context, seconds: int = None):
+        """Set the proposal timeout in seconds (30-3600)."""
+        if seconds is None:
+            current = await self.get_effective_setting(ctx.guild.id, "proposal_timeout")
+            await ctx.send(f"Proposal timeout is currently **{current} seconds** ({current // 60} minutes).")
+        else:
+            if seconds < 30 or seconds > 3600:
+                await ctx.send("Timeout must be between 30 and 3600 seconds.")
+                return
+            await self.config.guild(ctx.guild).override_proposal_timeout.set(seconds)
+            await ctx.send(f"Proposal timeout set to **{seconds} seconds** ({seconds // 60} minutes).")
+
+    @familyset.command(name="settings")
+    async def familyset_settings(self, ctx: commands.Context):
+        """Display current family settings for this server."""
+        polyamory = await self.get_effective_setting(ctx.guild.id, "polyamory_enabled")
+        incest = await self.get_effective_setting(ctx.guild.id, "incest_enabled")
+        timeout = await self.get_effective_setting(ctx.guild.id, "proposal_timeout")
+        max_spouses = await self.config.max_spouses()
+        max_children = await self.config.max_children()
+
+        embed = discord.Embed(
+            title="Family Settings",
+            color=await ctx.embed_color()
+        )
+        embed.add_field(name="Polyamory", value="Enabled" if polyamory else "Disabled", inline=True)
+        embed.add_field(name="Incest", value="Enabled" if incest else "Disabled", inline=True)
+        embed.add_field(name="Proposal Timeout", value=f"{timeout}s ({timeout // 60}m)", inline=True)
+        embed.add_field(name="Max Spouses", value=str(max_spouses), inline=True)
+        embed.add_field(name="Max Children", value=str(max_children), inline=True)
+
+        await ctx.send(embed=embed)
+
+    @familyset.command(name="reset")
+    async def familyset_reset(self, ctx: commands.Context):
+        """Reset all server settings to use global defaults."""
+        await self.config.guild(ctx.guild).override_polyamory.set(None)
+        await self.config.guild(ctx.guild).override_incest.set(None)
+        await self.config.guild(ctx.guild).override_proposal_timeout.set(None)
+        await ctx.send("All server settings have been reset to global defaults.")
+
+    # === Global Owner Settings ===
+
+    @commands.group()
+    @commands.is_owner()
+    async def familysetglobal(self, ctx: commands.Context):
+        """Configure global family settings (bot owner only)."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help(ctx.command)
+
+    @familysetglobal.command(name="polyamory")
+    async def familysetglobal_polyamory(self, ctx: commands.Context, enabled: bool):
+        """Set the global default for polyamory."""
+        await self.config.polyamory_enabled.set(enabled)
+        status = "enabled" if enabled else "disabled"
+        await ctx.send(f"Global polyamory default set to **{status}**.")
+
+    @familysetglobal.command(name="incest")
+    async def familysetglobal_incest(self, ctx: commands.Context, enabled: bool):
+        """Set the global default for incest."""
+        await self.config.incest_enabled.set(enabled)
+        status = "enabled" if enabled else "disabled"
+        await ctx.send(f"Global incest default set to **{status}**.")
+
+    @familysetglobal.command(name="timeout")
+    async def familysetglobal_timeout(self, ctx: commands.Context, seconds: int):
+        """Set the global default proposal timeout."""
+        if seconds < 30 or seconds > 3600:
+            await ctx.send("Timeout must be between 30 and 3600 seconds.")
+            return
+        await self.config.proposal_timeout.set(seconds)
+        await ctx.send(f"Global proposal timeout set to **{seconds} seconds**.")
+
+    @familysetglobal.command(name="maxspouses")
+    async def familysetglobal_maxspouses(self, ctx: commands.Context, count: int):
+        """Set the maximum number of spouses (when polyamory is enabled)."""
+        if count < 1 or count > 20:
+            await ctx.send("Max spouses must be between 1 and 20.")
+            return
+        await self.config.max_spouses.set(count)
+        await ctx.send(f"Maximum spouses set to **{count}**.")
+
+    @familysetglobal.command(name="maxchildren")
+    async def familysetglobal_maxchildren(self, ctx: commands.Context, count: int):
+        """Set the maximum number of children per user."""
+        if count < 1 or count > 50:
+            await ctx.send("Max children must be between 1 and 50.")
+            return
+        await self.config.max_children.set(count)
+        await ctx.send(f"Maximum children set to **{count}**.")
+
+    @familysetglobal.command(name="settings")
+    async def familysetglobal_settings(self, ctx: commands.Context):
+        """Display current global family settings."""
+        polyamory = await self.config.polyamory_enabled()
+        incest = await self.config.incest_enabled()
+        timeout = await self.config.proposal_timeout()
+        max_spouses = await self.config.max_spouses()
+        max_children = await self.config.max_children()
+
+        embed = discord.Embed(
+            title="Global Family Settings",
+            color=await ctx.embed_color()
+        )
+        embed.add_field(name="Polyamory Default", value="Enabled" if polyamory else "Disabled", inline=True)
+        embed.add_field(name="Incest Default", value="Enabled" if incest else "Disabled", inline=True)
+        embed.add_field(name="Proposal Timeout", value=f"{timeout}s ({timeout // 60}m)", inline=True)
+        embed.add_field(name="Max Spouses", value=str(max_spouses), inline=True)
+        embed.add_field(name="Max Children", value=str(max_children), inline=True)
+
+        await ctx.send(embed=embed)

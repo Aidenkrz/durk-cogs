@@ -1,0 +1,24 @@
+{
+    "author": ["Durk"],
+    "install_msg": "Thank you for installing the Family cog! Use `[p]help Family` for commands.\n\nFor family tree visualization, ensure `networkx` and `matplotlib` are installed.",
+    "name": "Family",
+    "short": "Marriage, adoption, and family tree system.",
+    "description": "A comprehensive family system with marriage, adoption, sire relationships, and visual family trees. Features include proposals with accept/decline buttons, polyamory and incest settings, and network graph visualization of family connections.",
+    "tags": [
+        "family",
+        "marriage",
+        "adoption",
+        "social",
+        "roleplay",
+        "tree"
+    ],
+    "requirements": [
+        "aiosqlite"
+    ],
+    "required_cogs": {},
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "end_user_data_statement": "This cog stores Discord user IDs and family relationship data (marriages, parent-child relationships) globally across all servers. This data is used to track virtual family connections and generate family trees."
+}
