@@ -2,6 +2,7 @@ import logging
 import math
 from io import BytesIO
 from typing import TYPE_CHECKING, Dict, List, Set, Optional, Tuple
+from collections import defaultdict
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -17,7 +18,7 @@ log = logging.getLogger("red.DurkCogs.Family.visualization")
 
 
 class FamilyTreeVisualizer:
-    """Generates family tree visualizations using Pillow."""
+    """Generates hierarchical family tree visualizations using Pillow."""
 
     # Color scheme (RGB tuples for Pillow)
     COLORS = {
@@ -32,13 +33,11 @@ class FamilyTreeVisualizer:
     # Edge colors
     EDGE_COLORS = {
         'marriage': (255, 105, 180),   # Pink
-        'parent_child': (65, 105, 225), # Blue
+        'parent_child': (100, 149, 237), # Cornflower blue
     }
 
     # Background color (Discord dark theme)
     BG_COLOR = (54, 57, 63)
-    TEXT_COLOR = (0, 0, 0)  # Black text for contrast on colored nodes
-    LABEL_BG = (47, 49, 54)  # Dark background for labels below nodes
 
     def __init__(self):
         if not PILLOW_AVAILABLE:
@@ -57,116 +56,118 @@ class FamilyTreeVisualizer:
         depth: int = 2
     ) -> Optional[BytesIO]:
         """
-        Generate a family tree image centered on user_id.
-
-        Args:
-            db: Database instance
-            user_id: The central user to build the tree around
-            bot: Discord bot instance for fetching usernames
-            depth: How many relationship levels to traverse
-
-        Returns:
-            BytesIO containing PNG image, or None if unavailable
+        Generate a hierarchical family tree image centered on user_id.
         """
         if not PILLOW_AVAILABLE:
             return None
 
-        # Collect all family members and their relationships
-        nodes: Dict[int, dict] = {}
-        edges: List[Tuple[int, int, str]] = []
-        visited: Set[int] = set()
+        # Collect family data
+        family_data = await self._collect_family_hierarchical(db, user_id, bot, depth)
 
-        await self._collect_family(
-            db, user_id, bot, nodes, edges, visited, depth, 0, user_id
-        )
-
-        if not nodes:
+        if not family_data['nodes']:
             return None
 
-        # Calculate positions using a simple force-directed layout
-        positions = self._calculate_positions(nodes, edges)
+        # Calculate hierarchical positions
+        positions = self._calculate_hierarchical_positions(family_data, user_id)
 
-        # Scale factor for higher resolution
-        scale = 2.0
+        if not positions:
+            return None
 
-        # Determine image size based on positions
-        min_x = min(p[0] for p in positions.values()) - 150
-        max_x = max(p[0] for p in positions.values()) + 150
-        min_y = min(p[1] for p in positions.values()) - 100
-        max_y = max(p[1] for p in positions.values()) + 100
+        # Layout constants
+        node_width = 120
+        node_height = 50
+        h_spacing = 160  # Horizontal spacing between nodes
+        v_spacing = 120  # Vertical spacing between levels
+        margin = 80
 
-        width = max(800, int((max_x - min_x + 300) * scale))
-        height = max(600, int((max_y - min_y + 200) * scale))
+        # Calculate image dimensions
+        all_x = [p[0] for p in positions.values()]
+        all_y = [p[1] for p in positions.values()]
 
-        # Offset positions to fit in image
-        offset_x = (-min_x + 150) * scale
-        offset_y = (-min_y + 100) * scale
+        min_x, max_x = min(all_x), max(all_x)
+        min_y, max_y = min(all_y), max(all_y)
+
+        width = int((max_x - min_x) * h_spacing + node_width + margin * 2)
+        height = int((max_y - min_y) * v_spacing + node_height + margin * 2)
+
+        # Ensure minimum size
+        width = max(600, width)
+        height = max(400, height)
+
+        # Offset to center the tree
+        offset_x = -min_x * h_spacing + margin + node_width // 2
+        offset_y = -min_y * v_spacing + margin + node_height // 2
 
         # Create image
         img = Image.new('RGB', (width, height), self.BG_COLOR)
         draw = ImageDraw.Draw(img)
 
-        # Try to load a font, fall back to default
-        font_size = int(16 * scale)
-        title_font_size = int(24 * scale)
+        # Load fonts
         try:
-            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-            title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", title_font_size)
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 14)
+            title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 20)
         except (OSError, IOError):
             try:
-                font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", font_size)
-                title_font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", title_font_size)
+                font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 14)
+                title_font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 20)
             except (OSError, IOError):
                 font = ImageFont.load_default()
                 title_font = font
 
         # Draw title
-        central_name = nodes[user_id]['name']
+        central_name = family_data['nodes'][user_id]['name']
         title = f"Family Tree for {central_name}"
         title_bbox = draw.textbbox((0, 0), title, font=title_font)
         title_width = title_bbox[2] - title_bbox[0]
-        draw.text(((width - title_width) // 2, int(20 * scale)), title, fill=(255, 255, 255), font=title_font)
+        draw.text(((width - title_width) // 2, 15), title, fill=(255, 255, 255), font=title_font)
 
-        # Node size - smaller nodes
-        node_radius = int(22 * scale)
-
-        # Draw edges first (so they're behind nodes)
-        for user1_id, user2_id, edge_type in edges:
-            if user1_id in positions and user2_id in positions:
-                x1, y1 = positions[user1_id]
-                x2, y2 = positions[user2_id]
-                x1, y1 = x1 * scale + offset_x, y1 * scale + offset_y
-                x2, y2 = x2 * scale + offset_x, y2 * scale + offset_y
+        # Draw edges first
+        for edge in family_data['edges']:
+            uid1, uid2, edge_type = edge
+            if uid1 in positions and uid2 in positions:
+                x1 = positions[uid1][0] * h_spacing + offset_x
+                y1 = positions[uid1][1] * v_spacing + offset_y
+                x2 = positions[uid2][0] * h_spacing + offset_x
+                y2 = positions[uid2][1] * v_spacing + offset_y
 
                 color = self.EDGE_COLORS.get(edge_type, (128, 128, 128))
-                line_width = int(3 * scale)
 
                 if edge_type == 'marriage':
-                    # Solid thick line for marriage
-                    draw.line([(x1, y1), (x2, y2)], fill=color, width=line_width)
+                    # Horizontal line for marriage (same level)
+                    draw.line([(x1, y1), (x2, y2)], fill=color, width=3)
                 else:
-                    # Dashed line for parent-child
-                    self._draw_dashed_line(draw, x1, y1, x2, y2, color, width=int(2 * scale))
+                    # Elbow connector for parent-child
+                    mid_y = (y1 + y2) / 2
+                    draw.line([(x1, y1), (x1, mid_y)], fill=color, width=2)
+                    draw.line([(x1, mid_y), (x2, mid_y)], fill=color, width=2)
+                    draw.line([(x2, mid_y), (x2, y2)], fill=color, width=2)
+
         # Draw nodes
-        for uid, node_data in nodes.items():
+        node_h = 45
+        node_w = 110
+        corner_radius = 8
+
+        for uid, node_data in family_data['nodes'].items():
             if uid not in positions:
                 continue
 
-            x, y = positions[uid]
-            x, y = x * scale + offset_x, y * scale + offset_y
+            x = positions[uid][0] * h_spacing + offset_x
+            y = positions[uid][1] * v_spacing + offset_y
 
             color = self.COLORS.get(node_data['type'], self.COLORS['extended'])
 
-            # Draw circle with white outline
-            draw.ellipse(
-                [(x - node_radius, y - node_radius),
-                 (x + node_radius, y + node_radius)],
+            # Draw rounded rectangle
+            self._draw_rounded_rect(
+                draw,
+                x - node_w // 2, y - node_h // 2,
+                x + node_w // 2, y + node_h // 2,
+                corner_radius,
                 fill=color,
                 outline=(255, 255, 255),
-                width=int(2 * scale)
+                width=2
             )
 
-            # Draw name below the node
+            # Draw name
             name = node_data['name']
             if len(name) > 14:
                 name = name[:12] + ".."
@@ -175,28 +176,19 @@ class FamilyTreeVisualizer:
             text_width = text_bbox[2] - text_bbox[0]
             text_height = text_bbox[3] - text_bbox[1]
 
-            # Position text below the node
-            text_x = x - text_width // 2
-            text_y = y + node_radius + int(5 * scale)
+            # Use black text for light colors, white for dark
+            brightness = (color[0] * 299 + color[1] * 587 + color[2] * 114) / 1000
+            text_color = (0, 0, 0) if brightness > 128 else (255, 255, 255)
 
-            # Draw text background for readability
-            padding = int(4 * scale)
-            draw.rectangle(
-                [(text_x - padding, text_y - padding),
-                 (text_x + text_width + padding, text_y + text_height + padding)],
-                fill=(30, 32, 36)
-            )
-
-            # Draw white text
             draw.text(
-                (text_x, text_y),
+                (x - text_width // 2, y - text_height // 2),
                 name,
-                fill=(255, 255, 255),
+                fill=text_color,
                 font=font
             )
 
-        # Draw legend
-        legend_y = height - int(50 * scale)
+        # Draw legend at bottom
+        legend_y = height - 40
         legend_items = [
             ('You', self.COLORS['self']),
             ('Spouse', self.COLORS['spouse']),
@@ -205,222 +197,199 @@ class FamilyTreeVisualizer:
             ('Sibling', self.COLORS['sibling']),
         ]
 
-        legend_x = int(30 * scale)
-        dot_size = int(18 * scale)
+        legend_x = 30
         for label, color in legend_items:
-            draw.ellipse([(legend_x, legend_y), (legend_x + dot_size, legend_y + dot_size)], fill=color, outline=(255, 255, 255), width=2)
-            draw.text((legend_x + dot_size + int(8 * scale), legend_y), label, fill=(255, 255, 255), font=font)
-            legend_x += int(110 * scale)
+            draw.ellipse([(legend_x, legend_y), (legend_x + 16, legend_y + 16)],
+                        fill=color, outline=(255, 255, 255), width=1)
+            draw.text((legend_x + 22, legend_y), label, fill=(255, 255, 255), font=font)
+            legend_x += 100
 
         # Save to BytesIO
         buffer = BytesIO()
-        img.save(buffer, format='PNG')
+        img.save(buffer, format='PNG', quality=95)
         buffer.seek(0)
 
         return buffer
 
-    def _draw_dashed_line(self, draw, x1, y1, x2, y2, color, width=1, dash_length=8):
-        """Draw a dashed line."""
-        dx = x2 - x1
-        dy = y2 - y1
-        distance = math.sqrt(dx * dx + dy * dy)
+    def _draw_rounded_rect(self, draw, x1, y1, x2, y2, radius, fill, outline, width):
+        """Draw a rounded rectangle."""
+        # Draw the main rectangle parts
+        draw.rectangle([x1 + radius, y1, x2 - radius, y2], fill=fill)
+        draw.rectangle([x1, y1 + radius, x2, y2 - radius], fill=fill)
 
-        if distance == 0:
-            return
+        # Draw the four corners
+        draw.ellipse([x1, y1, x1 + radius * 2, y1 + radius * 2], fill=fill)
+        draw.ellipse([x2 - radius * 2, y1, x2, y1 + radius * 2], fill=fill)
+        draw.ellipse([x1, y2 - radius * 2, x1 + radius * 2, y2], fill=fill)
+        draw.ellipse([x2 - radius * 2, y2 - radius * 2, x2, y2], fill=fill)
 
-        dashes = int(distance / dash_length)
-        if dashes == 0:
-            dashes = 1
+        # Draw outline
+        if outline and width > 0:
+            # Top and bottom edges
+            draw.line([(x1 + radius, y1), (x2 - radius, y1)], fill=outline, width=width)
+            draw.line([(x1 + radius, y2), (x2 - radius, y2)], fill=outline, width=width)
+            # Left and right edges
+            draw.line([(x1, y1 + radius), (x1, y2 - radius)], fill=outline, width=width)
+            draw.line([(x2, y1 + radius), (x2, y2 - radius)], fill=outline, width=width)
+            # Corner arcs (approximated)
+            draw.arc([x1, y1, x1 + radius * 2, y1 + radius * 2], 180, 270, fill=outline, width=width)
+            draw.arc([x2 - radius * 2, y1, x2, y1 + radius * 2], 270, 360, fill=outline, width=width)
+            draw.arc([x1, y2 - radius * 2, x1 + radius * 2, y2], 90, 180, fill=outline, width=width)
+            draw.arc([x2 - radius * 2, y2 - radius * 2, x2, y2], 0, 90, fill=outline, width=width)
 
-        for i in range(0, dashes, 2):
-            start = i / dashes
-            end = min((i + 1) / dashes, 1)
-
-            sx = x1 + dx * start
-            sy = y1 + dy * start
-            ex = x1 + dx * end
-            ey = y1 + dy * end
-
-            draw.line([(sx, sy), (ex, ey)], fill=color, width=width)
-
-    def _calculate_positions(
-        self, nodes: Dict[int, dict], edges: List[Tuple[int, int, str]]
+    def _calculate_hierarchical_positions(
+        self, family_data: dict, central_user_id: int
     ) -> Dict[int, Tuple[float, float]]:
-        """Calculate node positions using a simple force-directed layout."""
+        """
+        Calculate hierarchical positions with:
+        - Central user at (0, 0)
+        - Spouses horizontally adjacent
+        - Parents above (negative y)
+        - Children below (positive y)
+        """
+        nodes = family_data['nodes']
+        edges = family_data['edges']
+        levels = family_data['levels']
+
         if not nodes:
             return {}
 
-        # Initialize positions in a circle with more spacing
         positions = {}
-        n = len(nodes)
-        node_ids = list(nodes.keys())
 
-        # Larger initial radius for more spacing
-        initial_radius = max(200, n * 40)
-        for i, uid in enumerate(node_ids):
-            angle = 2 * math.pi * i / n
-            positions[uid] = (math.cos(angle) * initial_radius, math.sin(angle) * initial_radius)
+        # Group nodes by level
+        level_nodes = defaultdict(list)
+        for uid, level in levels.items():
+            level_nodes[level].append(uid)
 
-        # More iterations for better layout
-        for _ in range(80):
-            forces = {uid: [0.0, 0.0] for uid in node_ids}
+        # Sort levels
+        sorted_levels = sorted(level_nodes.keys())
 
-            # Stronger repulsion between all nodes
-            for i, uid1 in enumerate(node_ids):
-                for uid2 in node_ids[i + 1:]:
-                    x1, y1 = positions[uid1]
-                    x2, y2 = positions[uid2]
+        # Position nodes at each level
+        for level in sorted_levels:
+            nodes_at_level = level_nodes[level]
 
-                    dx = x2 - x1
-                    dy = y2 - y1
-                    dist = math.sqrt(dx * dx + dy * dy) + 0.1
+            # Sort nodes to keep spouses together and central user in middle
+            if level == 0:
+                # Put central user first, then their spouses
+                sorted_nodes = [central_user_id] if central_user_id in nodes_at_level else []
+                for uid in nodes_at_level:
+                    if uid != central_user_id:
+                        sorted_nodes.append(uid)
+                nodes_at_level = sorted_nodes
 
-                    # Minimum distance to prevent overlap
-                    min_dist = 120
-                    if dist < min_dist:
-                        dist = min_dist
+            n = len(nodes_at_level)
+            # Center the nodes at this level
+            start_x = -(n - 1) / 2
 
-                    # Stronger repulsion force
-                    force = 15000 / (dist * dist)
-                    fx = -force * dx / dist
-                    fy = -force * dy / dist
-
-                    forces[uid1][0] += fx
-                    forces[uid1][1] += fy
-                    forces[uid2][0] -= fx
-                    forces[uid2][1] -= fy
-
-            # Attraction along edges (weaker to allow more spacing)
-            for uid1, uid2, _ in edges:
-                if uid1 not in positions or uid2 not in positions:
-                    continue
-
-                x1, y1 = positions[uid1]
-                x2, y2 = positions[uid2]
-
-                dx = x2 - x1
-                dy = y2 - y1
-                dist = math.sqrt(dx * dx + dy * dy) + 0.1
-
-                # Only attract if too far apart
-                ideal_dist = 150
-                if dist > ideal_dist:
-                    force = (dist - ideal_dist) * 0.03
-                    fx = force * dx / dist
-                    fy = force * dy / dist
-
-                    forces[uid1][0] += fx
-                    forces[uid1][1] += fy
-                    forces[uid2][0] -= fx
-                    forces[uid2][1] -= fy
-
-            # Apply forces with damping
-            for uid in node_ids:
-                x, y = positions[uid]
-                fx, fy = forces[uid]
-
-                # Limit force magnitude
-                mag = math.sqrt(fx * fx + fy * fy)
-                if mag > 15:
-                    fx = fx / mag * 15
-                    fy = fy / mag * 15
-
-                positions[uid] = (x + fx, y + fy)
+            for i, uid in enumerate(nodes_at_level):
+                positions[uid] = (start_x + i, level)
 
         return positions
 
-    async def _collect_family(
+    async def _collect_family_hierarchical(
         self,
         db: "FamilyDatabase",
         user_id: int,
         bot: "Red",
-        nodes: Dict[int, dict],
-        edges: List[Tuple[int, int, str]],
-        visited: Set[int],
-        max_depth: int,
-        current_depth: int,
-        central_user_id: int
-    ):
-        """Recursively collect family members and relationships."""
-        if user_id in visited or current_depth > max_depth:
-            return
+        depth: int
+    ) -> dict:
+        """
+        Collect family members with level information for hierarchical layout.
+        Level 0 = central user and spouses
+        Level -1, -2 = parents, grandparents (above)
+        Level 1, 2 = children, grandchildren (below)
+        """
+        nodes: Dict[int, dict] = {}
+        edges: List[Tuple[int, int, str]] = []
+        levels: Dict[int, int] = {}
+        visited: Set[int] = set()
 
-        visited.add(user_id)
+        async def get_name(uid: int) -> str:
+            user = bot.get_user(uid)
+            return user.display_name if user else f"User {uid}"
 
-        # Get user name
-        user = bot.get_user(user_id)
-        display_name = user.display_name if user else f"User {user_id}"
+        async def collect_ancestors(uid: int, current_level: int, max_level: int):
+            """Collect parents and grandparents (going up)."""
+            if uid in visited or current_level < -max_level:
+                return
 
-        # Determine node type
-        if user_id == central_user_id:
-            node_type = 'self'
-        else:
-            node_type = 'extended'
+            parents = await db.get_parents(uid)
+            for parent_id in parents:
+                if parent_id not in nodes:
+                    nodes[parent_id] = {
+                        'name': await get_name(parent_id),
+                        'type': 'parent'
+                    }
+                    levels[parent_id] = current_level - 1
 
-        nodes[user_id] = {'name': display_name, 'type': node_type}
+                edge = tuple(sorted([parent_id, uid]))
+                if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
+                    edges.append((parent_id, uid, 'parent_child'))
 
-        # Get spouses
+                await collect_ancestors(parent_id, current_level - 1, max_level)
+
+        async def collect_descendants(uid: int, current_level: int, max_level: int):
+            """Collect children and grandchildren (going down)."""
+            if uid in visited or current_level > max_level:
+                return
+
+            children = await db.get_children(uid)
+            for child_id in children:
+                if child_id not in nodes:
+                    nodes[child_id] = {
+                        'name': await get_name(child_id),
+                        'type': 'child'
+                    }
+                    levels[child_id] = current_level + 1
+
+                edge = tuple(sorted([uid, child_id]))
+                if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
+                    edges.append((uid, child_id, 'parent_child'))
+
+                await collect_descendants(child_id, current_level + 1, max_level)
+
+        # Add central user
+        nodes[user_id] = {
+            'name': await get_name(user_id),
+            'type': 'self'
+        }
+        levels[user_id] = 0
+
+        # Add spouses at same level
         spouses = await db.get_spouses(user_id)
         for spouse_id in spouses:
-            if spouse_id not in nodes:
-                spouse = bot.get_user(spouse_id)
-                spouse_name = spouse.display_name if spouse else f"User {spouse_id}"
-                nodes[spouse_id] = {'name': spouse_name, 'type': 'spouse'}
+            nodes[spouse_id] = {
+                'name': await get_name(spouse_id),
+                'type': 'spouse'
+            }
+            levels[spouse_id] = 0
+            edges.append((user_id, spouse_id, 'marriage'))
 
-            # Add edge if not already added
-            edge = tuple(sorted([user_id, spouse_id]))
-            if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
-                edges.append((edge[0], edge[1], 'marriage'))
-
-            if current_depth < max_depth:
-                await self._collect_family(
-                    db, spouse_id, bot, nodes, edges, visited,
-                    max_depth, current_depth + 1, central_user_id
-                )
-
-        # Get parents
-        parents = await db.get_parents(user_id)
-        for parent_id in parents:
-            if parent_id not in nodes:
-                parent = bot.get_user(parent_id)
-                parent_name = parent.display_name if parent else f"User {parent_id}"
-                nodes[parent_id] = {'name': parent_name, 'type': 'parent'}
-
-            edge = tuple(sorted([parent_id, user_id]))
-            if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
-                edges.append((edge[0], edge[1], 'parent_child'))
-
-            if current_depth < max_depth:
-                await self._collect_family(
-                    db, parent_id, bot, nodes, edges, visited,
-                    max_depth, current_depth + 1, central_user_id
-                )
-
-        # Get children
-        children = await db.get_children(user_id)
-        for child_id in children:
-            if child_id not in nodes:
-                child = bot.get_user(child_id)
-                child_name = child.display_name if child else f"User {child_id}"
-                nodes[child_id] = {'name': child_name, 'type': 'child'}
-
-            edge = tuple(sorted([user_id, child_id]))
-            if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
-                edges.append((edge[0], edge[1], 'parent_child'))
-
-            if current_depth < max_depth:
-                await self._collect_family(
-                    db, child_id, bot, nodes, edges, visited,
-                    max_depth, current_depth + 1, central_user_id
-                )
-
-        # Get siblings
+        # Add siblings at same level
         siblings = await db.get_siblings(user_id)
         for sibling_id in siblings:
             if sibling_id not in nodes:
-                sibling = bot.get_user(sibling_id)
-                sibling_name = sibling.display_name if sibling else f"User {sibling_id}"
-                nodes[sibling_id] = {'name': sibling_name, 'type': 'sibling'}
+                nodes[sibling_id] = {
+                    'name': await get_name(sibling_id),
+                    'type': 'sibling'
+                }
+                levels[sibling_id] = 0
+
+        # Collect ancestors (parents, grandparents)
+        await collect_ancestors(user_id, 0, depth)
+
+        # Collect descendants (children, grandchildren)
+        await collect_descendants(user_id, 0, depth)
+
+        # Also collect descendants of spouses
+        for spouse_id in spouses:
+            await collect_descendants(spouse_id, 0, depth)
+
+        return {
+            'nodes': nodes,
+            'edges': edges,
+            'levels': levels
+        }
 
 
 async def generate_text_tree(db: "FamilyDatabase", user_id: int, bot: "Red") -> str:
@@ -438,7 +407,7 @@ async def generate_text_tree(db: "FamilyDatabase", user_id: int, bot: "Red") -> 
         for p in parents:
             parent = bot.get_user(p)
             name = parent.display_name if parent else f"User {p}"
-            lines.append(f"  \u2514 {name}")
+            lines.append(f"  └ {name}")
 
     # Spouses
     spouses = await db.get_spouses(user_id)
@@ -447,7 +416,7 @@ async def generate_text_tree(db: "FamilyDatabase", user_id: int, bot: "Red") -> 
         for s in spouses:
             spouse = bot.get_user(s)
             name = spouse.display_name if spouse else f"User {s}"
-            lines.append(f"  \u2764 {name}")
+            lines.append(f"  ♥ {name}")
 
     # Siblings
     siblings = await db.get_siblings(user_id)
@@ -456,7 +425,7 @@ async def generate_text_tree(db: "FamilyDatabase", user_id: int, bot: "Red") -> 
         for s in siblings:
             sibling = bot.get_user(s)
             name = sibling.display_name if sibling else f"User {s}"
-            lines.append(f"  \u2194 {name}")
+            lines.append(f"  ↔ {name}")
 
     # Children
     children = await db.get_children(user_id)
@@ -465,7 +434,7 @@ async def generate_text_tree(db: "FamilyDatabase", user_id: int, bot: "Red") -> 
         for c in children:
             child = bot.get_user(c)
             name = child.display_name if child else f"User {c}"
-            lines.append(f"  \u2514 {name}")
+            lines.append(f"  └ {name}")
 
     if len(lines) == 1:
         lines.append("No family connections yet.")
