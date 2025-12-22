@@ -27,6 +27,9 @@ class FamilyTreeVisualizer:
         'parent': (65, 105, 225),    # Royal blue
         'child': (50, 205, 50),      # Lime green
         'sibling': (255, 165, 0),    # Orange
+        'in_law': (138, 43, 226),    # Blue violet (children's spouses, their parents)
+        'grandparent': (70, 130, 180), # Steel blue
+        'grandchild': (144, 238, 144), # Light green
         'extended': (147, 112, 219), # Medium purple
     }
 
@@ -187,22 +190,23 @@ class FamilyTreeVisualizer:
                 font=font
             )
 
-        # Draw legend at bottom
-        legend_y = height - 40
+        # Draw legend at bottom (two rows if needed)
         legend_items = [
             ('You', self.COLORS['self']),
             ('Spouse', self.COLORS['spouse']),
             ('Parent', self.COLORS['parent']),
             ('Child', self.COLORS['child']),
             ('Sibling', self.COLORS['sibling']),
+            ('In-law', self.COLORS['in_law']),
         ]
 
+        legend_y = height - 40
         legend_x = 30
         for label, color in legend_items:
             draw.ellipse([(legend_x, legend_y), (legend_x + 16, legend_y + 16)],
                         fill=color, outline=(255, 255, 255), width=1)
             draw.text((legend_x + 22, legend_y), label, fill=(255, 255, 255), font=font)
-            legend_x += 100
+            legend_x += 90
 
         # Save to BytesIO
         buffer = BytesIO()
@@ -298,55 +302,90 @@ class FamilyTreeVisualizer:
         Level 0 = central user and spouses
         Level -1, -2 = parents, grandparents (above)
         Level 1, 2 = children, grandchildren (below)
+
+        This traverses through marriages to show in-laws (children's spouses and their parents).
         """
         nodes: Dict[int, dict] = {}
         edges: List[Tuple[int, int, str]] = []
         levels: Dict[int, int] = {}
-        visited: Set[int] = set()
+        processed_ancestors: Set[int] = set()
+        processed_descendants: Set[int] = set()
 
         async def get_name(uid: int) -> str:
             user = bot.get_user(uid)
             return user.display_name if user else f"User {uid}"
 
-        async def collect_ancestors(uid: int, current_level: int, max_level: int):
+        def add_edge(uid1: int, uid2: int, edge_type: str):
+            """Add edge if not already present."""
+            edge = tuple(sorted([uid1, uid2]))
+            if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
+                edges.append((uid1, uid2, edge_type))
+
+        async def collect_ancestors(uid: int, current_level: int, max_level: int, node_type: str = 'parent'):
             """Collect parents and grandparents (going up)."""
-            if uid in visited or current_level < -max_level:
+            if uid in processed_ancestors or current_level < -max_level:
                 return
+            processed_ancestors.add(uid)
 
             parents = await db.get_parents(uid)
             for parent_id in parents:
+                parent_type = node_type
+                if current_level - 1 < -1:
+                    parent_type = 'grandparent' if node_type == 'parent' else 'in_law'
+
                 if parent_id not in nodes:
                     nodes[parent_id] = {
                         'name': await get_name(parent_id),
-                        'type': 'parent'
+                        'type': parent_type
                     }
                     levels[parent_id] = current_level - 1
 
-                edge = tuple(sorted([parent_id, uid]))
-                if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
-                    edges.append((parent_id, uid, 'parent_child'))
+                add_edge(parent_id, uid, 'parent_child')
+                await collect_ancestors(parent_id, current_level - 1, max_level, node_type)
 
-                await collect_ancestors(parent_id, current_level - 1, max_level)
-
-        async def collect_descendants(uid: int, current_level: int, max_level: int):
-            """Collect children and grandchildren (going down)."""
-            if uid in visited or current_level > max_level:
+        async def collect_descendants(uid: int, current_level: int, max_level: int,
+                                     is_blood_relative: bool = True, collect_in_laws: bool = True):
+            """Collect children, grandchildren, and their spouses (in-laws)."""
+            if uid in processed_descendants or current_level > max_level:
                 return
+            processed_descendants.add(uid)
 
             children = await db.get_children(uid)
             for child_id in children:
+                child_type = 'child' if is_blood_relative else 'in_law'
+                if current_level + 1 > 1:
+                    child_type = 'grandchild' if is_blood_relative else 'in_law'
+
                 if child_id not in nodes:
                     nodes[child_id] = {
                         'name': await get_name(child_id),
-                        'type': 'child'
+                        'type': child_type
                     }
                     levels[child_id] = current_level + 1
 
-                edge = tuple(sorted([uid, child_id]))
-                if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
-                    edges.append((uid, child_id, 'parent_child'))
+                add_edge(uid, child_id, 'parent_child')
 
-                await collect_descendants(child_id, current_level + 1, max_level)
+                # Get child's spouses (children-in-law)
+                if collect_in_laws:
+                    child_spouses = await db.get_spouses(child_id)
+                    for spouse_id in child_spouses:
+                        if spouse_id not in nodes:
+                            nodes[spouse_id] = {
+                                'name': await get_name(spouse_id),
+                                'type': 'in_law'
+                            }
+                            levels[spouse_id] = current_level + 1
+                        add_edge(child_id, spouse_id, 'marriage')
+
+                        # Get the in-law's parents (e.g., ChildB's parents when viewing PersonA's tree)
+                        await collect_ancestors(spouse_id, current_level + 1, max_level, 'in_law')
+
+                        # Get descendants of child's spouse (step-grandchildren, etc.)
+                        await collect_descendants(spouse_id, current_level + 1, max_level,
+                                                 is_blood_relative=False, collect_in_laws=False)
+
+                await collect_descendants(child_id, current_level + 1, max_level,
+                                         is_blood_relative=is_blood_relative, collect_in_laws=collect_in_laws)
 
         # Add central user
         nodes[user_id] = {
@@ -363,7 +402,10 @@ class FamilyTreeVisualizer:
                 'type': 'spouse'
             }
             levels[spouse_id] = 0
-            edges.append((user_id, spouse_id, 'marriage'))
+            add_edge(user_id, spouse_id, 'marriage')
+
+            # Get spouse's parents (parents-in-law)
+            await collect_ancestors(spouse_id, 0, depth, 'in_law')
 
         # Add siblings at same level
         siblings = await db.get_siblings(user_id)
@@ -375,15 +417,26 @@ class FamilyTreeVisualizer:
                 }
                 levels[sibling_id] = 0
 
-        # Collect ancestors (parents, grandparents)
-        await collect_ancestors(user_id, 0, depth)
+            # Get sibling's spouses
+            sibling_spouses = await db.get_spouses(sibling_id)
+            for spouse_id in sibling_spouses:
+                if spouse_id not in nodes:
+                    nodes[spouse_id] = {
+                        'name': await get_name(spouse_id),
+                        'type': 'in_law'
+                    }
+                    levels[spouse_id] = 0
+                add_edge(sibling_id, spouse_id, 'marriage')
 
-        # Collect descendants (children, grandchildren)
-        await collect_descendants(user_id, 0, depth)
+        # Collect ancestors (parents, grandparents)
+        await collect_ancestors(user_id, 0, depth, 'parent')
+
+        # Collect descendants (children, grandchildren) - this now includes in-laws
+        await collect_descendants(user_id, 0, depth, is_blood_relative=True, collect_in_laws=True)
 
         # Also collect descendants of spouses
         for spouse_id in spouses:
-            await collect_descendants(spouse_id, 0, depth)
+            await collect_descendants(spouse_id, 0, depth, is_blood_relative=True, collect_in_laws=True)
 
         return {
             'nodes': nodes,
