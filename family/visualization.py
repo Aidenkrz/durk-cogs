@@ -1,16 +1,13 @@
 import logging
+import math
 from io import BytesIO
-from typing import TYPE_CHECKING, Dict, Set, Optional
+from typing import TYPE_CHECKING, Dict, List, Set, Optional, Tuple
 
 try:
-    import networkx as nx
-    import matplotlib
-    matplotlib.use('Agg')  # Use non-interactive backend
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    VISUALIZATION_AVAILABLE = True
+    from PIL import Image, ImageDraw, ImageFont
+    PILLOW_AVAILABLE = True
 except ImportError:
-    VISUALIZATION_AVAILABLE = False
+    PILLOW_AVAILABLE = False
 
 if TYPE_CHECKING:
     from .database import FamilyDatabase
@@ -20,32 +17,36 @@ log = logging.getLogger("red.DurkCogs.Family.visualization")
 
 
 class FamilyTreeVisualizer:
-    """Generates network graph visualizations of family trees."""
+    """Generates family tree visualizations using Pillow."""
 
-    # Color scheme for different relationship types
+    # Color scheme (RGB tuples for Pillow)
     COLORS = {
-        'self': '#FFD700',       # Gold for the focused user
-        'spouse': '#FF69B4',     # Hot pink for spouses
-        'parent': '#4169E1',     # Royal blue for parents
-        'child': '#32CD32',      # Lime green for children
-        'sibling': '#FFA500',    # Orange for siblings
-        'extended': '#9370DB',   # Medium purple for extended family
+        'self': (255, 215, 0),       # Gold
+        'spouse': (255, 105, 180),   # Hot pink
+        'parent': (65, 105, 225),    # Royal blue
+        'child': (50, 205, 50),      # Lime green
+        'sibling': (255, 165, 0),    # Orange
+        'extended': (147, 112, 219), # Medium purple
     }
 
     # Edge colors
     EDGE_COLORS = {
-        'marriage': '#FF69B4',   # Pink for marriages
-        'parent_child': '#4169E1',  # Blue for parent-child
+        'marriage': (255, 105, 180),   # Pink
+        'parent_child': (65, 105, 225), # Blue
     }
 
+    # Background color (Discord dark theme)
+    BG_COLOR = (47, 49, 54)
+    TEXT_COLOR = (255, 255, 255)
+
     def __init__(self):
-        if not VISUALIZATION_AVAILABLE:
-            log.warning("NetworkX or Matplotlib not available. Tree visualization will be disabled.")
+        if not PILLOW_AVAILABLE:
+            log.warning("Pillow not available. Tree visualization will be disabled.")
 
     @property
     def available(self) -> bool:
         """Check if visualization dependencies are available."""
-        return VISUALIZATION_AVAILABLE
+        return PILLOW_AVAILABLE
 
     async def generate_tree(
         self,
@@ -55,7 +56,7 @@ class FamilyTreeVisualizer:
         depth: int = 2
     ) -> Optional[BytesIO]:
         """
-        Generate a family tree network graph centered on user_id.
+        Generate a family tree image centered on user_id.
 
         Args:
             db: Database instance
@@ -64,281 +65,378 @@ class FamilyTreeVisualizer:
             depth: How many relationship levels to traverse
 
         Returns:
-            BytesIO containing PNG image, or None if visualization unavailable
+            BytesIO containing PNG image, or None if unavailable
         """
-        if not VISUALIZATION_AVAILABLE:
+        if not PILLOW_AVAILABLE:
             return None
 
-        G = nx.Graph()
-        node_colors: Dict[int, str] = {}
-        node_labels: Dict[int, str] = {}
-        edge_types: Dict[tuple, str] = {}
+        # Collect all family members and their relationships
+        nodes: Dict[int, dict] = {}
+        edges: List[Tuple[int, int, str]] = []
         visited: Set[int] = set()
 
-        # Build the graph
-        await self._build_graph(
-            G, db, user_id, bot,
-            node_colors, node_labels, edge_types,
-            depth, visited, 0, user_id
+        await self._collect_family(
+            db, user_id, bot, nodes, edges, visited, depth, 0, user_id
         )
 
-        if len(G.nodes()) == 0:
+        if not nodes:
             return None
 
-        # Create figure with dark background for better Discord appearance
-        fig, ax = plt.subplots(figsize=(14, 10), facecolor='#2C2F33')
-        ax.set_facecolor('#2C2F33')
+        # Calculate positions using a simple force-directed layout
+        positions = self._calculate_positions(nodes, edges)
 
-        # Use spring layout (force-directed) for network graph
-        if len(G.nodes()) == 1:
-            pos = {list(G.nodes())[0]: (0, 0)}
-        else:
-            pos = nx.spring_layout(G, k=2.5, iterations=50, seed=42)
+        # Determine image size based on positions
+        min_x = min(p[0] for p in positions.values()) - 100
+        max_x = max(p[0] for p in positions.values()) + 100
+        min_y = min(p[1] for p in positions.values()) - 60
+        max_y = max(p[1] for p in positions.values()) + 60
 
-        # Prepare node colors list
-        colors = [node_colors.get(node, self.COLORS['extended']) for node in G.nodes()]
+        width = max(600, int(max_x - min_x + 200))
+        height = max(400, int(max_y - min_y + 150))
+
+        # Offset positions to fit in image
+        offset_x = -min_x + 100
+        offset_y = -min_y + 80
+
+        # Create image
+        img = Image.new('RGB', (width, height), self.BG_COLOR)
+        draw = ImageDraw.Draw(img)
+
+        # Try to load a font, fall back to default
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
+            title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 18)
+        except (OSError, IOError):
+            try:
+                font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans.ttf", 14)
+                title_font = ImageFont.truetype("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf", 18)
+            except (OSError, IOError):
+                font = ImageFont.load_default()
+                title_font = font
+
+        # Draw title
+        central_name = nodes[user_id]['name']
+        title = f"Family Tree for {central_name}"
+        title_bbox = draw.textbbox((0, 0), title, font=title_font)
+        title_width = title_bbox[2] - title_bbox[0]
+        draw.text(((width - title_width) // 2, 15), title, fill=self.TEXT_COLOR, font=title_font)
+
+        # Draw edges first (so they're behind nodes)
+        for user1_id, user2_id, edge_type in edges:
+            if user1_id in positions and user2_id in positions:
+                x1, y1 = positions[user1_id]
+                x2, y2 = positions[user2_id]
+                x1, y1 = x1 + offset_x, y1 + offset_y
+                x2, y2 = x2 + offset_x, y2 + offset_y
+
+                color = self.EDGE_COLORS.get(edge_type, (128, 128, 128))
+
+                if edge_type == 'marriage':
+                    # Solid thick line for marriage
+                    draw.line([(x1, y1), (x2, y2)], fill=color, width=3)
+                else:
+                    # Dashed line for parent-child
+                    self._draw_dashed_line(draw, x1, y1, x2, y2, color, width=2)
 
         # Draw nodes
-        nx.draw_networkx_nodes(
-            G, pos,
-            node_color=colors,
-            node_size=3000,
-            ax=ax,
-            edgecolors='white',
-            linewidths=2
-        )
+        node_radius = 35
+        for uid, node_data in nodes.items():
+            if uid not in positions:
+                continue
 
-        # Draw labels with white text
-        labels = {node: node_labels.get(node, str(node)) for node in G.nodes()}
-        nx.draw_networkx_labels(
-            G, pos, labels,
-            font_size=9,
-            font_color='white',
-            font_weight='bold',
-            ax=ax
-        )
+            x, y = positions[uid]
+            x, y = x + offset_x, y + offset_y
 
-        # Separate edges by type
-        marriage_edges = [(u, v) for (u, v), t in edge_types.items() if t == 'marriage']
-        parent_edges = [(u, v) for (u, v), t in edge_types.items() if t == 'parent_child']
+            color = self.COLORS.get(node_data['type'], self.COLORS['extended'])
 
-        # Draw marriage edges (solid, thicker)
-        if marriage_edges:
-            nx.draw_networkx_edges(
-                G, pos,
-                edgelist=marriage_edges,
-                edge_color=self.EDGE_COLORS['marriage'],
-                width=3,
-                style='solid',
-                ax=ax
+            # Draw circle
+            draw.ellipse(
+                [(x - node_radius, y - node_radius),
+                 (x + node_radius, y + node_radius)],
+                fill=color,
+                outline=self.TEXT_COLOR,
+                width=2
             )
 
-        # Draw parent-child edges (dashed)
-        if parent_edges:
-            nx.draw_networkx_edges(
-                G, pos,
-                edgelist=parent_edges,
-                edge_color=self.EDGE_COLORS['parent_child'],
-                width=2,
-                style='dashed',
-                ax=ax
+            # Draw name (truncate if needed)
+            name = node_data['name']
+            if len(name) > 12:
+                name = name[:10] + ".."
+
+            text_bbox = draw.textbbox((0, 0), name, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+
+            draw.text(
+                (x - text_width // 2, y - text_height // 2),
+                name,
+                fill=self.TEXT_COLOR,
+                font=font
             )
 
-        # Add legend
-        legend_elements = [
-            mpatches.Patch(color=self.COLORS['self'], label='You'),
-            mpatches.Patch(color=self.COLORS['spouse'], label='Spouse'),
-            mpatches.Patch(color=self.COLORS['parent'], label='Parent'),
-            mpatches.Patch(color=self.COLORS['child'], label='Child'),
-            mpatches.Patch(color=self.COLORS['sibling'], label='Sibling'),
-            mpatches.Patch(color=self.COLORS['extended'], label='Extended'),
+        # Draw legend
+        legend_y = height - 35
+        legend_items = [
+            ('You', self.COLORS['self']),
+            ('Spouse', self.COLORS['spouse']),
+            ('Parent', self.COLORS['parent']),
+            ('Child', self.COLORS['child']),
+            ('Sibling', self.COLORS['sibling']),
         ]
 
-        # Add edge legend
-        from matplotlib.lines import Line2D
-        legend_elements.extend([
-            Line2D([0], [0], color=self.EDGE_COLORS['marriage'], linewidth=3,
-                   label='Marriage', linestyle='solid'),
-            Line2D([0], [0], color=self.EDGE_COLORS['parent_child'], linewidth=2,
-                   label='Parent/Child', linestyle='dashed'),
-        ])
-
-        ax.legend(
-            handles=legend_elements,
-            loc='upper left',
-            facecolor='#23272A',
-            edgecolor='white',
-            labelcolor='white',
-            fontsize=9
-        )
-
-        # Get the central user's name for the title
-        central_name = node_labels.get(user_id, "Unknown")
-        ax.set_title(
-            f"Family Tree for {central_name}",
-            fontsize=16,
-            fontweight='bold',
-            color='white',
-            pad=20
-        )
-
-        ax.axis('off')
-
-        # Adjust layout
-        plt.tight_layout()
+        legend_x = 20
+        for label, color in legend_items:
+            draw.ellipse([(legend_x, legend_y), (legend_x + 15, legend_y + 15)], fill=color)
+            draw.text((legend_x + 20, legend_y), label, fill=self.TEXT_COLOR, font=font)
+            legend_x += 90
 
         # Save to BytesIO
         buffer = BytesIO()
-        plt.savefig(
-            buffer,
-            format='png',
-            dpi=150,
-            bbox_inches='tight',
-            facecolor='#2C2F33',
-            edgecolor='none'
-        )
+        img.save(buffer, format='PNG')
         buffer.seek(0)
-        plt.close(fig)
 
         return buffer
 
-    async def _build_graph(
+    def _draw_dashed_line(self, draw, x1, y1, x2, y2, color, width=1, dash_length=8):
+        """Draw a dashed line."""
+        dx = x2 - x1
+        dy = y2 - y1
+        distance = math.sqrt(dx * dx + dy * dy)
+
+        if distance == 0:
+            return
+
+        dashes = int(distance / dash_length)
+        if dashes == 0:
+            dashes = 1
+
+        for i in range(0, dashes, 2):
+            start = i / dashes
+            end = min((i + 1) / dashes, 1)
+
+            sx = x1 + dx * start
+            sy = y1 + dy * start
+            ex = x1 + dx * end
+            ey = y1 + dy * end
+
+            draw.line([(sx, sy), (ex, ey)], fill=color, width=width)
+
+    def _calculate_positions(
+        self, nodes: Dict[int, dict], edges: List[Tuple[int, int, str]]
+    ) -> Dict[int, Tuple[float, float]]:
+        """Calculate node positions using a simple force-directed layout."""
+        if not nodes:
+            return {}
+
+        # Initialize positions in a circle
+        positions = {}
+        n = len(nodes)
+        node_ids = list(nodes.keys())
+
+        for i, uid in enumerate(node_ids):
+            angle = 2 * math.pi * i / n
+            positions[uid] = (math.cos(angle) * 150, math.sin(angle) * 150)
+
+        # Simple force-directed iterations
+        for _ in range(50):
+            forces = {uid: [0.0, 0.0] for uid in node_ids}
+
+            # Repulsion between all nodes
+            for i, uid1 in enumerate(node_ids):
+                for uid2 in node_ids[i + 1:]:
+                    x1, y1 = positions[uid1]
+                    x2, y2 = positions[uid2]
+
+                    dx = x2 - x1
+                    dy = y2 - y1
+                    dist = math.sqrt(dx * dx + dy * dy) + 0.1
+
+                    # Repulsion force
+                    force = 5000 / (dist * dist)
+                    fx = -force * dx / dist
+                    fy = -force * dy / dist
+
+                    forces[uid1][0] += fx
+                    forces[uid1][1] += fy
+                    forces[uid2][0] -= fx
+                    forces[uid2][1] -= fy
+
+            # Attraction along edges
+            for uid1, uid2, _ in edges:
+                if uid1 not in positions or uid2 not in positions:
+                    continue
+
+                x1, y1 = positions[uid1]
+                x2, y2 = positions[uid2]
+
+                dx = x2 - x1
+                dy = y2 - y1
+                dist = math.sqrt(dx * dx + dy * dy) + 0.1
+
+                # Attraction force
+                force = dist * 0.05
+                fx = force * dx / dist
+                fy = force * dy / dist
+
+                forces[uid1][0] += fx
+                forces[uid1][1] += fy
+                forces[uid2][0] -= fx
+                forces[uid2][1] -= fy
+
+            # Apply forces with damping
+            for uid in node_ids:
+                x, y = positions[uid]
+                fx, fy = forces[uid]
+
+                # Limit force magnitude
+                mag = math.sqrt(fx * fx + fy * fy)
+                if mag > 10:
+                    fx = fx / mag * 10
+                    fy = fy / mag * 10
+
+                positions[uid] = (x + fx, y + fy)
+
+        return positions
+
+    async def _collect_family(
         self,
-        G: "nx.Graph",
         db: "FamilyDatabase",
         user_id: int,
         bot: "Red",
-        node_colors: Dict[int, str],
-        node_labels: Dict[int, str],
-        edge_types: Dict[tuple, str],
-        max_depth: int,
+        nodes: Dict[int, dict],
+        edges: List[Tuple[int, int, str]],
         visited: Set[int],
+        max_depth: int,
         current_depth: int,
         central_user_id: int
     ):
-        """Recursively build the graph from the database."""
+        """Recursively collect family members and relationships."""
         if user_id in visited or current_depth > max_depth:
             return
 
         visited.add(user_id)
 
-        # Fetch user name
+        # Get user name
         user = bot.get_user(user_id)
         display_name = user.display_name if user else f"User {user_id}"
-        # Truncate long names
-        if len(display_name) > 15:
-            display_name = display_name[:12] + "..."
 
-        G.add_node(user_id)
-        node_labels[user_id] = display_name
-
-        # Color based on relationship to central user
+        # Determine node type
         if user_id == central_user_id:
-            node_colors[user_id] = self.COLORS['self']
-        elif current_depth == 0:
-            node_colors[user_id] = self.COLORS['self']
+            node_type = 'self'
+        else:
+            node_type = 'extended'
 
-        # Fetch and add spouses
+        nodes[user_id] = {'name': display_name, 'type': node_type}
+
+        # Get spouses
         spouses = await db.get_spouses(user_id)
         for spouse_id in spouses:
-            if spouse_id not in visited:
+            if spouse_id not in nodes:
                 spouse = bot.get_user(spouse_id)
                 spouse_name = spouse.display_name if spouse else f"User {spouse_id}"
-                if len(spouse_name) > 15:
-                    spouse_name = spouse_name[:12] + "..."
+                nodes[spouse_id] = {'name': spouse_name, 'type': 'spouse'}
 
-                G.add_node(spouse_id)
-                node_labels[spouse_id] = spouse_name
+            # Add edge if not already added
+            edge = tuple(sorted([user_id, spouse_id]))
+            if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
+                edges.append((edge[0], edge[1], 'marriage'))
 
-                if spouse_id not in node_colors:
-                    node_colors[spouse_id] = self.COLORS['spouse']
-
-            # Add marriage edge
-            edge_key = tuple(sorted([user_id, spouse_id]))
-            if edge_key not in edge_types:
-                G.add_edge(user_id, spouse_id)
-                edge_types[edge_key] = 'marriage'
-
-            # Recurse to spouse's family
             if current_depth < max_depth:
-                await self._build_graph(
-                    G, db, spouse_id, bot,
-                    node_colors, node_labels, edge_types,
-                    max_depth, visited, current_depth + 1, central_user_id
+                await self._collect_family(
+                    db, spouse_id, bot, nodes, edges, visited,
+                    max_depth, current_depth + 1, central_user_id
                 )
 
-        # Fetch and add parents
+        # Get parents
         parents = await db.get_parents(user_id)
         for parent_id in parents:
-            if parent_id not in visited:
+            if parent_id not in nodes:
                 parent = bot.get_user(parent_id)
                 parent_name = parent.display_name if parent else f"User {parent_id}"
-                if len(parent_name) > 15:
-                    parent_name = parent_name[:12] + "..."
+                nodes[parent_id] = {'name': parent_name, 'type': 'parent'}
 
-                G.add_node(parent_id)
-                node_labels[parent_id] = parent_name
+            edge = tuple(sorted([parent_id, user_id]))
+            if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
+                edges.append((edge[0], edge[1], 'parent_child'))
 
-                if parent_id not in node_colors:
-                    node_colors[parent_id] = self.COLORS['parent']
-
-            # Add parent-child edge
-            edge_key = tuple(sorted([parent_id, user_id]))
-            if edge_key not in edge_types:
-                G.add_edge(parent_id, user_id)
-                edge_types[edge_key] = 'parent_child'
-
-            # Recurse to parent's family
             if current_depth < max_depth:
-                await self._build_graph(
-                    G, db, parent_id, bot,
-                    node_colors, node_labels, edge_types,
-                    max_depth, visited, current_depth + 1, central_user_id
+                await self._collect_family(
+                    db, parent_id, bot, nodes, edges, visited,
+                    max_depth, current_depth + 1, central_user_id
                 )
 
-        # Fetch and add children
+        # Get children
         children = await db.get_children(user_id)
         for child_id in children:
-            if child_id not in visited:
+            if child_id not in nodes:
                 child = bot.get_user(child_id)
                 child_name = child.display_name if child else f"User {child_id}"
-                if len(child_name) > 15:
-                    child_name = child_name[:12] + "..."
+                nodes[child_id] = {'name': child_name, 'type': 'child'}
 
-                G.add_node(child_id)
-                node_labels[child_id] = child_name
+            edge = tuple(sorted([user_id, child_id]))
+            if not any(e[0] == edge[0] and e[1] == edge[1] for e in edges):
+                edges.append((edge[0], edge[1], 'parent_child'))
 
-                if child_id not in node_colors:
-                    node_colors[child_id] = self.COLORS['child']
-
-            # Add parent-child edge
-            edge_key = tuple(sorted([user_id, child_id]))
-            if edge_key not in edge_types:
-                G.add_edge(user_id, child_id)
-                edge_types[edge_key] = 'parent_child'
-
-            # Recurse to child's family
             if current_depth < max_depth:
-                await self._build_graph(
-                    G, db, child_id, bot,
-                    node_colors, node_labels, edge_types,
-                    max_depth, visited, current_depth + 1, central_user_id
+                await self._collect_family(
+                    db, child_id, bot, nodes, edges, visited,
+                    max_depth, current_depth + 1, central_user_id
                 )
 
-        # Fetch and add siblings (don't recurse deep into siblings)
+        # Get siblings
         siblings = await db.get_siblings(user_id)
         for sibling_id in siblings:
-            if sibling_id not in visited and sibling_id not in G.nodes():
+            if sibling_id not in nodes:
                 sibling = bot.get_user(sibling_id)
                 sibling_name = sibling.display_name if sibling else f"User {sibling_id}"
-                if len(sibling_name) > 15:
-                    sibling_name = sibling_name[:12] + "..."
+                nodes[sibling_id] = {'name': sibling_name, 'type': 'sibling'}
 
-                G.add_node(sibling_id)
-                node_labels[sibling_id] = sibling_name
 
-                if sibling_id not in node_colors:
-                    node_colors[sibling_id] = self.COLORS['sibling']
+async def generate_text_tree(db: "FamilyDatabase", user_id: int, bot: "Red") -> str:
+    """Generate a simple text-based family tree as fallback."""
+    lines = []
 
-                # Connect siblings through their shared parent (already added)
-                # No direct edge needed as they're connected via parent
+    user = bot.get_user(user_id)
+    user_name = user.display_name if user else f"User {user_id}"
+    lines.append(f"**Family of {user_name}**\n")
+
+    # Parents
+    parents = await db.get_parents(user_id)
+    if parents:
+        lines.append("**Parents:**")
+        for p in parents:
+            parent = bot.get_user(p)
+            name = parent.display_name if parent else f"User {p}"
+            lines.append(f"  \u2514 {name}")
+
+    # Spouses
+    spouses = await db.get_spouses(user_id)
+    if spouses:
+        lines.append("**Spouses:**")
+        for s in spouses:
+            spouse = bot.get_user(s)
+            name = spouse.display_name if spouse else f"User {s}"
+            lines.append(f"  \u2764 {name}")
+
+    # Siblings
+    siblings = await db.get_siblings(user_id)
+    if siblings:
+        lines.append("**Siblings:**")
+        for s in siblings:
+            sibling = bot.get_user(s)
+            name = sibling.display_name if sibling else f"User {s}"
+            lines.append(f"  \u2194 {name}")
+
+    # Children
+    children = await db.get_children(user_id)
+    if children:
+        lines.append("**Children:**")
+        for c in children:
+            child = bot.get_user(c)
+            name = child.display_name if child else f"User {c}"
+            lines.append(f"  \u2514 {name}")
+
+    if len(lines) == 1:
+        lines.append("No family connections yet.")
+
+    return "\n".join(lines)
