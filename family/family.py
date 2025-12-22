@@ -111,12 +111,25 @@ class Family(commands.Cog):
     # === Helper Methods ===
 
     async def get_effective_setting(self, guild_id: int, setting: str):
-        """Get effective setting considering guild overrides."""
+        """
+        Get effective setting considering guild overrides.
+
+        Args:
+            guild_id: The guild ID
+            setting: The setting name (e.g., 'polyamory', 'incest', 'proposal_timeout')
+        """
         override_key = f"override_{setting}"
+        # Map setting names to global config keys
+        global_key_map = {
+            "polyamory": "polyamory_enabled",
+            "incest": "incest_enabled",
+            "proposal_timeout": "proposal_timeout",
+        }
+        global_key = global_key_map.get(setting, setting)
         guild_val = await self.config.guild_from_id(guild_id).get_attr(override_key)()
         if guild_val is not None:
             return guild_val
-        return await self.config.get_attr(setting)()
+        return await self.config.get_attr(global_key)()
 
     async def _validate_marriage(
         self, ctx: commands.Context, user: discord.Member
@@ -132,7 +145,7 @@ class Family(commands.Cog):
             return f"You're already married to {user.display_name}!"
 
         # Check polyamory
-        polyamory = await self.get_effective_setting(ctx.guild.id, "polyamory_enabled")
+        polyamory = await self.get_effective_setting(ctx.guild.id, "polyamory")
         if not polyamory:
             author_spouses = await self.db.get_marriage_count(ctx.author.id)
             if author_spouses > 0:
@@ -148,7 +161,7 @@ class Family(commands.Cog):
                 return f"You've reached the maximum number of spouses ({max_spouses})!"
 
         # Check incest
-        incest = await self.get_effective_setting(ctx.guild.id, "incest_enabled")
+        incest = await self.get_effective_setting(ctx.guild.id, "incest")
         if not incest:
             if await self.db.are_related(ctx.author.id, user.id):
                 return f"You can't marry {user.display_name} - you're related! (Incest is disabled on this server)"
@@ -185,7 +198,7 @@ class Family(commands.Cog):
             return f"You've reached the maximum number of children ({max_children})!"
 
         # Check incest - can't adopt your parent or spouse
-        incest = await self.get_effective_setting(ctx.guild.id, "incest_enabled")
+        incest = await self.get_effective_setting(ctx.guild.id, "incest")
         if not incest:
             # Can't adopt your parent
             if child.id in await self.db.get_parents(ctx.author.id):
@@ -579,7 +592,7 @@ class Family(commands.Cog):
             return
 
         # Check incest
-        incest = await self.get_effective_setting(ctx.guild.id, "incest_enabled")
+        incest = await self.get_effective_setting(ctx.guild.id, "incest")
         if not incest:
             if await self.db.are_related(coparent.id, child.id):
                 await ctx.send(
@@ -790,7 +803,7 @@ class Family(commands.Cog):
     async def familyset_polyamory(self, ctx: commands.Context, enabled: bool = None):
         """Enable or disable polyamory (multiple marriages) for this server."""
         if enabled is None:
-            current = await self.get_effective_setting(ctx.guild.id, "polyamory_enabled")
+            current = await self.get_effective_setting(ctx.guild.id, "polyamory")
             status = "enabled" if current else "disabled"
             await ctx.send(f"Polyamory is currently **{status}** for this server.")
         else:
@@ -802,7 +815,7 @@ class Family(commands.Cog):
     async def familyset_incest(self, ctx: commands.Context, enabled: bool = None):
         """Enable or disable incest (marriage between family members) for this server."""
         if enabled is None:
-            current = await self.get_effective_setting(ctx.guild.id, "incest_enabled")
+            current = await self.get_effective_setting(ctx.guild.id, "incest")
             status = "enabled" if current else "disabled"
             await ctx.send(f"Incest is currently **{status}** for this server.")
         else:
@@ -826,8 +839,8 @@ class Family(commands.Cog):
     @familyset.command(name="settings")
     async def familyset_settings(self, ctx: commands.Context):
         """Display current family settings for this server."""
-        polyamory = await self.get_effective_setting(ctx.guild.id, "polyamory_enabled")
-        incest = await self.get_effective_setting(ctx.guild.id, "incest_enabled")
+        polyamory = await self.get_effective_setting(ctx.guild.id, "polyamory")
+        incest = await self.get_effective_setting(ctx.guild.id, "incest")
         timeout = await self.get_effective_setting(ctx.guild.id, "proposal_timeout")
         max_spouses = await self.config.max_spouses()
         max_children = await self.config.max_children()
