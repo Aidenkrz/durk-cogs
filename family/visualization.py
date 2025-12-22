@@ -187,7 +187,7 @@ class FamilyTreeVisualizer:
         )
 
         # Draw marriage edges
-        self._draw_marriage_edges(draw, marriage_edges, node_positions, node_height)
+        self._draw_marriage_edges(draw, marriage_edges, node_positions, node_width, node_height, node_positions)
 
         # Draw nodes with modern styling
         for uid, node_data in family_data['nodes'].items():
@@ -225,44 +225,36 @@ class FamilyTreeVisualizer:
         half_w, half_h = w // 2, h // 2
         radius = min(h // 3, half_h - 2)  # Ensure radius doesn't exceed half height
 
-        # Shadow
-        shadow_offset = 4
+        # Shadow (offset down-right)
+        shadow_offset = 6
         self._draw_rounded_rect_filled(
             draw,
             x - half_w + shadow_offset, y - half_h + shadow_offset,
             x + half_w + shadow_offset, y + half_h + shadow_offset,
-            radius, (20, 20, 20)
+            radius, (15, 15, 18)
         )
 
-        # Main node body
+        # Main node body with darker color
         self._draw_rounded_rect_filled(
             draw,
             x - half_w, y - half_h,
             x + half_w, y + half_h,
-            radius, main_color
+            radius, dark_color
         )
 
-        # Bottom darker section for depth (only if there's enough space)
-        bottom_section_top = y + 2
-        bottom_section_bottom = y + half_h
-        if bottom_section_bottom > bottom_section_top + radius:
-            # Draw darker bottom portion
-            draw.rectangle(
-                [x - half_w + radius, bottom_section_top,
-                 x + half_w - radius, bottom_section_bottom],
-                fill=dark_color
-            )
-            # Bottom corners
-            if bottom_section_bottom - radius * 2 >= bottom_section_top:
-                draw.ellipse([x - half_w, bottom_section_bottom - radius * 2,
-                             x - half_w + radius * 2, bottom_section_bottom], fill=dark_color)
-                draw.ellipse([x + half_w - radius * 2, bottom_section_bottom - radius * 2,
-                             x + half_w, bottom_section_bottom], fill=dark_color)
+        # Lighter inner area (slightly inset) for gradient effect
+        inset = 3
+        self._draw_rounded_rect_filled(
+            draw,
+            x - half_w + inset, y - half_h + inset,
+            x + half_w - inset, y + half_h - inset // 2,
+            max(1, radius - inset), main_color
+        )
 
-        # Subtle highlight on top
-        highlight_color = tuple(min(255, c + 30) for c in main_color)
+        # Subtle highlight line on top
+        highlight_color = tuple(min(255, c + 40) for c in main_color)
         draw.line(
-            [(x - half_w + radius, y - half_h + 2), (x + half_w - radius, y - half_h + 2)],
+            [(x - half_w + radius + 2, y - half_h + 3), (x + half_w - radius - 2, y - half_h + 3)],
             fill=highlight_color, width=2
         )
 
@@ -357,30 +349,63 @@ class FamilyTreeVisualizer:
         draw.arc([x1, y2 - radius * 2, x1 + radius * 2, y2], 90, 180, fill=outline, width=width)
         draw.arc([x2 - radius * 2, y2 - radius * 2, x2, y2], 0, 90, fill=outline, width=width)
 
-    def _draw_marriage_edges(self, draw, edges, positions, node_height):
-        """Draw marriage connections with heart symbol."""
+    def _draw_marriage_edges(self, draw, edges, positions, node_width, node_height, all_positions):
+        """Draw marriage connections that route around other nodes."""
         color = self.EDGE_COLORS['marriage']
+        half_node_w = node_width // 2
+        half_node_h = node_height // 2
+
         for uid1, uid2, _ in edges:
             x1, y1 = positions[uid1]
             x2, y2 = positions[uid2]
 
-            # Draw curved connection for marriages at same level
-            if abs(y1 - y2) < 5:  # Same level
-                # Simple line with small hearts/dots
-                mid_x = (x1 + x2) / 2
+            # Ensure x1 < x2 for consistent routing
+            if x1 > x2:
+                x1, y1, x2, y2 = x2, y2, x1, y1
 
-                # Draw line
-                draw.line([(x1, y1), (x2, y2)], fill=color, width=3)
+            # Same level - direct horizontal line between adjacent nodes
+            if abs(y1 - y2) < 10:
+                # Connect from right edge of left node to left edge of right node
+                start_x = x1 + half_node_w
+                end_x = x2 - half_node_w
+                mid_x = (start_x + end_x) / 2
 
-                # Draw small heart/circle in middle
-                heart_size = 8
+                # Draw the connecting line
+                draw.line([(start_x, y1), (end_x, y2)], fill=color, width=3)
+
+                # Draw small circle in middle
+                dot_size = 6
                 draw.ellipse([
-                    mid_x - heart_size, y1 - heart_size,
-                    mid_x + heart_size, y1 + heart_size
+                    mid_x - dot_size, y1 - dot_size,
+                    mid_x + dot_size, y1 + dot_size
                 ], fill=color, outline=(255, 255, 255), width=1)
             else:
-                # Curved line for different levels
-                draw.line([(x1, y1), (x2, y2)], fill=color, width=3)
+                # Different levels - route around with elbow connector
+                # Go from right of one node, up/down, then to left of other
+                start_x = x1 + half_node_w
+                end_x = x2 - half_node_w
+
+                # Determine if we go up or down based on relative positions
+                if y1 < y2:
+                    # uid1 is above uid2
+                    route_y = y1 + half_node_h + 15
+                else:
+                    route_y = y1 - half_node_h - 15
+
+                mid_x = (start_x + end_x) / 2
+
+                # Draw path: horizontal from start, vertical, horizontal to end
+                draw.line([(start_x, y1), (mid_x, y1)], fill=color, width=3)
+                draw.line([(mid_x, y1), (mid_x, y2)], fill=color, width=3)
+                draw.line([(mid_x, y2), (end_x, y2)], fill=color, width=3)
+
+                # Draw dot at midpoint
+                dot_size = 5
+                mid_y = (y1 + y2) / 2
+                draw.ellipse([
+                    mid_x - dot_size, mid_y - dot_size,
+                    mid_x + dot_size, mid_y + dot_size
+                ], fill=color)
 
     def _draw_parent_child_edges(self, draw, edges, positions, node_width, node_height, v_spacing, family_data):
         """Draw parent-child connections with smart routing to avoid overlaps."""
