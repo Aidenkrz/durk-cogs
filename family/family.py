@@ -264,6 +264,9 @@ class Family(commands.Cog):
         await self.db.create_parent_child(parent_id, child_id, "adoption")
         await self.db.delete_proposal(proposal_id)
 
+        # Child inherits family title/crest from parent
+        await self.db.inherit_family_profile(child_id, parent_id)
+
         parent = self.bot.get_user(parent_id)
         child = self.bot.get_user(child_id)
 
@@ -301,6 +304,10 @@ class Family(commands.Cog):
         # Create the parent-child relationship for the co-parent
         await self.db.create_parent_child(coparent_id, child_id, "sire")
         await self.db.delete_proposal(proposal_id)
+
+        # Child inherits family title/crest from parents (proposer first, then coparent)
+        await self.db.inherit_family_profile(child_id, proposer_id)
+        await self.db.inherit_family_profile(child_id, coparent_id)
 
         proposer = self.bot.get_user(proposer_id)
         coparent = self.bot.get_user(coparent_id)

@@ -4,6 +4,8 @@ from io import BytesIO
 from typing import TYPE_CHECKING, Dict, List, Set, Optional, Tuple
 from collections import defaultdict
 
+import aiohttp
+
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
     PILLOW_AVAILABLE = True
@@ -50,6 +52,68 @@ class FamilyTreeVisualizer:
     def __init__(self):
         if not PILLOW_AVAILABLE:
             log.warning("Pillow not available. Tree visualization will be disabled.")
+        self._crest_cache: Dict[str, Optional[Image.Image]] = {}
+
+    async def _fetch_crest_image(self, url: str, target_size: int = 32) -> Optional[Image.Image]:
+        """Fetch and resize a crest image from URL."""
+        if not url:
+            return None
+
+        # Check cache first
+        cache_key = f"{url}_{target_size}"
+        if cache_key in self._crest_cache:
+            return self._crest_cache[cache_key]
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status != 200:
+                        self._crest_cache[cache_key] = None
+                        return None
+                    data = await resp.read()
+
+            img = Image.open(BytesIO(data))
+            # Convert to RGBA if necessary
+            if img.mode != 'RGBA':
+                img = img.convert('RGBA')
+
+            # Resize to target size maintaining aspect ratio
+            img.thumbnail((target_size, target_size), Image.Resampling.LANCZOS)
+
+            # Create a circular mask
+            size = (target_size, target_size)
+            mask = Image.new('L', size, 0)
+            mask_draw = ImageDraw.Draw(mask)
+            mask_draw.ellipse([0, 0, target_size - 1, target_size - 1], fill=255)
+
+            # Center the image in the target size
+            centered = Image.new('RGBA', size, (0, 0, 0, 0))
+            paste_x = (target_size - img.width) // 2
+            paste_y = (target_size - img.height) // 2
+            centered.paste(img, (paste_x, paste_y))
+
+            # Apply circular mask
+            output = Image.new('RGBA', size, (0, 0, 0, 0))
+            output.paste(centered, mask=mask)
+
+            self._crest_cache[cache_key] = output
+            return output
+
+        except Exception as e:
+            log.debug(f"Failed to fetch crest image from {url}: {e}")
+            self._crest_cache[cache_key] = None
+            return None
+
+    async def _prefetch_crests(self, nodes: Dict, crest_size: int = 32) -> Dict[int, Optional[Image.Image]]:
+        """Pre-fetch all crest images for nodes that have them."""
+        crests = {}
+        for uid, node_data in nodes.items():
+            crest_url = node_data.get('crest_url')
+            if crest_url:
+                crests[uid] = await self._fetch_crest_image(crest_url, crest_size)
+            else:
+                crests[uid] = None
+        return crests
 
     @property
     def available(self) -> bool:
@@ -113,8 +177,8 @@ class FamilyTreeVisualizer:
         offset_x = -min_x * h_spacing + margin + node_width // 2
         offset_y = -min_y * v_spacing + margin + node_height // 2 + 50 * self.SCALE
 
-        # Create image with gradient background
-        img = Image.new('RGB', (width, height), self.BG_COLOR)
+        # Create image with gradient background (RGBA for crest transparency)
+        img = Image.new('RGBA', (width, height), (*self.BG_COLOR, 255))
         draw = ImageDraw.Draw(img)
 
         # Draw subtle gradient background
@@ -189,6 +253,10 @@ class FamilyTreeVisualizer:
         # Draw marriage edges
         self._draw_marriage_edges(draw, marriage_edges, node_positions, node_width, node_height, node_positions)
 
+        # Prefetch crest images (scaled for high-res)
+        crest_size = 30 * self.SCALE
+        crest_images = await self._prefetch_crests(family_data['nodes'], crest_size)
+
         # Draw nodes with modern styling
         for uid, node_data in family_data['nodes'].items():
             if uid not in node_positions:
@@ -198,9 +266,10 @@ class FamilyTreeVisualizer:
             colors = self.COLORS.get(node_data['type'], self.COLORS['extended'])
 
             self._draw_modern_node(
-                draw, x, y, node_width, node_height,
+                img, draw, x, y, node_width, node_height,
                 colors, node_data['name'], font_bold,
-                is_self=(node_data['type'] == 'self')
+                is_self=(node_data['type'] == 'self'),
+                crest_img=crest_images.get(uid)
             )
 
         # Draw modern legend at bottom
@@ -287,8 +356,8 @@ class FamilyTreeVisualizer:
         offset_x = -min_x * h_spacing + margin + node_width // 2
         offset_y = -min_y * v_spacing + margin + node_height // 2 + 50 * self.SCALE
 
-        # Create image with gradient background
-        img = Image.new('RGB', (width, height), self.BG_COLOR)
+        # Create image with gradient background (RGBA for crest transparency)
+        img = Image.new('RGBA', (width, height), (*self.BG_COLOR, 255))
         draw = ImageDraw.Draw(img)
 
         # Draw subtle gradient background
@@ -339,6 +408,10 @@ class FamilyTreeVisualizer:
         # Draw marriage edges
         self._draw_marriage_edges(draw, marriage_edges, node_positions, node_width, node_height, node_positions)
 
+        # Prefetch crest images (scaled for high-res)
+        crest_size = 30 * self.SCALE
+        crest_images = await self._prefetch_crests(family_data['nodes'], crest_size)
+
         # Draw nodes with modern styling
         for uid, node_data in family_data['nodes'].items():
             if uid not in node_positions:
@@ -348,9 +421,10 @@ class FamilyTreeVisualizer:
             colors = self.COLORS.get(node_data['type'], self.COLORS['extended'])
 
             self._draw_modern_node(
-                draw, x, y, node_width, node_height,
+                img, draw, x, y, node_width, node_height,
                 colors, node_data['name'], font_bold,
-                is_self=False
+                is_self=False,
+                crest_img=crest_images.get(uid)
             )
 
         # Draw modern legend at bottom
@@ -377,11 +451,27 @@ class FamilyTreeVisualizer:
         edges = []
         levels = {}
 
-        async def get_name(user_id: int) -> str:
-            user = bot.get_user(user_id)
-            if user:
-                return user.display_name[:15]
-            return f"User {user_id}"[:15]
+        async def get_node_info(uid: int) -> dict:
+            """Get name and crest URL for a user."""
+            user = bot.get_user(uid)
+            name = user.display_name if user else f"User {uid}"
+            crest_url = None
+
+            # Try to get family profile
+            profile = await db.get_family_profile(uid)
+            if profile:
+                if profile.get("family_title"):
+                    title = profile["family_title"]
+                    if len(name) + len(title) > 20:
+                        name = name[:10] + "..."
+                    name = f"{name}\n{title}"
+                else:
+                    name = name[:15] if len(name) > 15 else name
+                crest_url = profile.get("family_crest_url")
+            else:
+                name = name[:15] if len(name) > 15 else name
+
+            return {"name": name, "crest_url": crest_url}
 
         def add_edge(uid1: int, uid2: int, edge_type: str):
             edge = (uid1, uid2, edge_type)
@@ -392,8 +482,10 @@ class FamilyTreeVisualizer:
         # Process all users
         for user_id in all_users:
             if user_id not in nodes:
+                node_info = await get_node_info(user_id)
                 nodes[user_id] = {
-                    'name': await get_name(user_id),
+                    'name': node_info['name'],
+                    'crest_url': node_info['crest_url'],
                     'type': 'extended'
                 }
                 levels[user_id] = 0
@@ -402,8 +494,10 @@ class FamilyTreeVisualizer:
             spouses = await db.get_spouses(user_id)
             for spouse_id in spouses:
                 if spouse_id not in nodes:
+                    node_info = await get_node_info(spouse_id)
                     nodes[spouse_id] = {
-                        'name': await get_name(spouse_id),
+                        'name': node_info['name'],
+                        'crest_url': node_info['crest_url'],
                         'type': 'extended'
                     }
                     levels[spouse_id] = 0
@@ -413,8 +507,10 @@ class FamilyTreeVisualizer:
             children = await db.get_children(user_id)
             for child_id in children:
                 if child_id not in nodes:
+                    node_info = await get_node_info(child_id)
                     nodes[child_id] = {
-                        'name': await get_name(child_id),
+                        'name': node_info['name'],
+                        'crest_url': node_info['crest_url'],
                         'type': 'extended'
                     }
                 # Child should be at a lower level than parent
@@ -429,8 +525,10 @@ class FamilyTreeVisualizer:
             parents = await db.get_parents(user_id)
             for parent_id in parents:
                 if parent_id not in nodes:
+                    node_info = await get_node_info(parent_id)
                     nodes[parent_id] = {
-                        'name': await get_name(parent_id),
+                        'name': node_info['name'],
+                        'crest_url': node_info['crest_url'],
                         'type': 'extended'
                     }
                 # Parent should be at a higher level than child
@@ -518,8 +616,8 @@ class FamilyTreeVisualizer:
 
         return positions
 
-    def _draw_modern_node(self, draw, x, y, w, h, colors, name, font, is_self=False):
-        """Draw a modern styled node with gradient and shadow."""
+    def _draw_modern_node(self, img, draw, x, y, w, h, colors, name, font, is_self=False, crest_img=None):
+        """Draw a modern styled node with gradient and shadow, and optional crest."""
         main_color, dark_color = colors
         half_w, half_h = w // 2, h // 2
         radius = min(h // 3, half_h - 2)  # Ensure radius doesn't exceed half height
@@ -585,6 +683,12 @@ class FamilyTreeVisualizer:
         text_color = (30, 30, 30) if brightness > 140 else (255, 255, 255)
         shadow_color = (0, 0, 0) if brightness > 140 else (50, 50, 50)
 
+        # Calculate crest offset if we have a crest
+        crest_offset = 0
+        if crest_img:
+            crest_size = crest_img.width
+            crest_offset = crest_size // 2 + 4  # Half crest width + small gap
+
         # Handle multi-line names (name + title)
         lines = name.split('\n')
         if len(lines) == 1:
@@ -597,15 +701,18 @@ class FamilyTreeVisualizer:
             text_width = text_bbox[2] - text_bbox[0]
             text_height = text_bbox[3] - text_bbox[1]
 
+            # Adjust x position for crest
+            text_center_x = x + crest_offset // 2 if crest_img else x
+
             # Text shadow for readability
             draw.text(
-                (x - text_width // 2 + 1, y - text_height // 2 + 1),
+                (text_center_x - text_width // 2 + 1, y - text_height // 2 + 1),
                 display_name,
                 fill=shadow_color,
                 font=font
             )
             draw.text(
-                (x - text_width // 2, y - text_height // 2),
+                (text_center_x - text_width // 2, y - text_height // 2),
                 display_name,
                 fill=text_color,
                 font=font
@@ -623,19 +730,28 @@ class FamilyTreeVisualizer:
             title_width = title_bbox[2] - title_bbox[0]
             line_height = name_bbox[3] - name_bbox[1]
 
+            # Adjust x position for crest
+            text_center_x = x + crest_offset // 2 if crest_img else x
+
             # Position for two lines centered vertically
             name_y = y - line_height
             title_y = y + 2
 
             # Draw name line
-            draw.text((x - name_width // 2 + 1, name_y + 1), name_line, fill=shadow_color, font=font)
-            draw.text((x - name_width // 2, name_y), name_line, fill=text_color, font=font)
+            draw.text((text_center_x - name_width // 2 + 1, name_y + 1), name_line, fill=shadow_color, font=font)
+            draw.text((text_center_x - name_width // 2, name_y), name_line, fill=text_color, font=font)
 
             # Draw title line (slightly dimmer)
             title_color = tuple(max(0, c - 30) for c in text_color)
-            draw.text((x - title_width // 2 + 1, title_y + 1), title_line, fill=shadow_color, font=font)
-            draw.text((x - title_width // 2, title_y), title_line, fill=title_color, font=font
-        )
+            draw.text((text_center_x - title_width // 2 + 1, title_y + 1), title_line, fill=shadow_color, font=font)
+            draw.text((text_center_x - title_width // 2, title_y), title_line, fill=title_color, font=font)
+
+        # Draw crest image if available (on the left side of text)
+        if crest_img:
+            crest_x = int(x - half_w + 6)
+            crest_y = int(y - crest_img.height // 2)
+            # Paste with alpha mask for transparency
+            img.paste(crest_img, (crest_x, crest_y), crest_img)
 
     def _draw_rounded_rect_filled(self, draw, x1, y1, x2, y2, radius, fill):
         """Draw a filled rounded rectangle."""
@@ -994,18 +1110,28 @@ class FamilyTreeVisualizer:
         processed_ancestors: Set[int] = set()
         processed_descendants: Set[int] = set()
 
-        async def get_name(uid: int) -> str:
+        async def get_node_info(uid: int) -> dict:
+            """Get name and crest URL for a user."""
             user = bot.get_user(uid)
             name = user.display_name if user else f"User {uid}"
-            # Try to get family title
+            crest_url = None
+
+            # Try to get family profile
             profile = await db.get_family_profile(uid)
-            if profile and profile.get("family_title"):
-                title = profile["family_title"]
-                # Truncate if needed to fit in node
-                if len(name) + len(title) > 20:
-                    name = name[:10] + "..."
-                return f"{name}\n{title}"
-            return name[:15] if len(name) > 15 else name
+            if profile:
+                if profile.get("family_title"):
+                    title = profile["family_title"]
+                    # Truncate if needed to fit in node
+                    if len(name) + len(title) > 20:
+                        name = name[:10] + "..."
+                    name = f"{name}\n{title}"
+                else:
+                    name = name[:15] if len(name) > 15 else name
+                crest_url = profile.get("family_crest_url")
+            else:
+                name = name[:15] if len(name) > 15 else name
+
+            return {"name": name, "crest_url": crest_url}
 
         def add_edge(uid1: int, uid2: int, edge_type: str):
             """Add edge if not already present."""
@@ -1031,8 +1157,10 @@ class FamilyTreeVisualizer:
                     parent_type = 'in_law'
 
                 if parent_id not in nodes:
+                    node_info = await get_node_info(parent_id)
                     nodes[parent_id] = {
-                        'name': await get_name(parent_id),
+                        'name': node_info['name'],
+                        'crest_url': node_info['crest_url'],
                         'type': parent_type
                     }
                     levels[parent_id] = current_level - 1
@@ -1063,8 +1191,10 @@ class FamilyTreeVisualizer:
                     child_type = 'in_law'
 
                 if child_id not in nodes:
+                    node_info = await get_node_info(child_id)
                     nodes[child_id] = {
-                        'name': await get_name(child_id),
+                        'name': node_info['name'],
+                        'crest_url': node_info['crest_url'],
                         'type': child_type
                     }
                     levels[child_id] = current_level + 1
@@ -1083,8 +1213,10 @@ class FamilyTreeVisualizer:
                         spouse_is_blood = spouse_id in nodes and nodes[spouse_id]['type'] not in ('in_law', 'spouse')
 
                         if spouse_id not in nodes:
+                            node_info = await get_node_info(spouse_id)
                             nodes[spouse_id] = {
-                                'name': await get_name(spouse_id),
+                                'name': node_info['name'],
+                                'crest_url': node_info['crest_url'],
                                 'type': 'in_law'
                             }
                             levels[spouse_id] = current_level + 1
@@ -1103,8 +1235,10 @@ class FamilyTreeVisualizer:
                                          is_blood_relative=is_blood_relative, collect_in_laws=collect_in_laws)
 
         # Add central user
+        node_info = await get_node_info(user_id)
         nodes[user_id] = {
-            'name': await get_name(user_id),
+            'name': node_info['name'],
+            'crest_url': node_info['crest_url'],
             'type': 'self'
         }
         levels[user_id] = 0
@@ -1112,8 +1246,10 @@ class FamilyTreeVisualizer:
         # Add spouses at same level
         spouses = await db.get_spouses(user_id)
         for spouse_id in spouses:
+            node_info = await get_node_info(spouse_id)
             nodes[spouse_id] = {
-                'name': await get_name(spouse_id),
+                'name': node_info['name'],
+                'crest_url': node_info['crest_url'],
                 'type': 'spouse'
             }
             levels[spouse_id] = 0
@@ -1126,8 +1262,10 @@ class FamilyTreeVisualizer:
         siblings = await db.get_siblings(user_id)
         for sibling_id in siblings:
             if sibling_id not in nodes:
+                node_info = await get_node_info(sibling_id)
                 nodes[sibling_id] = {
-                    'name': await get_name(sibling_id),
+                    'name': node_info['name'],
+                    'crest_url': node_info['crest_url'],
                     'type': 'sibling'
                 }
                 levels[sibling_id] = 0
@@ -1136,8 +1274,10 @@ class FamilyTreeVisualizer:
             sibling_spouses = await db.get_spouses(sibling_id)
             for spouse_id in sibling_spouses:
                 if spouse_id not in nodes:
+                    node_info = await get_node_info(spouse_id)
                     nodes[spouse_id] = {
-                        'name': await get_name(spouse_id),
+                        'name': node_info['name'],
+                        'crest_url': node_info['crest_url'],
                         'type': 'in_law'
                     }
                     levels[spouse_id] = 0

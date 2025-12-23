@@ -489,3 +489,41 @@ class FamilyDatabase:
         """) as cursor:
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+    async def inherit_family_profile(self, child_id: int, parent_id: int):
+        """Have a child inherit the family title and crest from a parent (if they don't have their own)."""
+        parent_profile = await self.get_family_profile(parent_id)
+        if not parent_profile:
+            return
+
+        child_profile = await self.get_family_profile(child_id)
+
+        # Only inherit if parent has values and child doesn't
+        title_to_set = None
+        crest_to_set = None
+        motto_to_set = None
+
+        if parent_profile.get("family_title"):
+            if not child_profile or not child_profile.get("family_title"):
+                title_to_set = parent_profile["family_title"]
+
+        if parent_profile.get("family_crest_url"):
+            if not child_profile or not child_profile.get("family_crest_url"):
+                crest_to_set = parent_profile["family_crest_url"]
+
+        if parent_profile.get("family_motto"):
+            if not child_profile or not child_profile.get("family_motto"):
+                motto_to_set = parent_profile["family_motto"]
+
+        # Apply inheritance
+        if title_to_set or crest_to_set or motto_to_set:
+            await self.db.execute("""
+                INSERT INTO family_profiles (user_id, family_title, family_crest_url, family_motto, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    family_title = COALESCE(family_profiles.family_title, excluded.family_title),
+                    family_crest_url = COALESCE(family_profiles.family_crest_url, excluded.family_crest_url),
+                    family_motto = COALESCE(family_profiles.family_motto, excluded.family_motto),
+                    updated_at = CURRENT_TIMESTAMP
+            """, (child_id, title_to_set, crest_to_set, motto_to_set))
+            await self.db.commit()
