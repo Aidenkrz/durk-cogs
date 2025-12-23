@@ -1028,16 +1028,8 @@ class Family(commands.Cog):
         target = user or ctx.author
 
         try:
-            # Check if already married (unless polyamory)
+            # Get current spouses to exclude from results
             spouses = await self.db.get_spouses(target.id)
-            polyamory = await self.get_effective_setting(ctx.guild.id, "polyamory")
-            if spouses and not polyamory:
-                spouse_names = []
-                for s in spouses:
-                    u = self.bot.get_user(s)
-                    spouse_names.append(u.display_name if u else f"User {s}")
-                await ctx.send(f"{target.display_name} is already happily married to {', '.join(spouse_names)}!")
-                return
 
             # Get settings once
             incest = await self.get_effective_setting(ctx.guild.id, "incest")
@@ -1074,16 +1066,8 @@ class Family(commands.Cog):
 
             # Skip if related (using pre-fetched relatives)
             if not incest and member_id in target_relatives:
+                checked += 1
                 continue
-
-            # Skip if they're married (unless polyamory)
-            if not polyamory:
-                try:
-                    member_spouses = await self.db.get_spouses(member_id)
-                    if member_spouses:
-                        continue
-                except Exception:
-                    continue
 
             member = ctx.guild.get_member(member_id)
             if member:
