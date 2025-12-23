@@ -932,17 +932,54 @@ class Family(commands.Cog):
 
     # === Matchmaking Commands ===
 
+    # Cache for compatibility scores
+    _compat_cache: dict = {}
+
+    def _get_compat_score(self, user1_id: int, user2_id: int) -> int:
+        """Get just the overall compatibility score (fast, for sorting)."""
+        import hashlib
+
+        # Order-independent cache key
+        cache_key = (min(user1_id, user2_id), max(user1_id, user2_id))
+
+        if cache_key in self._compat_cache:
+            return self._compat_cache[cache_key]
+
+        # Calculate score
+        combined = cache_key[0] * cache_key[1]
+        seed = int(hashlib.md5(str(combined).encode()).hexdigest()[:8], 16)
+
+        # Generate stats and weighted average
+        def stat(offset: int) -> int:
+            return ((seed + offset * 7919) % 71) + 30  # 30-100 range
+
+        raw_stats = [stat(i) for i in range(1, 9)]
+        weights = [1.2, 1.0, 0.8, 1.1, 1.3, 0.7, 1.0, 1.5]
+        overall = int(sum(s * w for s, w in zip(raw_stats, weights)) / sum(weights))
+
+        # Cache it
+        self._compat_cache[cache_key] = overall
+
+        # Limit cache size
+        if len(self._compat_cache) > 50000:
+            # Clear half the cache
+            keys = list(self._compat_cache.keys())[:25000]
+            for k in keys:
+                del self._compat_cache[k]
+
+        return overall
+
     def _calculate_compatibility(self, user1_id: int, user2_id: int) -> dict:
-        """Calculate fake but deterministic compatibility stats between two users."""
+        """Calculate full compatibility stats between two users."""
         import hashlib
 
         # Create a deterministic seed from both user IDs (order-independent)
         combined = min(user1_id, user2_id) * max(user1_id, user2_id)
         seed = int(hashlib.md5(str(combined).encode()).hexdigest()[:8], 16)
 
-        # Generate "stats" based on the seed
+        # Generate "stats" based on the seed (30-100 range for better spread)
         def stat(offset: int) -> int:
-            return ((seed + offset * 7919) % 61) + 40  # 40-100 range
+            return ((seed + offset * 7919) % 71) + 30  # 30-100 range
 
         stats = {
             "emotional_sync": stat(1),
@@ -1001,36 +1038,56 @@ class Family(commands.Cog):
             await ctx.send(f"{target.display_name} is already happily married to {', '.join(spouse_names)}!")
             return
 
-        # Find all eligible singles in the guild
+        # Get settings once
+        incest = await self.get_effective_setting(ctx.guild.id, "incest")
+
+        # Get target's relatives once if needed
+        target_relatives = set()
+        if not incest:
+            target_relatives = await self.db.get_all_relatives(target.id)
+
+        # Phase 1: Quick filter - just get member IDs and scores (no DB calls per member)
+        # First, collect all non-bot member IDs
+        member_ids = [m.id for m in ctx.guild.members if not m.bot and m.id != target.id and m.id not in spouses]
+
+        # Calculate compatibility scores for all (fast, cached)
+        scored_ids = [(mid, self._get_compat_score(target.id, mid)) for mid in member_ids]
+
+        # Sort by score descending and take top candidates for detailed checking
+        scored_ids.sort(key=lambda x: x[1], reverse=True)
+
+        # Phase 2: Check top 50 candidates for eligibility (reduces DB calls dramatically)
         candidates = []
-        for member in ctx.guild.members:
-            if member.bot or member.id == target.id:
-                continue
-            # Skip if they're married (unless polyamory)
-            member_spouses = await self.db.get_spouses(member.id)
-            if member_spouses and not polyamory:
-                continue
-            # Skip if already married to target
-            if member.id in spouses:
-                continue
-            # Skip if related (incest check)
-            incest = await self.get_effective_setting(ctx.guild.id, "incest")
-            if not incest and await self.db.are_related(target.id, member.id):
+        checked = 0
+        for member_id, score in scored_ids:
+            if checked >= 50 or len(candidates) >= 5:
+                break
+
+            # Skip if related (using pre-fetched relatives)
+            if not incest and member_id in target_relatives:
                 continue
 
-            # Calculate compatibility
-            stats = self._calculate_compatibility(target.id, member.id)
-            candidates.append((member, stats))
+            # Skip if they're married (unless polyamory)
+            if not polyamory:
+                member_spouses = await self.db.get_spouses(member_id)
+                if member_spouses:
+                    continue
+
+            member = ctx.guild.get_member(member_id)
+            if member:
+                candidates.append((member, score))
+            checked += 1
 
         if not candidates:
             await ctx.send(f"No eligible matches found for {target.display_name}!")
             return
 
-        # Sort by overall compatibility
-        candidates.sort(key=lambda x: x[1]["overall"], reverse=True)
+        # Get full stats only for top matches we'll display
+        top_matches = []
+        for member, score in candidates[:5]:
+            full_stats = self._calculate_compatibility(target.id, member.id)
+            top_matches.append((member, full_stats))
 
-        # Get top 5 matches
-        top_matches = candidates[:5]
         best_match, best_stats = top_matches[0]
 
         embed = discord.Embed(
