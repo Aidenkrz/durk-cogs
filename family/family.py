@@ -1027,24 +1027,33 @@ class Family(commands.Cog):
         """Find your most compatible match in the server!"""
         target = user or ctx.author
 
-        # Check if already married (unless polyamory)
-        spouses = await self.db.get_spouses(target.id)
-        polyamory = await self.get_effective_setting(ctx.guild.id, "polyamory")
-        if spouses and not polyamory:
-            spouse_names = []
-            for s in spouses:
-                u = self.bot.get_user(s)
-                spouse_names.append(u.display_name if u else f"User {s}")
-            await ctx.send(f"{target.display_name} is already happily married to {', '.join(spouse_names)}!")
+        try:
+            # Check if already married (unless polyamory)
+            spouses = await self.db.get_spouses(target.id)
+            polyamory = await self.get_effective_setting(ctx.guild.id, "polyamory")
+            if spouses and not polyamory:
+                spouse_names = []
+                for s in spouses:
+                    u = self.bot.get_user(s)
+                    spouse_names.append(u.display_name if u else f"User {s}")
+                await ctx.send(f"{target.display_name} is already happily married to {', '.join(spouse_names)}!")
+                return
+
+            # Get settings once
+            incest = await self.get_effective_setting(ctx.guild.id, "incest")
+
+            # Get target's relatives once if needed (with error handling)
+            target_relatives = set()
+            if not incest:
+                try:
+                    target_relatives = await self.db.get_all_relatives(target.id)
+                except Exception:
+                    # If we can't get relatives, just skip the incest check
+                    incest = True
+
+        except Exception:
+            await ctx.send("An error occurred. Please try again.")
             return
-
-        # Get settings once
-        incest = await self.get_effective_setting(ctx.guild.id, "incest")
-
-        # Get target's relatives once if needed
-        target_relatives = set()
-        if not incest:
-            target_relatives = await self.db.get_all_relatives(target.id)
 
         # Phase 1: Quick filter - just get member IDs and scores (no DB calls per member)
         # First, collect all non-bot member IDs
@@ -1069,8 +1078,11 @@ class Family(commands.Cog):
 
             # Skip if they're married (unless polyamory)
             if not polyamory:
-                member_spouses = await self.db.get_spouses(member_id)
-                if member_spouses:
+                try:
+                    member_spouses = await self.db.get_spouses(member_id)
+                    if member_spouses:
+                        continue
+                except Exception:
                     continue
 
             member = ctx.guild.get_member(member_id)
