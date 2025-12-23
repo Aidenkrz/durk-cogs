@@ -840,6 +840,291 @@ class Family(commands.Cog):
 
         await ctx.send(embed=embed)
 
+    # === Family Profile Commands ===
+
+    @commands.group(invoke_without_command=True)
+    @commands.guild_only()
+    async def familyprofile(self, ctx: commands.Context, user: discord.Member = None):
+        """View or manage your family profile (title, motto, crest)."""
+        target = user or ctx.author
+        profile = await self.db.get_family_profile(target.id)
+
+        embed = discord.Embed(
+            title=f"Family Profile: {target.display_name}",
+            color=await ctx.embed_color()
+        )
+
+        if profile:
+            if profile.get("family_title"):
+                embed.add_field(name="Family Title", value=profile["family_title"], inline=False)
+            if profile.get("family_motto"):
+                embed.add_field(name="Family Motto", value=f"*\"{profile['family_motto']}\"*", inline=False)
+            if profile.get("family_crest_url"):
+                embed.set_thumbnail(url=profile["family_crest_url"])
+                embed.add_field(name="Family Crest", value="See thumbnail", inline=False)
+            if profile.get("looking_for_match"):
+                bio = profile.get("match_bio") or "No bio set"
+                embed.add_field(name="Looking for Match", value=bio, inline=False)
+
+        if not profile or not any([profile.get("family_title"), profile.get("family_motto"), profile.get("family_crest_url")]):
+            embed.description = "No family profile set up yet."
+            if target.id == ctx.author.id:
+                embed.description += f"\n\nUse `{ctx.clean_prefix}familyprofile title <name>` to set a family title!"
+
+        await ctx.send(embed=embed)
+
+    @familyprofile.command(name="title")
+    async def familyprofile_title(self, ctx: commands.Context, *, title: str = None):
+        """Set your family title (surname, dynasty name, house name, etc.)."""
+        if title and len(title) > 50:
+            await ctx.send("Family title must be 50 characters or less!")
+            return
+
+        await self.db.set_family_title(ctx.author.id, title)
+
+        if title:
+            await ctx.send(f"Your family title has been set to: **{title}**")
+        else:
+            await ctx.send("Your family title has been cleared.")
+
+    @familyprofile.command(name="motto")
+    async def familyprofile_motto(self, ctx: commands.Context, *, motto: str = None):
+        """Set your family motto."""
+        if motto and len(motto) > 200:
+            await ctx.send("Family motto must be 200 characters or less!")
+            return
+
+        await self.db.set_family_motto(ctx.author.id, motto)
+
+        if motto:
+            await ctx.send(f"Your family motto has been set to: *\"{motto}\"*")
+        else:
+            await ctx.send("Your family motto has been cleared.")
+
+    @familyprofile.command(name="crest")
+    async def familyprofile_crest(self, ctx: commands.Context, url: str = None):
+        """Set your family crest/banner image URL. Attach an image or provide a URL."""
+        # Check for attached image
+        if ctx.message.attachments:
+            attachment = ctx.message.attachments[0]
+            if attachment.content_type and attachment.content_type.startswith("image/"):
+                url = attachment.url
+            else:
+                await ctx.send("Please attach a valid image file!")
+                return
+
+        if url:
+            # Basic URL validation
+            if not url.startswith(("http://", "https://")):
+                await ctx.send("Please provide a valid URL starting with http:// or https://")
+                return
+
+            await self.db.set_family_crest(ctx.author.id, url)
+            embed = discord.Embed(
+                title="Family Crest Set!",
+                color=await ctx.embed_color()
+            )
+            embed.set_thumbnail(url=url)
+            await ctx.send(embed=embed)
+        else:
+            await self.db.set_family_crest(ctx.author.id, None)
+            await ctx.send("Your family crest has been cleared.")
+
+    # === Matchmaking Commands ===
+
+    def _calculate_compatibility(self, user1_id: int, user2_id: int) -> dict:
+        """Calculate fake but deterministic compatibility stats between two users."""
+        import hashlib
+
+        # Create a deterministic seed from both user IDs (order-independent)
+        combined = min(user1_id, user2_id) * max(user1_id, user2_id)
+        seed = int(hashlib.md5(str(combined).encode()).hexdigest()[:8], 16)
+
+        # Generate "stats" based on the seed
+        def stat(offset: int) -> int:
+            return ((seed + offset * 7919) % 61) + 40  # 40-100 range
+
+        stats = {
+            "emotional_sync": stat(1),
+            "humor_compatibility": stat(2),
+            "adventure_spirit": stat(3),
+            "communication": stat(4),
+            "trust_potential": stat(5),
+            "chaos_alignment": stat(6),
+            "vibe_match": stat(7),
+            "destiny_score": stat(8),
+        }
+
+        # Overall compatibility is weighted average
+        weights = [1.2, 1.0, 0.8, 1.1, 1.3, 0.7, 1.0, 1.5]
+        total = sum(s * w for s, w in zip(stats.values(), weights))
+        stats["overall"] = int(total / sum(weights))
+
+        return stats
+
+    def _get_compatibility_rating(self, score: int) -> str:
+        """Get a fun rating based on compatibility score."""
+        if score >= 95:
+            return "Soulmates"
+        elif score >= 85:
+            return "Perfect Match"
+        elif score >= 75:
+            return "Highly Compatible"
+        elif score >= 65:
+            return "Good Potential"
+        elif score >= 55:
+            return "Worth a Shot"
+        elif score >= 45:
+            return "It's Complicated"
+        else:
+            return "Chaotic Energy"
+
+    def _score_bar(self, score: int, length: int = 10) -> str:
+        """Create a visual bar for a score."""
+        filled = int((score / 100) * length)
+        return "█" * filled + "░" * (length - filled)
+
+    @commands.command()
+    @commands.guild_only()
+    async def matchmaking(self, ctx: commands.Context, user: discord.Member = None):
+        """Find your most compatible match in the server!"""
+        target = user or ctx.author
+
+        # Check if already married (unless polyamory)
+        spouses = await self.db.get_spouses(target.id)
+        polyamory = await self.get_effective_setting(ctx.guild.id, "polyamory")
+        if spouses and not polyamory:
+            spouse_names = []
+            for s in spouses:
+                u = self.bot.get_user(s)
+                spouse_names.append(u.display_name if u else f"User {s}")
+            await ctx.send(f"{target.display_name} is already happily married to {', '.join(spouse_names)}!")
+            return
+
+        # Find all eligible singles in the guild
+        candidates = []
+        for member in ctx.guild.members:
+            if member.bot or member.id == target.id:
+                continue
+            # Skip if they're married (unless polyamory)
+            member_spouses = await self.db.get_spouses(member.id)
+            if member_spouses and not polyamory:
+                continue
+            # Skip if already married to target
+            if member.id in spouses:
+                continue
+            # Skip if related (incest check)
+            incest = await self.get_effective_setting(ctx.guild.id, "incest")
+            if not incest and await self.db.are_related(target.id, member.id):
+                continue
+
+            # Calculate compatibility
+            stats = self._calculate_compatibility(target.id, member.id)
+            candidates.append((member, stats))
+
+        if not candidates:
+            await ctx.send(f"No eligible matches found for {target.display_name}!")
+            return
+
+        # Sort by overall compatibility
+        candidates.sort(key=lambda x: x[1]["overall"], reverse=True)
+
+        # Get top 5 matches
+        top_matches = candidates[:5]
+        best_match, best_stats = top_matches[0]
+
+        embed = discord.Embed(
+            title=f"Matchmaking Results for {target.display_name}",
+            color=discord.Color.pink()
+        )
+
+        # Show best match with full stats
+        rating = self._get_compatibility_rating(best_stats["overall"])
+        embed.add_field(
+            name=f"Best Match: {best_match.display_name}",
+            value=(
+                f"**{rating}** - {best_stats['overall']}% Compatible\n\n"
+                f"Emotional Sync: {self._score_bar(best_stats['emotional_sync'])} {best_stats['emotional_sync']}%\n"
+                f"Humor Match: {self._score_bar(best_stats['humor_compatibility'])} {best_stats['humor_compatibility']}%\n"
+                f"Adventure Spirit: {self._score_bar(best_stats['adventure_spirit'])} {best_stats['adventure_spirit']}%\n"
+                f"Communication: {self._score_bar(best_stats['communication'])} {best_stats['communication']}%\n"
+                f"Trust Potential: {self._score_bar(best_stats['trust_potential'])} {best_stats['trust_potential']}%\n"
+                f"Chaos Alignment: {self._score_bar(best_stats['chaos_alignment'])} {best_stats['chaos_alignment']}%\n"
+                f"Vibe Match: {self._score_bar(best_stats['vibe_match'])} {best_stats['vibe_match']}%\n"
+                f"Destiny Score: {self._score_bar(best_stats['destiny_score'])} {best_stats['destiny_score']}%"
+            ),
+            inline=False
+        )
+
+        # Show other top matches briefly
+        if len(top_matches) > 1:
+            other_matches = []
+            for member, stats in top_matches[1:]:
+                rating = self._get_compatibility_rating(stats["overall"])
+                other_matches.append(f"**{member.display_name}** - {stats['overall']}% ({rating})")
+
+            embed.add_field(
+                name="Other Potential Matches",
+                value="\n".join(other_matches),
+                inline=False
+            )
+
+        embed.set_footer(text=f"Use {ctx.clean_prefix}marry @user to shoot your shot!")
+        embed.set_thumbnail(url=best_match.display_avatar.url)
+
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    @commands.guild_only()
+    async def compatibility(self, ctx: commands.Context, user1: discord.Member, user2: discord.Member = None):
+        """Check compatibility between two users."""
+        if user2 is None:
+            user2 = user1
+            user1 = ctx.author
+
+        if user1.id == user2.id:
+            await ctx.send("Self-love is important, but that's not how this works!")
+            return
+
+        stats = self._calculate_compatibility(user1.id, user2.id)
+        rating = self._get_compatibility_rating(stats["overall"])
+
+        embed = discord.Embed(
+            title=f"Compatibility: {user1.display_name} & {user2.display_name}",
+            description=f"**{rating}** - {stats['overall']}% Overall Compatibility",
+            color=discord.Color.pink()
+        )
+
+        embed.add_field(
+            name="Compatibility Breakdown",
+            value=(
+                f"Emotional Sync: {self._score_bar(stats['emotional_sync'])} {stats['emotional_sync']}%\n"
+                f"Humor Match: {self._score_bar(stats['humor_compatibility'])} {stats['humor_compatibility']}%\n"
+                f"Adventure Spirit: {self._score_bar(stats['adventure_spirit'])} {stats['adventure_spirit']}%\n"
+                f"Communication: {self._score_bar(stats['communication'])} {stats['communication']}%\n"
+                f"Trust Potential: {self._score_bar(stats['trust_potential'])} {stats['trust_potential']}%\n"
+                f"Chaos Alignment: {self._score_bar(stats['chaos_alignment'])} {stats['chaos_alignment']}%\n"
+                f"Vibe Match: {self._score_bar(stats['vibe_match'])} {stats['vibe_match']}%\n"
+                f"Destiny Score: {self._score_bar(stats['destiny_score'])} {stats['destiny_score']}%"
+            ),
+            inline=False
+        )
+
+        # Fun commentary based on score
+        if stats["overall"] >= 90:
+            comment = "The stars have aligned! This is meant to be."
+        elif stats["overall"] >= 75:
+            comment = "Strong potential here. The universe approves."
+        elif stats["overall"] >= 60:
+            comment = "Could work with some effort. Love finds a way!"
+        elif stats["overall"] >= 45:
+            comment = "Opposites attract... sometimes. Proceed with caution."
+        else:
+            comment = "Chaotic energy detected. This could be entertaining."
+
+        embed.set_footer(text=comment)
+        await ctx.send(embed=embed)
+
     @commands.command(name="familyhelp")
     @commands.guild_only()
     async def familyhelp(self, ctx: commands.Context):
@@ -877,6 +1162,30 @@ class Family(commands.Cog):
         embed.add_field(
             name="\U0001f4cb Information",
             value=info_cmds,
+            inline=False
+        )
+
+        # Profile commands
+        profile_cmds = (
+            f"`{prefix}familyprofile [@user]` - View family profile\n"
+            f"`{prefix}familyprofile title <name>` - Set family title/dynasty\n"
+            f"`{prefix}familyprofile motto <text>` - Set family motto\n"
+            f"`{prefix}familyprofile crest [url]` - Set family crest image"
+        )
+        embed.add_field(
+            name="\U0001f3f0 Profile",
+            value=profile_cmds,
+            inline=False
+        )
+
+        # Matchmaking commands
+        matchmaking_cmds = (
+            f"`{prefix}matchmaking [@user]` - Find your best match in the server\n"
+            f"`{prefix}compatibility @user` - Check compatibility with someone"
+        )
+        embed.add_field(
+            name="\U0001f495 Matchmaking",
+            value=matchmaking_cmds,
             inline=False
         )
 

@@ -80,6 +80,18 @@ class FamilyDatabase:
             CREATE INDEX IF NOT EXISTS idx_parent_child_child ON parent_child(child_id);
             CREATE INDEX IF NOT EXISTS idx_proposals_target ON pending_proposals(target_id);
             CREATE INDEX IF NOT EXISTS idx_proposals_expires ON pending_proposals(expires_at);
+
+            CREATE TABLE IF NOT EXISTS family_profiles (
+                user_id INTEGER PRIMARY KEY,
+                family_title TEXT,
+                family_motto TEXT,
+                family_crest_url TEXT,
+                looking_for_match INTEGER DEFAULT 0,
+                match_bio TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            );
         """)
         await self.db.commit()
 
@@ -402,5 +414,78 @@ class FamilyDatabase:
         await self.db.execute("DELETE FROM marriages")
         await self.db.execute("DELETE FROM parent_child")
         await self.db.execute("DELETE FROM pending_proposals")
+        await self.db.execute("DELETE FROM family_profiles")
         await self.db.execute("DELETE FROM users")
         await self.db.commit()
+
+    # === Family Profile Operations ===
+
+    async def get_family_profile(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Get a user's family profile."""
+        async with self.db.execute(
+            "SELECT * FROM family_profiles WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+
+    async def set_family_title(self, user_id: int, title: Optional[str]):
+        """Set a user's family title (surname, dynasty name, etc.)."""
+        await self.db.execute("""
+            INSERT INTO family_profiles (user_id, family_title, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                family_title = excluded.family_title,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, title))
+        await self.db.commit()
+
+    async def set_family_motto(self, user_id: int, motto: Optional[str]):
+        """Set a user's family motto."""
+        await self.db.execute("""
+            INSERT INTO family_profiles (user_id, family_motto, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                family_motto = excluded.family_motto,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, motto))
+        await self.db.commit()
+
+    async def set_family_crest(self, user_id: int, crest_url: Optional[str]):
+        """Set a user's family crest URL."""
+        await self.db.execute("""
+            INSERT INTO family_profiles (user_id, family_crest_url, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                family_crest_url = excluded.family_crest_url,
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, crest_url))
+        await self.db.commit()
+
+    async def set_looking_for_match(self, user_id: int, looking: bool, bio: Optional[str] = None):
+        """Set whether a user is looking for a match and their bio."""
+        await self.db.execute("""
+            INSERT INTO family_profiles (user_id, looking_for_match, match_bio, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                looking_for_match = excluded.looking_for_match,
+                match_bio = COALESCE(excluded.match_bio, family_profiles.match_bio),
+                updated_at = CURRENT_TIMESTAMP
+        """, (user_id, 1 if looking else 0, bio))
+        await self.db.commit()
+
+    async def get_singles_looking(self) -> List[Dict[str, Any]]:
+        """Get all users who are looking for a match and have no spouses."""
+        async with self.db.execute("""
+            SELECT fp.user_id, fp.match_bio, fp.family_title
+            FROM family_profiles fp
+            WHERE fp.looking_for_match = 1
+            AND NOT EXISTS (
+                SELECT 1 FROM marriages m
+                WHERE m.user1_id = fp.user_id OR m.user2_id = fp.user_id
+            )
+        """) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]

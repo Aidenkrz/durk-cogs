@@ -577,34 +577,64 @@ class FamilyTreeVisualizer:
                     radius + i, (255, 215, 0), 1
                 )
 
-        # Draw name
-        display_name = name
-        if len(display_name) > 14:
-            display_name = display_name[:12] + ".."
-
-        text_bbox = draw.textbbox((0, 0), display_name, font=font)
-        text_width = text_bbox[2] - text_bbox[0]
-        text_height = text_bbox[3] - text_bbox[1]
-
         # Calculate brightness for text color
         avg_color = ((main_color[0] + dark_color[0]) // 2,
                      (main_color[1] + dark_color[1]) // 2,
                      (main_color[2] + dark_color[2]) // 2)
         brightness = (avg_color[0] * 299 + avg_color[1] * 587 + avg_color[2] * 114) / 1000
         text_color = (30, 30, 30) if brightness > 140 else (255, 255, 255)
+        shadow_color = (0, 0, 0) if brightness > 140 else (50, 50, 50)
 
-        # Text shadow for readability
-        draw.text(
-            (x - text_width // 2 + 1, y - text_height // 2 + 1),
-            display_name,
-            fill=(0, 0, 0) if brightness > 140 else (50, 50, 50),
-            font=font
-        )
-        draw.text(
-            (x - text_width // 2, y - text_height // 2),
-            display_name,
-            fill=text_color,
-            font=font
+        # Handle multi-line names (name + title)
+        lines = name.split('\n')
+        if len(lines) == 1:
+            # Single line - original behavior
+            display_name = name
+            if len(display_name) > 14:
+                display_name = display_name[:12] + ".."
+
+            text_bbox = draw.textbbox((0, 0), display_name, font=font)
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+
+            # Text shadow for readability
+            draw.text(
+                (x - text_width // 2 + 1, y - text_height // 2 + 1),
+                display_name,
+                fill=shadow_color,
+                font=font
+            )
+            draw.text(
+                (x - text_width // 2, y - text_height // 2),
+                display_name,
+                fill=text_color,
+                font=font
+            )
+        else:
+            # Multi-line (name + title)
+            name_line = lines[0][:14] if len(lines[0]) > 14 else lines[0]
+            title_line = lines[1][:16] if len(lines[1]) > 16 else lines[1]
+
+            # Get dimensions for both lines
+            name_bbox = draw.textbbox((0, 0), name_line, font=font)
+            title_bbox = draw.textbbox((0, 0), title_line, font=font)
+
+            name_width = name_bbox[2] - name_bbox[0]
+            title_width = title_bbox[2] - title_bbox[0]
+            line_height = name_bbox[3] - name_bbox[1]
+
+            # Position for two lines centered vertically
+            name_y = y - line_height
+            title_y = y + 2
+
+            # Draw name line
+            draw.text((x - name_width // 2 + 1, name_y + 1), name_line, fill=shadow_color, font=font)
+            draw.text((x - name_width // 2, name_y), name_line, fill=text_color, font=font)
+
+            # Draw title line (slightly dimmer)
+            title_color = tuple(max(0, c - 30) for c in text_color)
+            draw.text((x - title_width // 2 + 1, title_y + 1), title_line, fill=shadow_color, font=font)
+            draw.text((x - title_width // 2, title_y), title_line, fill=title_color, font=font
         )
 
     def _draw_rounded_rect_filled(self, draw, x1, y1, x2, y2, radius, fill):
@@ -966,7 +996,16 @@ class FamilyTreeVisualizer:
 
         async def get_name(uid: int) -> str:
             user = bot.get_user(uid)
-            return user.display_name if user else f"User {uid}"
+            name = user.display_name if user else f"User {uid}"
+            # Try to get family title
+            profile = await db.get_family_profile(uid)
+            if profile and profile.get("family_title"):
+                title = profile["family_title"]
+                # Truncate if needed to fit in node
+                if len(name) + len(title) > 20:
+                    name = name[:10] + "..."
+                return f"{name}\n{title}"
+            return name[:15] if len(name) > 15 else name
 
         def add_edge(uid1: int, uid2: int, edge_type: str):
             """Add edge if not already present."""
