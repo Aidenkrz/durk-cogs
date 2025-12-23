@@ -62,7 +62,6 @@ class ProposalView(View):
             try:
                 await self.cog.handle_proposal_timeout(self.proposal_id)
             except Exception:
-                # Cog may have been unloaded or database closed
                 pass
 
 
