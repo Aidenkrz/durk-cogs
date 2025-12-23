@@ -125,14 +125,15 @@ class FamilyTreeVisualizer:
         db: "FamilyDatabase",
         user_id: int,
         bot: "Red",
-        depth: int = 2
+        depth: int = 2,
+        guild=None
     ) -> Optional[BytesIO]:
         """Generate a beautiful hierarchical family tree image."""
         if not PILLOW_AVAILABLE:
             return None
 
         # Collect family data
-        family_data = await self._collect_family_hierarchical(db, user_id, bot, depth)
+        family_data = await self._collect_family_hierarchical(db, user_id, bot, depth, guild)
 
         if not family_data['nodes']:
             return None
@@ -213,7 +214,9 @@ class FamilyTreeVisualizer:
 
         # Draw title with subtle glow effect
         central_name = family_data['nodes'][user_id]['name']
-        title = f"{central_name}'s Family Tree"
+        # Use only the first line (name without family title) for the header
+        display_name = central_name.split('\n')[0]
+        title = f"{display_name}'s Family Tree"
         title_bbox = draw.textbbox((0, 0), title, font=title_font)
         title_width = title_bbox[2] - title_bbox[0]
         title_x = (width - title_width) // 2
@@ -292,6 +295,7 @@ class FamilyTreeVisualizer:
         self,
         db: "FamilyDatabase",
         bot: "Red",
+        guild=None
     ) -> Optional[BytesIO]:
         """Generate a family tree image for all users with relations."""
         if not PILLOW_AVAILABLE:
@@ -304,7 +308,7 @@ class FamilyTreeVisualizer:
             return None
 
         # Collect all family data
-        family_data = await self._collect_all_families(db, bot, all_users)
+        family_data = await self._collect_all_families(db, bot, all_users, guild)
 
         if not family_data['nodes']:
             return None
@@ -444,7 +448,8 @@ class FamilyTreeVisualizer:
         self,
         db: "FamilyDatabase",
         bot: "Red",
-        all_users: set
+        all_users: set,
+        guild=None
     ) -> Dict:
         """Collect family data for all users, grouping connected families together."""
         nodes = {}
@@ -453,8 +458,15 @@ class FamilyTreeVisualizer:
 
         async def get_node_info(uid: int) -> dict:
             """Get name and crest URL for a user."""
-            user = bot.get_user(uid)
-            name = user.display_name if user else f"User {uid}"
+            # Try to get server nickname first
+            name = None
+            if guild:
+                member = guild.get_member(uid)
+                if member:
+                    name = member.display_name
+            if not name:
+                user = bot.get_user(uid)
+                name = user.display_name if user else f"User {uid}"
             crest_url = None
 
             # Try to get family profile
@@ -683,11 +695,10 @@ class FamilyTreeVisualizer:
         text_color = (30, 30, 30) if brightness > 140 else (255, 255, 255)
         shadow_color = (0, 0, 0) if brightness > 140 else (50, 50, 50)
 
-        # Calculate crest offset if we have a crest
-        crest_offset = 0
+        # Calculate crest space if we have a crest
+        crest_space = 0
         if crest_img:
-            crest_size = crest_img.width
-            crest_offset = crest_size // 2 + 4  # Half crest width + small gap
+            crest_space = crest_img.width + 8  # Crest width + padding
 
         # Handle multi-line names (name + title)
         lines = name.split('\n')
@@ -701,26 +712,36 @@ class FamilyTreeVisualizer:
             text_width = text_bbox[2] - text_bbox[0]
             text_height = text_bbox[3] - text_bbox[1]
 
-            # Adjust x position for crest
-            text_center_x = x + crest_offset // 2 if crest_img else x
+            # Calculate available space and center text+crest together
+            total_content_width = text_width + crest_space
+            content_start_x = x - total_content_width // 2
+
+            # Text position (after crest space)
+            text_x = content_start_x + crest_space
 
             # Text shadow for readability
             draw.text(
-                (text_center_x - text_width // 2 + 1, y - text_height // 2 + 1),
+                (text_x + 1, y - text_height // 2 + 1),
                 display_name,
                 fill=shadow_color,
                 font=font
             )
             draw.text(
-                (text_center_x - text_width // 2, y - text_height // 2),
+                (text_x, y - text_height // 2),
                 display_name,
                 fill=text_color,
                 font=font
             )
+
+            # Draw crest if available
+            if crest_img:
+                crest_x = int(content_start_x)
+                crest_y = int(y - crest_img.height // 2)
+                img.paste(crest_img, (crest_x, crest_y), crest_img)
         else:
             # Multi-line (name + title)
-            name_line = lines[0][:14] if len(lines[0]) > 14 else lines[0]
-            title_line = lines[1][:16] if len(lines[1]) > 16 else lines[1]
+            name_line = lines[0][:12] if len(lines[0]) > 12 else lines[0]
+            title_line = lines[1][:14] if len(lines[1]) > 14 else lines[1]
 
             # Get dimensions for both lines
             name_bbox = draw.textbbox((0, 0), name_line, font=font)
@@ -730,28 +751,32 @@ class FamilyTreeVisualizer:
             title_width = title_bbox[2] - title_bbox[0]
             line_height = name_bbox[3] - name_bbox[1]
 
-            # Adjust x position for crest
-            text_center_x = x + crest_offset // 2 if crest_img else x
+            # Calculate total width needed (max of name/title + crest)
+            max_text_width = max(name_width, title_width)
+            total_content_width = max_text_width + crest_space
+            content_start_x = x - total_content_width // 2
 
             # Position for two lines centered vertically
             name_y = y - line_height
             title_y = y + 2
 
+            # Text positions (after crest space, centered within text area)
+            text_area_center = content_start_x + crest_space + max_text_width // 2
+
             # Draw name line
-            draw.text((text_center_x - name_width // 2 + 1, name_y + 1), name_line, fill=shadow_color, font=font)
-            draw.text((text_center_x - name_width // 2, name_y), name_line, fill=text_color, font=font)
+            draw.text((text_area_center - name_width // 2 + 1, name_y + 1), name_line, fill=shadow_color, font=font)
+            draw.text((text_area_center - name_width // 2, name_y), name_line, fill=text_color, font=font)
 
             # Draw title line (slightly dimmer)
             title_color = tuple(max(0, c - 30) for c in text_color)
-            draw.text((text_center_x - title_width // 2 + 1, title_y + 1), title_line, fill=shadow_color, font=font)
-            draw.text((text_center_x - title_width // 2, title_y), title_line, fill=title_color, font=font)
+            draw.text((text_area_center - title_width // 2 + 1, title_y + 1), title_line, fill=shadow_color, font=font)
+            draw.text((text_area_center - title_width // 2, title_y), title_line, fill=title_color, font=font)
 
-        # Draw crest image if available (on the left side of text)
-        if crest_img:
-            crest_x = int(x - half_w + 6)
-            crest_y = int(y - crest_img.height // 2)
-            # Paste with alpha mask for transparency
-            img.paste(crest_img, (crest_x, crest_y), crest_img)
+            # Draw crest if available
+            if crest_img:
+                crest_x = int(content_start_x)
+                crest_y = int(y - crest_img.height // 2)
+                img.paste(crest_img, (crest_x, crest_y), crest_img)
 
     def _draw_rounded_rect_filled(self, draw, x1, y1, x2, y2, radius, fill):
         """Draw a filled rounded rectangle."""
@@ -1094,7 +1119,8 @@ class FamilyTreeVisualizer:
         db: "FamilyDatabase",
         user_id: int,
         bot: "Red",
-        depth: int
+        depth: int,
+        guild=None
     ) -> dict:
         """
         Collect family members with level information for hierarchical layout.
@@ -1112,8 +1138,15 @@ class FamilyTreeVisualizer:
 
         async def get_node_info(uid: int) -> dict:
             """Get name and crest URL for a user."""
-            user = bot.get_user(uid)
-            name = user.display_name if user else f"User {uid}"
+            # Try to get server nickname first
+            name = None
+            if guild:
+                member = guild.get_member(uid)
+                if member:
+                    name = member.display_name
+            if not name:
+                user = bot.get_user(uid)
+                name = user.display_name if user else f"User {uid}"
             crest_url = None
 
             # Try to get family profile

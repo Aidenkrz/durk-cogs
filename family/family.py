@@ -677,7 +677,7 @@ class Family(commands.Cog):
 
         async with ctx.typing():
             image_buffer = await self.visualizer.generate_tree(
-                self.db, target.id, self.bot, depth=2
+                self.db, target.id, self.bot, depth=2, guild=ctx.guild
             )
 
             if not image_buffer:
@@ -708,7 +708,7 @@ class Family(commands.Cog):
 
         async with ctx.typing():
             image_buffer = await self.visualizer.generate_server_tree(
-                self.db, self.bot
+                self.db, self.bot, guild=ctx.guild
             )
 
             if not image_buffer:
@@ -890,7 +890,12 @@ class Family(commands.Cog):
         await self.db.set_family_title(ctx.author.id, title)
 
         if title:
-            await ctx.send(f"Your family title has been set to: **{title}**")
+            # Auto-propagate to descendants
+            updated = await self.db.propagate_family_profile(ctx.author.id)
+            msg = f"Your family title has been set to: **{title}**"
+            if updated > 0:
+                msg += f"\n*Inherited by {updated} descendant(s).*"
+            await ctx.send(msg)
         else:
             await ctx.send("Your family title has been cleared.")
 
@@ -904,7 +909,12 @@ class Family(commands.Cog):
         await self.db.set_family_motto(ctx.author.id, motto)
 
         if motto:
-            await ctx.send(f"Your family motto has been set to: *\"{motto}\"*")
+            # Auto-propagate to descendants
+            updated = await self.db.propagate_family_profile(ctx.author.id)
+            msg = f"Your family motto has been set to: *\"{motto}\"*"
+            if updated > 0:
+                msg += f"\n*Inherited by {updated} descendant(s).*"
+            await ctx.send(msg)
         else:
             await ctx.send("Your family motto has been cleared.")
 
@@ -927,15 +937,123 @@ class Family(commands.Cog):
                 return
 
             await self.db.set_family_crest(ctx.author.id, url)
+            # Auto-propagate to descendants
+            updated = await self.db.propagate_family_profile(ctx.author.id)
             embed = discord.Embed(
                 title="Family Crest Set!",
                 color=await ctx.embed_color()
             )
             embed.set_thumbnail(url=url)
+            if updated > 0:
+                embed.set_footer(text=f"Inherited by {updated} descendant(s)")
             await ctx.send(embed=embed)
         else:
             await self.db.set_family_crest(ctx.author.id, None)
             await ctx.send("Your family crest has been cleared.")
+
+    @familyprofile.command(name="propagate")
+    async def familyprofile_propagate(self, ctx: commands.Context):
+        """Manually propagate your family profile to all descendants who don't have their own."""
+        profile = await self.db.get_family_profile(ctx.author.id)
+        if not profile or not any([profile.get("family_title"), profile.get("family_crest_url"), profile.get("family_motto")]):
+            await ctx.send("You don't have a family profile to propagate! Set a title, crest, or motto first.")
+            return
+
+        updated = await self.db.propagate_family_profile(ctx.author.id)
+
+        if updated > 0:
+            await ctx.send(f"Your family profile has been inherited by **{updated}** descendant(s)!")
+        else:
+            await ctx.send("No descendants needed to inherit your profile (they may already have their own).")
+
+    @familyprofile.command(name="inherit")
+    async def familyprofile_inherit(self, ctx: commands.Context, parent: discord.Member = None):
+        """Choose which parent's family profile to inherit. Use without arguments to see options."""
+        parents = await self.db.get_parents(ctx.author.id)
+
+        if not parents:
+            await ctx.send("You don't have any parents to inherit from!")
+            return
+
+        # Get profiles for all parents
+        parent_profiles = []
+        for parent_id in parents:
+            profile = await self.db.get_family_profile(parent_id)
+            if profile and any([profile.get("family_title"), profile.get("family_crest_url"), profile.get("family_motto")]):
+                user = ctx.guild.get_member(parent_id) or self.bot.get_user(parent_id)
+                parent_profiles.append({
+                    "id": parent_id,
+                    "name": user.display_name if user else f"User {parent_id}",
+                    "profile": profile
+                })
+
+        if not parent_profiles:
+            await ctx.send("None of your parents have a family profile set!")
+            return
+
+        if parent is None:
+            # Show available options
+            embed = discord.Embed(
+                title="Available Family Profiles to Inherit",
+                description="Use `.familyprofile inherit @parent` to inherit from a parent.",
+                color=await ctx.embed_color()
+            )
+
+            for p in parent_profiles:
+                profile = p["profile"]
+                value_parts = []
+                if profile.get("family_title"):
+                    value_parts.append(f"**Title:** {profile['family_title']}")
+                if profile.get("family_motto"):
+                    value_parts.append(f"**Motto:** {profile['family_motto']}")
+                if profile.get("family_crest_url"):
+                    value_parts.append("**Has Crest:** Yes")
+                embed.add_field(
+                    name=p["name"],
+                    value="\n".join(value_parts) if value_parts else "No profile",
+                    inline=False
+                )
+
+            await ctx.send(embed=embed)
+            return
+
+        # Check if the specified user is actually a parent
+        if parent.id not in parents:
+            await ctx.send(f"{parent.display_name} is not one of your parents!")
+            return
+
+        # Check if that parent has a profile
+        parent_profile = await self.db.get_family_profile(parent.id)
+        if not parent_profile or not any([parent_profile.get("family_title"), parent_profile.get("family_crest_url"), parent_profile.get("family_motto")]):
+            await ctx.send(f"{parent.display_name} doesn't have a family profile set!")
+            return
+
+        # Force inherit from this parent (overwriting any existing values)
+        async with self.db.db.execute("""
+            INSERT INTO family_profiles (user_id, family_title, family_crest_url, family_motto, updated_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                family_title = excluded.family_title,
+                family_crest_url = excluded.family_crest_url,
+                family_motto = excluded.family_motto,
+                updated_at = CURRENT_TIMESTAMP
+        """, (ctx.author.id, parent_profile.get("family_title"), parent_profile.get("family_crest_url"), parent_profile.get("family_motto"))):
+            pass
+        await self.db.db.commit()
+
+        embed = discord.Embed(
+            title="Family Profile Inherited!",
+            description=f"You have inherited the family profile from **{parent.display_name}**!",
+            color=await ctx.embed_color()
+        )
+        if parent_profile.get("family_title"):
+            embed.add_field(name="Title", value=parent_profile["family_title"], inline=True)
+        if parent_profile.get("family_motto"):
+            embed.add_field(name="Motto", value=parent_profile["family_motto"], inline=True)
+        if parent_profile.get("family_crest_url"):
+            embed.set_thumbnail(url=parent_profile["family_crest_url"])
+
+        await ctx.send(embed=embed)
 
     # === Matchmaking Commands ===
 
@@ -1230,7 +1348,9 @@ class Family(commands.Cog):
             f"`{prefix}familyprofile [@user]` - View family profile\n"
             f"`{prefix}familyprofile title <name>` - Set family title/dynasty\n"
             f"`{prefix}familyprofile motto <text>` - Set family motto\n"
-            f"`{prefix}familyprofile crest [url]` - Set family crest image"
+            f"`{prefix}familyprofile crest [url]` - Set family crest image\n"
+            f"`{prefix}familyprofile inherit [@parent]` - Inherit from a parent\n"
+            f"`{prefix}familyprofile propagate` - Propagate to descendants"
         )
         embed.add_field(
             name="\U0001f3f0 Profile",

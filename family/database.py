@@ -527,3 +527,51 @@ class FamilyDatabase:
                     updated_at = CURRENT_TIMESTAMP
             """, (child_id, title_to_set, crest_to_set, motto_to_set))
             await self.db.commit()
+
+    async def get_all_descendants(self, user_id: int) -> List[int]:
+        """Get all descendants (children, grandchildren, etc.) of a user recursively."""
+        descendants = []
+        to_process = [user_id]
+        processed = set()
+
+        while to_process:
+            current = to_process.pop(0)
+            if current in processed:
+                continue
+            processed.add(current)
+
+            children = await self.get_children(current)
+            for child_id in children:
+                if child_id not in processed and child_id not in descendants:
+                    descendants.append(child_id)
+                    to_process.append(child_id)
+
+        return descendants
+
+    async def propagate_family_profile(self, user_id: int) -> int:
+        """Propagate user's family profile to all descendants who don't have their own.
+        Returns the number of descendants updated."""
+        profile = await self.get_family_profile(user_id)
+        if not profile:
+            return 0
+
+        descendants = await self.get_all_descendants(user_id)
+        updated_count = 0
+
+        for descendant_id in descendants:
+            descendant_profile = await self.get_family_profile(descendant_id)
+
+            # Check what needs to be inherited
+            needs_update = False
+            if profile.get("family_title") and (not descendant_profile or not descendant_profile.get("family_title")):
+                needs_update = True
+            if profile.get("family_crest_url") and (not descendant_profile or not descendant_profile.get("family_crest_url")):
+                needs_update = True
+            if profile.get("family_motto") and (not descendant_profile or not descendant_profile.get("family_motto")):
+                needs_update = True
+
+            if needs_update:
+                await self.inherit_family_profile(descendant_id, user_id)
+                updated_count += 1
+
+        return updated_count
