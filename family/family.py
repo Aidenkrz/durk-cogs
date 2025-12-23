@@ -689,6 +689,38 @@ class Family(commands.Cog):
 
     @commands.command()
     @commands.guild_only()
+    @commands.admin_or_permissions(administrator=True)
+    async def servertree(self, ctx: commands.Context):
+        """Display a visual family tree for everyone in the server with relations."""
+        if not self.visualizer.available:
+            await ctx.send(
+                "Family tree visualization is not available. "
+                "The bot owner needs to install `Pillow`."
+            )
+            return
+
+        async with ctx.typing():
+            image_buffer = await self.visualizer.generate_server_tree(
+                self.db, self.bot
+            )
+
+            if not image_buffer:
+                await ctx.send("No family connections exist yet!")
+                return
+
+            file = discord.File(image_buffer, filename="server_family_tree.png")
+
+            embed = discord.Embed(
+                title="Server Family Tree",
+                description="All family connections in this server",
+                color=await ctx.embed_color()
+            )
+            embed.set_image(url="attachment://server_family_tree.png")
+
+            await ctx.send(embed=embed, file=file)
+
+    @commands.command()
+    @commands.guild_only()
     async def family(self, ctx: commands.Context, user: discord.Member = None):
         """Display family information for a user."""
         target = user or ctx.author

@@ -379,6 +379,24 @@ class FamilyDatabase:
         relatives.update(spouses)
         return len(relatives)
 
+    async def get_all_users_with_relations(self) -> set:
+        """Get all user IDs that have at least one family relation."""
+        users = set()
+
+        # Users in marriages
+        async with self.db.execute("SELECT user1_id, user2_id FROM marriages") as cursor:
+            async for row in cursor:
+                users.add(row[0])
+                users.add(row[1])
+
+        # Users in parent-child relationships
+        async with self.db.execute("SELECT parent_id, child_id FROM parent_child") as cursor:
+            async for row in cursor:
+                users.add(row[0])
+                users.add(row[1])
+
+        return users
+
     async def reset_all(self):
         """Delete all family data (marriages, parent-child relationships, proposals)."""
         await self.db.execute("DELETE FROM marriages")

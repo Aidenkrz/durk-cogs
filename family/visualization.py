@@ -219,6 +219,305 @@ class FamilyTreeVisualizer:
 
         return buffer
 
+    async def generate_server_tree(
+        self,
+        db: "FamilyDatabase",
+        bot: "Red",
+    ) -> Optional[BytesIO]:
+        """Generate a family tree image for all users with relations."""
+        if not PILLOW_AVAILABLE:
+            return None
+
+        # Get all users with at least one relation
+        all_users = await db.get_all_users_with_relations()
+
+        if not all_users:
+            return None
+
+        # Collect all family data
+        family_data = await self._collect_all_families(db, bot, all_users)
+
+        if not family_data['nodes']:
+            return None
+
+        # Calculate positions for all families
+        positions = self._calculate_server_positions(family_data)
+
+        if not positions:
+            return None
+
+        # Layout constants (will be scaled)
+        node_width = 130
+        node_height = 44
+        h_spacing = 170
+        v_spacing = 100
+        margin = 100
+
+        # Calculate image dimensions
+        all_x = [p[0] for p in positions.values()]
+        all_y = [p[1] for p in positions.values()]
+
+        min_x, max_x = min(all_x), max(all_x)
+        min_y, max_y = min(all_y), max(all_y)
+
+        base_width = int((max_x - min_x) * h_spacing + node_width + margin * 2)
+        base_height = int((max_y - min_y) * v_spacing + node_height + margin * 2 + 60)
+
+        # Ensure minimum size
+        base_width = max(800, base_width)
+        base_height = max(600, base_height)
+
+        # Cap maximum size to avoid memory issues
+        max_dimension = 8000
+        if base_width > max_dimension:
+            base_width = max_dimension
+        if base_height > max_dimension:
+            base_height = max_dimension
+
+        # Scale up for high-res
+        width = base_width * self.SCALE
+        height = base_height * self.SCALE
+        h_spacing *= self.SCALE
+        v_spacing *= self.SCALE
+        node_width *= self.SCALE
+        node_height *= self.SCALE
+        margin *= self.SCALE
+
+        # Offset to center the tree
+        offset_x = -min_x * h_spacing + margin + node_width // 2
+        offset_y = -min_y * v_spacing + margin + node_height // 2 + 50 * self.SCALE
+
+        # Create image with gradient background
+        img = Image.new('RGB', (width, height), self.BG_COLOR)
+        draw = ImageDraw.Draw(img)
+
+        # Draw subtle gradient background
+        for y_pos in range(height):
+            ratio = y_pos / height
+            r = int(self.BG_GRADIENT_TOP[0] * (1 - ratio) + self.BG_GRADIENT_BOTTOM[0] * ratio)
+            g = int(self.BG_GRADIENT_TOP[1] * (1 - ratio) + self.BG_GRADIENT_BOTTOM[1] * ratio)
+            b = int(self.BG_GRADIENT_TOP[2] * (1 - ratio) + self.BG_GRADIENT_BOTTOM[2] * ratio)
+            draw.line([(0, y_pos), (width, y_pos)], fill=(r, g, b))
+
+        # Load fonts
+        font_size = 13 * self.SCALE
+        title_font_size = 22 * self.SCALE
+        legend_font_size = 11 * self.SCALE
+
+        try:
+            font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", font_size)
+            font_bold = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
+            title_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", title_font_size)
+            legend_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", legend_font_size)
+        except (IOError, OSError):
+            font = ImageFont.load_default()
+            font_bold = font
+            title_font = font
+            legend_font = font
+
+        # Draw title
+        title = "Server Family Tree"
+        title_bbox = draw.textbbox((0, 0), title, font=title_font)
+        title_width = title_bbox[2] - title_bbox[0]
+        title_x = (width - title_width) // 2
+        draw.text((title_x, 20 * self.SCALE), title, fill=(220, 220, 230), font=title_font)
+
+        # Calculate actual pixel positions for nodes
+        node_positions = {}
+        for uid, (grid_x, grid_y) in positions.items():
+            px = int(grid_x * h_spacing + offset_x)
+            py = int(grid_y * v_spacing + offset_y)
+            node_positions[uid] = (px, py)
+
+        # Separate edges by type
+        parent_child_edges = [(u1, u2, t) for u1, u2, t in family_data['edges'] if t == 'parent_child']
+        marriage_edges = [(u1, u2, t) for u1, u2, t in family_data['edges'] if t == 'marriage']
+
+        # Draw parent-child edges first
+        self._draw_parent_child_edges(draw, parent_child_edges, node_positions, node_width, node_height, v_spacing, family_data)
+
+        # Draw marriage edges
+        self._draw_marriage_edges(draw, marriage_edges, node_positions, node_width, node_height, node_positions)
+
+        # Draw nodes with modern styling
+        for uid, node_data in family_data['nodes'].items():
+            if uid not in node_positions:
+                continue
+
+            x, y = node_positions[uid]
+            colors = self.COLORS.get(node_data['type'], self.COLORS['extended'])
+
+            self._draw_modern_node(
+                draw, x, y, node_width, node_height,
+                colors, node_data['name'], font_bold,
+                is_self=False
+            )
+
+        # Draw modern legend at bottom
+        self._draw_legend(draw, width, height, legend_font, self.SCALE)
+
+        # Scale down with high-quality resampling
+        final_img = img.resize((width // self.SCALE, height // self.SCALE), Image.Resampling.LANCZOS)
+
+        # Save to BytesIO
+        buffer = BytesIO()
+        final_img.save(buffer, format='PNG', optimize=True)
+        buffer.seek(0)
+
+        return buffer
+
+    async def _collect_all_families(
+        self,
+        db: "FamilyDatabase",
+        bot: "Red",
+        all_users: set
+    ) -> Dict:
+        """Collect family data for all users, grouping connected families together."""
+        nodes = {}
+        edges = []
+        levels = {}
+
+        async def get_name(user_id: int) -> str:
+            user = bot.get_user(user_id)
+            if user:
+                return user.display_name[:15]
+            return f"User {user_id}"[:15]
+
+        def add_edge(uid1: int, uid2: int, edge_type: str):
+            edge = (uid1, uid2, edge_type)
+            reverse = (uid2, uid1, edge_type)
+            if edge not in edges and reverse not in edges:
+                edges.append(edge)
+
+        # Process all users
+        for user_id in all_users:
+            if user_id not in nodes:
+                nodes[user_id] = {
+                    'name': await get_name(user_id),
+                    'type': 'extended'
+                }
+                levels[user_id] = 0
+
+            # Get marriages
+            spouses = await db.get_spouses(user_id)
+            for spouse_id in spouses:
+                if spouse_id not in nodes:
+                    nodes[spouse_id] = {
+                        'name': await get_name(spouse_id),
+                        'type': 'extended'
+                    }
+                    levels[spouse_id] = 0
+                add_edge(user_id, spouse_id, 'marriage')
+
+            # Get children
+            children = await db.get_children(user_id)
+            for child_id in children:
+                if child_id not in nodes:
+                    nodes[child_id] = {
+                        'name': await get_name(child_id),
+                        'type': 'extended'
+                    }
+                # Child should be at a lower level than parent
+                if child_id in levels:
+                    if levels[child_id] <= levels[user_id]:
+                        levels[child_id] = levels[user_id] + 1
+                else:
+                    levels[child_id] = levels[user_id] + 1
+                add_edge(user_id, child_id, 'parent_child')
+
+            # Get parents
+            parents = await db.get_parents(user_id)
+            for parent_id in parents:
+                if parent_id not in nodes:
+                    nodes[parent_id] = {
+                        'name': await get_name(parent_id),
+                        'type': 'extended'
+                    }
+                # Parent should be at a higher level than child
+                if parent_id in levels:
+                    if levels[parent_id] >= levels[user_id]:
+                        levels[parent_id] = levels[user_id] - 1
+                else:
+                    levels[parent_id] = levels[user_id] - 1
+                add_edge(parent_id, user_id, 'parent_child')
+
+        # Normalize levels so minimum is 0
+        if levels:
+            min_level = min(levels.values())
+            for uid in levels:
+                levels[uid] -= min_level
+
+        return {
+            'nodes': nodes,
+            'edges': edges,
+            'levels': levels
+        }
+
+    def _calculate_server_positions(self, family_data: Dict) -> Dict[int, Tuple[float, float]]:
+        """Calculate positions for all nodes in a server-wide tree."""
+        nodes = family_data['nodes']
+        edges = family_data['edges']
+        levels = family_data['levels']
+
+        if not nodes:
+            return {}
+
+        # Find connected components (separate family trees)
+        adjacency = defaultdict(set)
+        for uid1, uid2, _ in edges:
+            adjacency[uid1].add(uid2)
+            adjacency[uid2].add(uid1)
+
+        visited = set()
+        components = []
+
+        def dfs(start):
+            component = set()
+            stack = [start]
+            while stack:
+                node = stack.pop()
+                if node in visited:
+                    continue
+                visited.add(node)
+                component.add(node)
+                for neighbor in adjacency[node]:
+                    if neighbor not in visited:
+                        stack.append(neighbor)
+            return component
+
+        for uid in nodes:
+            if uid not in visited:
+                component = dfs(uid)
+                if component:
+                    components.append(component)
+
+        positions = {}
+        x_offset = 0
+
+        # Process each connected component (family tree) separately
+        for component in components:
+            # Group nodes by level within this component
+            level_nodes = defaultdict(list)
+            for uid in component:
+                level = levels.get(uid, 0)
+                level_nodes[level].append(uid)
+
+            # Calculate width of this component
+            max_width = max(len(nodes_at_level) for nodes_at_level in level_nodes.values()) if level_nodes else 1
+
+            # Position nodes within component
+            for level, nodes_at_level in level_nodes.items():
+                num_nodes = len(nodes_at_level)
+                start_x = x_offset + (max_width - num_nodes) / 2
+
+                for i, uid in enumerate(sorted(nodes_at_level)):
+                    positions[uid] = (start_x + i, level)
+
+            # Move offset for next component
+            x_offset += max_width + 2  # Gap between family trees
+
+        return positions
+
     def _draw_modern_node(self, draw, x, y, w, h, colors, name, font, is_self=False):
         """Draw a modern styled node with gradient and shadow."""
         main_color, dark_color = colors
