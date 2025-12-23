@@ -415,14 +415,8 @@ class FamilyTreeVisualizer:
         # Group edges by parent level to route horizontal lines at different heights
         level_edges = defaultdict(list)
         for uid1, uid2, _ in edges:
-            x1, y1 = positions[uid1]
-            x2, y2 = positions[uid2]
-
-            # Determine which is parent (higher up = lower y)
-            if y1 < y2:
-                parent_id, child_id = uid1, uid2
-            else:
-                parent_id, child_id = uid2, uid1
+            # uid1 is always the parent, uid2 is always the child (as stored by add_edge)
+            parent_id, child_id = uid1, uid2
 
             parent_level = family_data['levels'].get(parent_id, 0)
             level_edges[parent_level].append((parent_id, child_id))
@@ -456,15 +450,22 @@ class FamilyTreeVisualizer:
                 for parent_id, child_id, px, py, cx, cy in seg_edges:
                     half_node_h = node_height // 2
 
-                    # Start from bottom of parent, end at top of child
-                    start_y = py + half_node_h
-                    end_y = cy - half_node_h
+                    # Determine visual direction based on actual Y positions
+                    # Parent should be above (lower Y), child below (higher Y)
+                    if py <= cy:
+                        # Normal case: parent above child
+                        start_y = py + half_node_h  # Bottom of parent
+                        end_y = cy - half_node_h    # Top of child
+                    else:
+                        # Unusual case: child above parent visually, draw from top of parent to bottom of child
+                        start_y = py - half_node_h  # Top of parent
+                        end_y = cy + half_node_h    # Bottom of child
 
                     # Calculate mid-point with offset to avoid overlaps
                     mid_y = (start_y + end_y) / 2 + y_offset
 
                     # Draw smooth path: vertical -> horizontal -> vertical
-                    # From parent down
+                    # From parent
                     draw.line([(px, start_y), (px, mid_y)], fill=color, width=line_width)
                     # Horizontal
                     draw.line([(px, mid_y), (cx, mid_y)], fill=color, width=line_width)
@@ -697,6 +698,10 @@ class FamilyTreeVisualizer:
                         'type': parent_type
                     }
                     levels[parent_id] = current_level - 1
+                else:
+                    # Ensure parent is always at a higher level (lower number) than child
+                    if levels[parent_id] >= levels.get(uid, current_level):
+                        levels[parent_id] = levels.get(uid, current_level) - 1
 
                 add_edge(parent_id, uid, 'parent_child')
                 await collect_ancestors(parent_id, current_level - 1, max_level, is_blood)
@@ -725,6 +730,10 @@ class FamilyTreeVisualizer:
                         'type': child_type
                     }
                     levels[child_id] = current_level + 1
+                else:
+                    # Ensure child is always at a lower level (higher number) than parent
+                    if levels[child_id] <= levels.get(uid, current_level):
+                        levels[child_id] = levels.get(uid, current_level) + 1
 
                 add_edge(uid, child_id, 'parent_child')
 
@@ -732,6 +741,9 @@ class FamilyTreeVisualizer:
                 if collect_in_laws:
                     child_spouses = await db.get_spouses(child_id)
                     for spouse_id in child_spouses:
+                        # Check if spouse is already in tree (possible with incest)
+                        spouse_is_blood = spouse_id in nodes and nodes[spouse_id]['type'] not in ('in_law', 'spouse')
+
                         if spouse_id not in nodes:
                             nodes[spouse_id] = {
                                 'name': await get_name(spouse_id),
@@ -740,12 +752,14 @@ class FamilyTreeVisualizer:
                             levels[spouse_id] = current_level + 1
                         add_edge(child_id, spouse_id, 'marriage')
 
-                        # Get the in-law's parents (not blood related)
-                        await collect_ancestors(spouse_id, current_level + 1, max_level, is_blood=False)
+                        # Only traverse spouse's family if they're not already a blood relative
+                        if not spouse_is_blood:
+                            # Get the in-law's parents (not blood related)
+                            await collect_ancestors(spouse_id, current_level + 1, max_level, is_blood=False)
 
-                        # Get descendants of child's spouse (not blood related to central user)
-                        await collect_descendants(spouse_id, current_level + 1, max_level,
-                                                 is_blood_relative=False, collect_in_laws=False)
+                            # Get descendants of child's spouse (not blood related to central user)
+                            await collect_descendants(spouse_id, current_level + 1, max_level,
+                                                     is_blood_relative=False, collect_in_laws=False)
 
                 await collect_descendants(child_id, current_level + 1, max_level,
                                          is_blood_relative=is_blood_relative, collect_in_laws=collect_in_laws)
