@@ -2,7 +2,7 @@
     "author": ["Durk"],
     "install_msg": "Thank you for installing the Family cog! Use `[p]familyhelp` for commands.",
     "name": "Family",
-    "short": "Marriage, adoption, and family tree system.",
+    "short": "Marriage, adoption, and family tree system",
     "description": "A comprehensive family system with marriage, adoption, sire relationships, and visual family trees. Features include proposals with accept/decline buttons, polyamory and incest settings, and network graph visualization of family connections.",
     "tags": [
         "family",
