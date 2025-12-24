@@ -131,10 +131,20 @@ class Family(commands.Cog):
             return guild_val
         return await self.config.get_attr(global_key)()
 
+    async def _check_banned(self, user_id: int) -> bool:
+        """Check if a user is banned from the family system."""
+        return await self.db.is_banned(user_id)
+
     async def _validate_marriage(
         self, ctx: commands.Context, user: discord.Member
     ) -> Optional[str]:
         """Validate a marriage proposal. Returns error message or None if valid."""
+        # Check bans
+        if await self._check_banned(ctx.author.id):
+            return "You are banned from using the family system."
+        if await self._check_banned(user.id):
+            return f"{user.display_name} is banned from using the family system."
+
         if user.bot:
             return "You can't marry a bot!"
 
@@ -176,6 +186,12 @@ class Family(commands.Cog):
         self, ctx: commands.Context, child: discord.Member
     ) -> Optional[str]:
         """Validate an adoption proposal. Returns error message or None if valid."""
+        # Check bans
+        if await self._check_banned(ctx.author.id):
+            return "You are banned from using the family system."
+        if await self._check_banned(child.id):
+            return f"{child.display_name} is banned from using the family system."
+
         if child.bot:
             return "You can't adopt a bot!"
 
@@ -581,6 +597,17 @@ class Family(commands.Cog):
         If you're already a parent, this adds a co-parent.
         If neither of you are parents, both become parents.
         """
+        # Check bans
+        if await self._check_banned(ctx.author.id):
+            await ctx.send("You are banned from using the family system.")
+            return
+        if await self._check_banned(coparent.id):
+            await ctx.send(f"{coparent.display_name} is banned from using the family system.")
+            return
+        if await self._check_banned(child.id):
+            await ctx.send(f"{child.display_name} is banned from using the family system.")
+            return
+
         # Validation
         if coparent.bot or child.bot:
             await ctx.send("Bots cannot be part of family relationships!")
@@ -869,6 +896,16 @@ class Family(commands.Cog):
             if profile.get("family_crest_url"):
                 embed.set_thumbnail(url=profile["family_crest_url"])
                 embed.add_field(name="Family Crest", value="See thumbnail", inline=False)
+            if profile.get("family_owner_id"):
+                owner_id = profile["family_owner_id"]
+                owner = ctx.guild.get_member(owner_id) or self.bot.get_user(owner_id)
+                owner_name = owner.display_name if owner else f"User {owner_id}"
+                is_owner = owner_id == target.id
+                embed.add_field(
+                    name="Family Owner",
+                    value=f"{'You' if is_owner and target.id == ctx.author.id else owner_name}" + (" (You)" if is_owner and target.id != ctx.author.id else ""),
+                    inline=False
+                )
             if profile.get("looking_for_match"):
                 bio = profile.get("match_bio") or "No bio set"
                 embed.add_field(name="Looking for Match", value=bio, inline=False)
@@ -1645,6 +1682,24 @@ class Family(commands.Cog):
             inline=False
         )
 
+        # Admin commands
+        admin_cmds = (
+            f"`{prefix}familyadmin stats` - View system statistics\n"
+            f"`{prefix}familyadmin ban @user [reason]` - Ban user from family system\n"
+            f"`{prefix}familyadmin unban @user` - Unban user\n"
+            f"`{prefix}familyadmin banlist` - View all banned users\n"
+            f"`{prefix}familyadmin deleteuser @user` - Delete all user connections\n"
+            f"`{prefix}familyadmin forcedivorce @u1 @u2` - Force divorce\n"
+            f"`{prefix}familyadmin forcedisown @parent @child` - Force disown\n"
+            f"`{prefix}familyadmin cleanup` - Remove orphaned profiles\n"
+            f"`{prefix}familyadmin userinfo @user` - View user's family info"
+        )
+        embed.add_field(
+            name="\U0001f6e0\ufe0f Admin",
+            value=admin_cmds,
+            inline=False
+        )
+
         embed.set_footer(text="Proposals require the other person to accept!")
 
         await ctx.send(embed=embed)
@@ -1808,3 +1863,229 @@ class Family(commands.Cog):
 
         await self.db.reset_all()
         await ctx.send("✅ All family data has been reset.")
+
+    # === Admin Commands ===
+
+    @commands.group()
+    @commands.guild_only()
+    @commands.admin_or_permissions(administrator=True)
+    async def familyadmin(self, ctx: commands.Context):
+        """Administrative commands for managing the family system."""
+        if ctx.invoked_subcommand is None:
+            await ctx.send_help(ctx.command)
+
+    @familyadmin.command(name="stats")
+    async def familyadmin_stats(self, ctx: commands.Context):
+        """View statistics about the family system."""
+        stats = await self.db.get_statistics()
+
+        embed = discord.Embed(
+            title="Family System Statistics",
+            color=await ctx.embed_color()
+        )
+        embed.add_field(name="Total Marriages", value=str(stats["total_marriages"]), inline=True)
+        embed.add_field(name="Parent-Child Relations", value=str(stats["total_parent_child"]), inline=True)
+        embed.add_field(name="Unique Users", value=str(stats["unique_users"]), inline=True)
+        embed.add_field(name="Family Profiles", value=str(stats["total_profiles"]), inline=True)
+        embed.add_field(name="Banned Users", value=str(stats["total_banned"]), inline=True)
+        embed.add_field(name="Pending Proposals", value=str(stats["pending_proposals"]), inline=True)
+        embed.add_field(name="Looking for Match", value=str(stats["looking_for_match"]), inline=True)
+
+        await ctx.send(embed=embed)
+
+    @familyadmin.command(name="ban")
+    async def familyadmin_ban(self, ctx: commands.Context, user: discord.Member, *, reason: str = None):
+        """Ban a user from using the family system."""
+        if await self.db.is_banned(user.id):
+            await ctx.send(f"{user.display_name} is already banned from the family system.")
+            return
+
+        await self.db.ban_user(user.id, ctx.author.id, reason)
+        msg = f"**{user.display_name}** has been banned from the family system."
+        if reason:
+            msg += f"\nReason: {reason}"
+        await ctx.send(msg)
+
+    @familyadmin.command(name="unban")
+    async def familyadmin_unban(self, ctx: commands.Context, user: discord.Member):
+        """Unban a user from the family system."""
+        if not await self.db.is_banned(user.id):
+            await ctx.send(f"{user.display_name} is not banned from the family system.")
+            return
+
+        await self.db.unban_user(user.id)
+        await ctx.send(f"**{user.display_name}** has been unbanned from the family system.")
+
+    @familyadmin.command(name="banlist")
+    async def familyadmin_banlist(self, ctx: commands.Context):
+        """View all banned users."""
+        bans = await self.db.get_all_bans()
+
+        if not bans:
+            await ctx.send("No users are currently banned from the family system.")
+            return
+
+        embed = discord.Embed(
+            title="Banned Users",
+            color=await ctx.embed_color()
+        )
+
+        for ban in bans[:25]:  # Limit to 25 entries
+            user = self.bot.get_user(ban["user_id"])
+            user_name = user.display_name if user else f"User {ban['user_id']}"
+
+            banned_by = self.bot.get_user(ban["banned_by"])
+            banned_by_name = banned_by.display_name if banned_by else f"User {ban['banned_by']}"
+
+            reason = ban.get("reason") or "No reason provided"
+            embed.add_field(
+                name=user_name,
+                value=f"By: {banned_by_name}\nReason: {reason}",
+                inline=False
+            )
+
+        if len(bans) > 25:
+            embed.set_footer(text=f"Showing 25 of {len(bans)} banned users")
+
+        await ctx.send(embed=embed)
+
+    @familyadmin.command(name="checkban")
+    async def familyadmin_checkban(self, ctx: commands.Context, user: discord.Member):
+        """Check if a user is banned and view ban details."""
+        ban_info = await self.db.get_ban_info(user.id)
+
+        if not ban_info:
+            await ctx.send(f"{user.display_name} is not banned from the family system.")
+            return
+
+        banned_by = self.bot.get_user(ban_info["banned_by"])
+        banned_by_name = banned_by.display_name if banned_by else f"User {ban_info['banned_by']}"
+
+        embed = discord.Embed(
+            title=f"Ban Info: {user.display_name}",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Banned By", value=banned_by_name, inline=True)
+        embed.add_field(name="Banned At", value=ban_info["banned_at"], inline=True)
+        embed.add_field(name="Reason", value=ban_info.get("reason") or "No reason provided", inline=False)
+
+        await ctx.send(embed=embed)
+
+    @familyadmin.command(name="deleteuser")
+    async def familyadmin_deleteuser(self, ctx: commands.Context, user: discord.Member, confirm: str = None):
+        """Delete all family connections for a user."""
+        if confirm != "confirm":
+            await ctx.send(
+                f"⚠️ **WARNING**: This will delete ALL family connections for **{user.display_name}**!\n"
+                f"This includes marriages, parent-child relationships, and their family profile.\n\n"
+                f"To confirm, run: `{ctx.prefix}familyadmin deleteuser {user.mention} confirm`"
+            )
+            return
+
+        counts = await self.db.delete_all_user_connections(user.id)
+
+        embed = discord.Embed(
+            title=f"Deleted Family Data for {user.display_name}",
+            color=discord.Color.orange()
+        )
+        embed.add_field(name="Marriages Removed", value=str(counts["marriages"]), inline=True)
+        embed.add_field(name="Children Removed", value=str(counts["children_removed"]), inline=True)
+        embed.add_field(name="Parents Removed", value=str(counts["parents_removed"]), inline=True)
+        embed.add_field(name="Proposals Cancelled", value=str(counts["proposals"]), inline=True)
+        embed.add_field(name="Profile Deleted", value="Yes" if counts["profile"] else "No", inline=True)
+
+        await ctx.send(embed=embed)
+
+    @familyadmin.command(name="forcedivorce")
+    async def familyadmin_forcedivorce(self, ctx: commands.Context, user1: discord.Member, user2: discord.Member):
+        """Force a divorce between two users."""
+        if not await self.db.are_married(user1.id, user2.id):
+            await ctx.send(f"{user1.display_name} and {user2.display_name} are not married!")
+            return
+
+        await self.db.delete_marriage(user1.id, user2.id)
+
+        embed = discord.Embed(
+            title="Forced Divorce",
+            description=f"**{user1.display_name}** and **{user2.display_name}** have been forcibly divorced.",
+            color=discord.Color.dark_gray()
+        )
+        await ctx.send(embed=embed)
+
+    @familyadmin.command(name="forcedisown")
+    async def familyadmin_forcedisown(self, ctx: commands.Context, parent: discord.Member, child: discord.Member):
+        """Force a parent to disown a child."""
+        if not await self.db.is_parent_of(parent.id, child.id):
+            await ctx.send(f"{parent.display_name} is not a parent of {child.display_name}!")
+            return
+
+        await self.db.delete_parent_child(parent.id, child.id)
+
+        embed = discord.Embed(
+            title="Forced Disown",
+            description=f"**{parent.display_name}** has been forced to disown **{child.display_name}**.",
+            color=discord.Color.dark_gray()
+        )
+        await ctx.send(embed=embed)
+
+    @familyadmin.command(name="cleanup")
+    async def familyadmin_cleanup(self, ctx: commands.Context):
+        """Clean up orphaned family profiles (profiles for users with no connections)."""
+        removed = await self.db.cleanup_all_orphaned_profiles()
+
+        if removed:
+            await ctx.send(f"Cleaned up **{removed}** orphaned family profile(s).")
+        else:
+            await ctx.send("No orphaned family profiles found.")
+
+    @familyadmin.command(name="userinfo")
+    async def familyadmin_userinfo(self, ctx: commands.Context, user: discord.Member):
+        """View detailed family information for a user."""
+        spouses = await self.db.get_spouses(user.id)
+        parents = await self.db.get_parents(user.id)
+        children = await self.db.get_children(user.id)
+        siblings = await self.db.get_siblings(user.id)
+        profile = await self.db.get_family_profile(user.id)
+        is_banned = await self.db.is_banned(user.id)
+
+        embed = discord.Embed(
+            title=f"Family Info: {user.display_name}",
+            color=discord.Color.red() if is_banned else await ctx.embed_color()
+        )
+
+        if is_banned:
+            embed.description = "**This user is BANNED from the family system.**"
+
+        embed.add_field(name="Spouses", value=str(len(spouses)), inline=True)
+        embed.add_field(name="Parents", value=str(len(parents)), inline=True)
+        embed.add_field(name="Children", value=str(len(children)), inline=True)
+        embed.add_field(name="Siblings", value=str(len(siblings)), inline=True)
+
+        if profile:
+            has_profile = any([
+                profile.get("family_title"),
+                profile.get("family_motto"),
+                profile.get("family_crest_url")
+            ])
+            embed.add_field(name="Has Profile", value="Yes" if has_profile else "No", inline=True)
+
+            if profile.get("family_owner_id"):
+                owner = self.bot.get_user(profile["family_owner_id"])
+                owner_name = owner.display_name if owner else f"User {profile['family_owner_id']}"
+                embed.add_field(name="Family Owner", value=owner_name, inline=True)
+        else:
+            embed.add_field(name="Has Profile", value="No", inline=True)
+
+        # List connections
+        if spouses:
+            spouse_names = []
+            for s in spouses:
+                u = self.bot.get_user(s)
+                spouse_names.append(u.display_name if u else f"User {s}")
+            embed.add_field(
+                name="Spouse List",
+                value="\n".join(spouse_names[:10]) + (f"\n...and {len(spouse_names)-10} more" if len(spouse_names) > 10 else ""),
+                inline=False
+            )
+
+        await ctx.send(embed=embed)

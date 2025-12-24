@@ -94,6 +94,15 @@ class FamilyDatabase:
                 FOREIGN KEY (user_id) REFERENCES users(user_id),
                 FOREIGN KEY (family_owner_id) REFERENCES users(user_id)
             );
+
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id INTEGER PRIMARY KEY,
+                banned_by INTEGER NOT NULL,
+                reason TEXT,
+                banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (banned_by) REFERENCES users(user_id)
+            );
         """)
         await self.db.commit()
 
@@ -769,3 +778,157 @@ class FamilyDatabase:
         """, (child_id, title, crest, motto, parent_owner))
         await self.db.commit()
         return True
+
+    # === Ban Operations ===
+
+    async def ban_user(self, user_id: int, banned_by: int, reason: str = None):
+        """Ban a user from using the family system."""
+        await self.db.execute("""
+            INSERT INTO banned_users (user_id, banned_by, reason)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                banned_by = excluded.banned_by,
+                reason = excluded.reason,
+                banned_at = CURRENT_TIMESTAMP
+        """, (user_id, banned_by, reason))
+        await self.db.commit()
+
+    async def unban_user(self, user_id: int) -> bool:
+        """Unban a user. Returns True if user was banned."""
+        cursor = await self.db.execute(
+            "DELETE FROM banned_users WHERE user_id = ?",
+            (user_id,)
+        )
+        await self.db.commit()
+        return cursor.rowcount > 0
+
+    async def is_banned(self, user_id: int) -> bool:
+        """Check if a user is banned."""
+        async with self.db.execute(
+            "SELECT 1 FROM banned_users WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            return await cursor.fetchone() is not None
+
+    async def get_ban_info(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Get ban information for a user."""
+        async with self.db.execute(
+            "SELECT * FROM banned_users WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+
+    async def get_all_bans(self) -> List[Dict[str, Any]]:
+        """Get all banned users."""
+        async with self.db.execute("SELECT * FROM banned_users ORDER BY banned_at DESC") as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    # === User Data Deletion ===
+
+    async def delete_all_user_connections(self, user_id: int) -> Dict[str, int]:
+        """Delete all connections for a user. Returns counts of deleted items."""
+        counts = {}
+
+        # Delete marriages
+        cursor = await self.db.execute(
+            "DELETE FROM marriages WHERE user1_id = ? OR user2_id = ?",
+            (user_id, user_id)
+        )
+        counts["marriages"] = cursor.rowcount
+
+        # Delete parent-child where user is parent
+        cursor = await self.db.execute(
+            "DELETE FROM parent_child WHERE parent_id = ?",
+            (user_id,)
+        )
+        counts["children_removed"] = cursor.rowcount
+
+        # Delete parent-child where user is child
+        cursor = await self.db.execute(
+            "DELETE FROM parent_child WHERE child_id = ?",
+            (user_id,)
+        )
+        counts["parents_removed"] = cursor.rowcount
+
+        # Delete pending proposals involving user
+        cursor = await self.db.execute(
+            "DELETE FROM pending_proposals WHERE proposer_id = ? OR target_id = ?",
+            (user_id, user_id)
+        )
+        counts["proposals"] = cursor.rowcount
+
+        # Clear family profile
+        cursor = await self.db.execute(
+            "DELETE FROM family_profiles WHERE user_id = ?",
+            (user_id,)
+        )
+        counts["profile"] = cursor.rowcount
+
+        await self.db.commit()
+        return counts
+
+    # === Global Cleanup ===
+
+    async def cleanup_all_orphaned_profiles(self) -> int:
+        """
+        Remove family profiles for users who have no family connections.
+        Returns count of profiles removed.
+        """
+        # Get all users with family connections
+        connected_users = await self.get_all_users_with_relations()
+
+        # Delete profiles for users not in connected_users
+        if connected_users:
+            placeholders = ",".join("?" * len(connected_users))
+            cursor = await self.db.execute(f"""
+                DELETE FROM family_profiles
+                WHERE user_id NOT IN ({placeholders})
+                AND (family_title IS NOT NULL OR family_motto IS NOT NULL OR family_crest_url IS NOT NULL)
+            """, tuple(connected_users))
+        else:
+            # No connected users, delete all profiles with content
+            cursor = await self.db.execute("""
+                DELETE FROM family_profiles
+                WHERE family_title IS NOT NULL OR family_motto IS NOT NULL OR family_crest_url IS NOT NULL
+            """)
+
+        await self.db.commit()
+        return cursor.rowcount
+
+    async def get_statistics(self) -> Dict[str, Any]:
+        """Get comprehensive statistics about the family system."""
+        stats = {}
+
+        # Total marriages
+        async with self.db.execute("SELECT COUNT(*) FROM marriages") as cursor:
+            stats["total_marriages"] = (await cursor.fetchone())[0]
+
+        # Total parent-child relationships
+        async with self.db.execute("SELECT COUNT(*) FROM parent_child") as cursor:
+            stats["total_parent_child"] = (await cursor.fetchone())[0]
+
+        # Total unique users with relations
+        users = await self.get_all_users_with_relations()
+        stats["unique_users"] = len(users)
+
+        # Total family profiles
+        async with self.db.execute("SELECT COUNT(*) FROM family_profiles WHERE family_title IS NOT NULL OR family_motto IS NOT NULL OR family_crest_url IS NOT NULL") as cursor:
+            stats["total_profiles"] = (await cursor.fetchone())[0]
+
+        # Total banned users
+        async with self.db.execute("SELECT COUNT(*) FROM banned_users") as cursor:
+            stats["total_banned"] = (await cursor.fetchone())[0]
+
+        # Pending proposals
+        async with self.db.execute("SELECT COUNT(*) FROM pending_proposals WHERE expires_at > datetime('now')") as cursor:
+            stats["pending_proposals"] = (await cursor.fetchone())[0]
+
+        # Users looking for match
+        async with self.db.execute("SELECT COUNT(*) FROM family_profiles WHERE looking_for_match = 1") as cursor:
+            stats["looking_for_match"] = (await cursor.fetchone())[0]
+
+        return stats
