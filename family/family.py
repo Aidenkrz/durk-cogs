@@ -1205,6 +1205,107 @@ class Family(commands.Cog):
         else:
             await ctx.send("All family members are still connected to you!")
 
+    @familyprofile.command(name="claim")
+    async def familyprofile_claim(self, ctx: commands.Context):
+        """Claim ownership of your family profile (if it has no owner)."""
+        profile = await self.db.get_family_profile(ctx.author.id)
+        if not profile:
+            await ctx.send("You don't have a family profile! Set a title, motto, or crest first.")
+            return
+
+        if profile.get("family_owner_id"):
+            owner_id = profile["family_owner_id"]
+            if owner_id == ctx.author.id:
+                await ctx.send("You already own this family profile!")
+            else:
+                owner = ctx.guild.get_member(owner_id) or self.bot.get_user(owner_id)
+                owner_name = owner.display_name if owner else f"User {owner_id}"
+                await ctx.send(f"This family is already owned by **{owner_name}**!")
+            return
+
+        # Claim ownership
+        await self.db.set_family_owner(ctx.author.id, ctx.author.id)
+        await ctx.send(f"You are now the owner of your family profile! Use `.familyprofile propagate` to share it with your descendants.")
+
+    @familyprofile.command(name="setowner")
+    @commands.admin_or_permissions(administrator=True)
+    async def familyprofile_setowner(self, ctx: commands.Context, user: discord.Member, new_owner: discord.Member):
+        """[Admin] Set the owner of a user's family profile."""
+        profile = await self.db.get_family_profile(user.id)
+        if not profile:
+            await ctx.send(f"{user.display_name} doesn't have a family profile!")
+            return
+
+        await self.db.set_family_owner(user.id, new_owner.id)
+        await ctx.send(f"Set **{new_owner.display_name}** as the owner of **{user.display_name}**'s family profile.")
+
+    @familyprofile.command(name="leave")
+    async def familyprofile_leave(self, ctx: commands.Context):
+        """Leave your current family (clears your family profile but keeps matchmaking data)."""
+        profile = await self.db.get_family_profile(ctx.author.id)
+        if not profile:
+            await ctx.send("You don't have a family profile!")
+            return
+
+        if not profile.get("family_owner_id"):
+            await ctx.send("You're not part of any family!")
+            return
+
+        if profile.get("family_owner_id") == ctx.author.id:
+            # Check if there are other members
+            members = await self.db.get_family_members(ctx.author.id)
+            if members:
+                await ctx.send(f"You own this family! You have {len(members)} member(s). "
+                              f"Transfer ownership first with `.familyprofile transfer @user` or use `.familyprofile disband` to remove everyone.")
+                return
+
+        await self.db.remove_from_family(ctx.author.id)
+        await ctx.send("You have left your family. Your family title, motto, and crest have been cleared.")
+
+    @familyprofile.command(name="transfer")
+    async def familyprofile_transfer(self, ctx: commands.Context, new_owner: discord.Member):
+        """Transfer family ownership to another family member."""
+        profile = await self.db.get_family_profile(ctx.author.id)
+        if not profile:
+            await ctx.send("You don't have a family profile!")
+            return
+
+        if profile.get("family_owner_id") != ctx.author.id:
+            await ctx.send("You don't own this family!")
+            return
+
+        # Check if new owner is a family member
+        members = await self.db.get_family_members(ctx.author.id)
+        if new_owner.id not in members and new_owner.id != ctx.author.id:
+            await ctx.send(f"{new_owner.display_name} is not a member of your family!")
+            return
+
+        # Transfer ownership to all members
+        for member_id in members + [ctx.author.id]:
+            await self.db.set_family_owner(member_id, new_owner.id)
+
+        await ctx.send(f"Family ownership has been transferred to **{new_owner.display_name}**!")
+
+    @familyprofile.command(name="disband")
+    async def familyprofile_disband(self, ctx: commands.Context):
+        """Disband your family, removing all members (owner only)."""
+        profile = await self.db.get_family_profile(ctx.author.id)
+        if not profile:
+            await ctx.send("You don't have a family profile!")
+            return
+
+        if profile.get("family_owner_id") != ctx.author.id:
+            await ctx.send("You don't own this family!")
+            return
+
+        members = await self.db.get_family_members(ctx.author.id)
+
+        # Remove all members including self
+        for member_id in members + [ctx.author.id]:
+            await self.db.remove_from_family(member_id)
+
+        await ctx.send(f"Your family has been disbanded. {len(members) + 1} member(s) have had their family profiles cleared.")
+
     # === Matchmaking Commands ===
 
     # Cache for compatibility scores
