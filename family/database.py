@@ -932,3 +932,71 @@ class FamilyDatabase:
             stats["looking_for_match"] = (await cursor.fetchone())[0]
 
         return stats
+
+    async def find_disconnected_family_trees(self) -> List[Set[int]]:
+        """
+        Find all separate/disconnected family trees in the database.
+        Returns a list of sets, each set containing user IDs in a connected tree.
+        """
+        all_users = await self.get_all_users_with_relations()
+
+        if not all_users:
+            return []
+
+        # Find connected components
+        visited = set()
+        components = []
+
+        for user_id in all_users:
+            if user_id not in visited:
+                # BFS to find all connected users
+                connected = await self.get_all_connected_users(user_id)
+                visited.update(connected)
+                components.append(connected)
+
+        return components
+
+    async def get_users_not_connected_to(self, root_user_id: int) -> Set[int]:
+        """
+        Find all users who have relationships but are NOT connected to the specified user.
+        Useful for finding 'orphaned' family trees.
+        """
+        all_users = await self.get_all_users_with_relations()
+        connected_to_root = await self.get_all_connected_users(root_user_id)
+
+        return all_users - connected_to_root
+
+    async def delete_users_relationships(self, user_ids: Set[int]) -> Dict[str, int]:
+        """
+        Delete all relationships for a set of users.
+        Returns counts of deleted items.
+        """
+        if not user_ids:
+            return {"marriages": 0, "parent_child": 0, "profiles": 0}
+
+        counts = {"marriages": 0, "parent_child": 0, "profiles": 0}
+
+        for user_id in user_ids:
+            # Delete marriages
+            cursor = await self.db.execute(
+                "DELETE FROM marriages WHERE user1_id = ? OR user2_id = ?",
+                (user_id, user_id)
+            )
+            counts["marriages"] += cursor.rowcount
+
+            # Delete parent-child relationships
+            cursor = await self.db.execute(
+                "DELETE FROM parent_child WHERE parent_id = ? OR child_id = ?",
+                (user_id, user_id)
+            )
+            counts["parent_child"] += cursor.rowcount
+
+            # Clear family profile
+            cursor = await self.db.execute(
+                "DELETE FROM family_profiles WHERE user_id = ?",
+                (user_id,)
+            )
+            counts["profiles"] += cursor.rowcount
+
+        await self.db.commit()
+        return counts

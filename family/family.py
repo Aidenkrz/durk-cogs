@@ -691,9 +691,16 @@ class Family(commands.Cog):
 
     @commands.command()
     @commands.guild_only()
-    async def tree(self, ctx: commands.Context, user: discord.Member = None):
-        """Display a visual family tree."""
+    async def tree(self, ctx: commands.Context, user: discord.Member = None, depth: int = 4):
+        """Display a visual family tree.
+
+        The depth parameter controls how many generations to show (default 4).
+        Higher values show more of the family but may be slower.
+        """
         target = user or ctx.author
+
+        # Clamp depth to reasonable bounds
+        depth = max(1, min(depth, 10))
 
         if not self.visualizer.available:
             await ctx.send(
@@ -704,7 +711,7 @@ class Family(commands.Cog):
 
         async with ctx.typing():
             image_buffer = await self.visualizer.generate_tree(
-                self.db, target.id, self.bot, depth=2, guild=ctx.guild
+                self.db, target.id, self.bot, depth=depth, guild=ctx.guild
             )
 
             if not image_buffer:
@@ -1685,14 +1692,17 @@ class Family(commands.Cog):
         # Admin commands
         admin_cmds = (
             f"`{prefix}familyadmin stats` - View system statistics\n"
-            f"`{prefix}familyadmin ban @user [reason]` - Ban user from family system\n"
+            f"`{prefix}familyadmin ban @user [reason]` - Ban user\n"
             f"`{prefix}familyadmin unban @user` - Unban user\n"
-            f"`{prefix}familyadmin banlist` - View all banned users\n"
-            f"`{prefix}familyadmin deleteuser @user` - Delete all user connections\n"
+            f"`{prefix}familyadmin banlist` - View banned users\n"
+            f"`{prefix}familyadmin deleteuser @user` - Delete all connections\n"
             f"`{prefix}familyadmin forcedivorce @u1 @u2` - Force divorce\n"
-            f"`{prefix}familyadmin forcedisown @parent @child` - Force disown\n"
+            f"`{prefix}familyadmin forcedisown @p @c` - Force disown\n"
             f"`{prefix}familyadmin cleanup` - Remove orphaned profiles\n"
-            f"`{prefix}familyadmin userinfo @user` - View user's family info"
+            f"`{prefix}familyadmin userinfo @user` - View user info\n"
+            f"`{prefix}familyadmin trees` - View all family trees\n"
+            f"`{prefix}familyadmin orphaned @user` - Find disconnected users\n"
+            f"`{prefix}familyadmin deleteorphaned @user` - Delete disconnected"
         )
         embed.add_field(
             name="\U0001f6e0\ufe0f Admin",
@@ -2087,5 +2097,124 @@ class Family(commands.Cog):
                 value="\n".join(spouse_names[:10]) + (f"\n...and {len(spouse_names)-10} more" if len(spouse_names) > 10 else ""),
                 inline=False
             )
+
+        await ctx.send(embed=embed)
+
+    @familyadmin.command(name="trees")
+    async def familyadmin_trees(self, ctx: commands.Context):
+        """View all separate family trees in the database."""
+        components = await self.db.find_disconnected_family_trees()
+
+        if not components:
+            await ctx.send("No family trees exist yet.")
+            return
+
+        # Sort by size (largest first)
+        components.sort(key=len, reverse=True)
+
+        embed = discord.Embed(
+            title="Family Trees Overview",
+            description=f"Found **{len(components)}** separate family tree(s)",
+            color=await ctx.embed_color()
+        )
+
+        for i, tree in enumerate(components[:10]):  # Show first 10 trees
+            # Get a sample member to identify the tree
+            sample_id = next(iter(tree))
+            sample_user = self.bot.get_user(sample_id)
+            sample_name = sample_user.display_name if sample_user else f"User {sample_id}"
+
+            # Get family title if exists
+            profile = await self.db.get_family_profile(sample_id)
+            title = profile.get("family_title") if profile else None
+
+            tree_name = title or f"Tree #{i+1}"
+            embed.add_field(
+                name=f"{tree_name} ({len(tree)} members)",
+                value=f"Sample: {sample_name}",
+                inline=True
+            )
+
+        if len(components) > 10:
+            embed.set_footer(text=f"Showing 10 of {len(components)} family trees")
+
+        await ctx.send(embed=embed)
+
+    @familyadmin.command(name="orphaned")
+    async def familyadmin_orphaned(self, ctx: commands.Context, root_user: discord.Member):
+        """
+        Find users who have relationships but are NOT connected to the specified user's tree.
+        This finds 'orphaned' family trees that should perhaps not exist.
+        """
+        orphaned = await self.db.get_users_not_connected_to(root_user.id)
+
+        if not orphaned:
+            await ctx.send(f"All users with family relationships are connected to {root_user.display_name}'s family tree!")
+            return
+
+        embed = discord.Embed(
+            title=f"Users Not Connected to {root_user.display_name}",
+            description=f"Found **{len(orphaned)}** user(s) with relationships not connected to this tree.",
+            color=discord.Color.orange()
+        )
+
+        # Show first 20
+        user_list = []
+        for user_id in list(orphaned)[:20]:
+            user = self.bot.get_user(user_id)
+            user_list.append(user.display_name if user else f"User {user_id}")
+
+        embed.add_field(
+            name="Users",
+            value="\n".join(user_list) if user_list else "None",
+            inline=False
+        )
+
+        if len(orphaned) > 20:
+            embed.set_footer(text=f"Showing 20 of {len(orphaned)} users. Use deleteorphaned to remove them.")
+
+        await ctx.send(embed=embed)
+
+    @familyadmin.command(name="deleteorphaned")
+    async def familyadmin_deleteorphaned(self, ctx: commands.Context, root_user: discord.Member, confirm: str = None):
+        """
+        Delete all users who have relationships but are NOT connected to the specified user's tree.
+        WARNING: This permanently removes their family data!
+        """
+        orphaned = await self.db.get_users_not_connected_to(root_user.id)
+
+        if not orphaned:
+            await ctx.send(f"No orphaned users found - all relationships are connected to {root_user.display_name}'s tree.")
+            return
+
+        if confirm != "confirm":
+            # Show preview
+            user_list = []
+            for user_id in list(orphaned)[:10]:
+                user = self.bot.get_user(user_id)
+                user_list.append(user.display_name if user else f"User {user_id}")
+
+            preview = "\n".join(user_list)
+            if len(orphaned) > 10:
+                preview += f"\n...and {len(orphaned) - 10} more"
+
+            await ctx.send(
+                f"⚠️ **WARNING**: This will delete ALL family data for **{len(orphaned)}** user(s) "
+                f"not connected to {root_user.display_name}'s tree!\n\n"
+                f"**Users to be affected:**\n{preview}\n\n"
+                f"To confirm, run: `{ctx.prefix}familyadmin deleteorphaned {root_user.mention} confirm`"
+            )
+            return
+
+        counts = await self.db.delete_users_relationships(orphaned)
+
+        embed = discord.Embed(
+            title="Orphaned Users Deleted",
+            description=f"Removed family data for **{len(orphaned)}** user(s).",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Marriages Deleted", value=str(counts["marriages"]), inline=True)
+        embed.add_field(name="Parent-Child Deleted", value=str(counts["parent_child"]), inline=True)
+        embed.add_field(name="Profiles Deleted", value=str(counts["profiles"]), inline=True)
 
         await ctx.send(embed=embed)
