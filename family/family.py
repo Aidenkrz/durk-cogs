@@ -1055,6 +1055,156 @@ class Family(commands.Cog):
 
         await ctx.send(embed=embed)
 
+    # === Connection/Relationship Commands ===
+
+    @commands.command()
+    @commands.guild_only()
+    async def connection(self, ctx: commands.Context, user1: discord.Member, user2: discord.Member = None):
+        """
+        Show how two people are connected through family relationships.
+        If only one user is specified, shows connection between you and that user.
+        """
+        if user2 is None:
+            user2 = user1
+            user1 = ctx.author
+
+        if user1.id == user2.id:
+            await ctx.send("That's the same person!")
+            return
+
+        path = await self.db.find_relationship_path(user1.id, user2.id)
+
+        if not path:
+            await ctx.send(f"**{user1.display_name}** and **{user2.display_name}** are not connected through any family relationships.")
+            return
+
+        # Build a readable path description
+        embed = discord.Embed(
+            title="Family Connection",
+            description=f"How **{user1.display_name}** and **{user2.display_name}** are connected:",
+            color=await ctx.embed_color()
+        )
+
+        # Create visual path
+        path_parts = []
+        relation_emoji = {
+            'start': '👤',
+            'self': '👤',
+            'spouse': '💕',
+            'parent': '👆',
+            'child': '👇',
+            'sibling': '↔️'
+        }
+
+        for i, step in enumerate(path):
+            user_id = step['user_id']
+            relation = step['relation']
+
+            # Get user name
+            member = ctx.guild.get_member(user_id)
+            if member:
+                name = member.display_name
+            else:
+                user = self.bot.get_user(user_id)
+                name = user.display_name if user else f"User {user_id}"
+
+            emoji = relation_emoji.get(relation, '•')
+
+            if i == 0:
+                path_parts.append(f"**{name}**")
+            else:
+                # Describe the relationship from the previous person's perspective
+                relation_text = {
+                    'spouse': "'s spouse",
+                    'parent': "'s parent",
+                    'child': "'s child",
+                    'sibling': "'s sibling"
+                }.get(relation, f" → {relation} →")
+                path_parts.append(f"{relation_text} **{name}**")
+
+        # Join with arrows for visual flow
+        path_str = "".join(path_parts)
+        embed.add_field(name="Connection Path", value=path_str, inline=False)
+
+        # Count degrees of separation
+        degrees = len(path) - 1
+        embed.set_footer(text=f"{degrees} degree{'s' if degrees != 1 else ''} of separation")
+
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    @commands.guild_only()
+    async def familymembers(self, ctx: commands.Context, user: discord.Member = None):
+        """Show all members of a family (all users with the same family owner)."""
+        target = user or ctx.author
+
+        profile = await self.db.get_family_profile(target.id)
+        if not profile or not profile.get("family_owner_id"):
+            await ctx.send(f"{target.display_name} is not part of any family!")
+            return
+
+        owner_id = profile["family_owner_id"]
+        owner = ctx.guild.get_member(owner_id) or self.bot.get_user(owner_id)
+        owner_name = owner.display_name if owner else f"User {owner_id}"
+
+        members = await self.db.get_family_members(owner_id)
+        # Include owner themselves
+        if owner_id not in members:
+            members = [owner_id] + members
+
+        embed = discord.Embed(
+            title=f"{profile.get('family_title', 'Family')}",
+            description=f"Owned by **{owner_name}**",
+            color=await ctx.embed_color()
+        )
+
+        member_names = []
+        for member_id in members:
+            member = ctx.guild.get_member(member_id) or self.bot.get_user(member_id)
+            name = member.display_name if member else f"User {member_id}"
+            if member_id == owner_id:
+                name = f"👑 {name} (Owner)"
+            member_names.append(name)
+
+        embed.add_field(
+            name=f"Members ({len(members)})",
+            value="\n".join(member_names) if member_names else "No members",
+            inline=False
+        )
+
+        if profile.get("family_crest_url"):
+            embed.set_thumbnail(url=profile["family_crest_url"])
+
+        await ctx.send(embed=embed)
+
+    @familyprofile.command(name="cleanup")
+    async def familyprofile_cleanup(self, ctx: commands.Context):
+        """Remove family membership from anyone no longer connected to you (owner only)."""
+        profile = await self.db.get_family_profile(ctx.author.id)
+        if not profile:
+            await ctx.send("You don't have a family profile!")
+            return
+
+        owner_id = profile.get("family_owner_id")
+        if owner_id != ctx.author.id:
+            owner = ctx.guild.get_member(owner_id) or self.bot.get_user(owner_id)
+            owner_name = owner.display_name if owner else f"User {owner_id}"
+            await ctx.send(f"Only the family owner (**{owner_name}**) can run cleanup!")
+            return
+
+        removed = await self.db.cleanup_disconnected_family_members(ctx.author.id)
+
+        if removed:
+            removed_names = []
+            for user_id in removed:
+                user = ctx.guild.get_member(user_id) or self.bot.get_user(user_id)
+                removed_names.append(user.display_name if user else f"User {user_id}")
+
+            await ctx.send(f"Removed {len(removed)} disconnected member(s) from your family:\n" +
+                          "\n".join(f"• {name}" for name in removed_names))
+        else:
+            await ctx.send("All family members are still connected to you!")
+
     # === Matchmaking Commands ===
 
     # Cache for compatibility scores
@@ -1350,11 +1500,23 @@ class Family(commands.Cog):
             f"`{prefix}familyprofile motto <text>` - Set family motto\n"
             f"`{prefix}familyprofile crest [url]` - Set family crest image\n"
             f"`{prefix}familyprofile inherit [@parent]` - Inherit from a parent\n"
-            f"`{prefix}familyprofile propagate` - Propagate to descendants"
+            f"`{prefix}familyprofile propagate` - Propagate to descendants\n"
+            f"`{prefix}familyprofile cleanup` - Remove disconnected members"
         )
         embed.add_field(
             name="\U0001f3f0 Profile",
             value=profile_cmds,
+            inline=False
+        )
+
+        # Connection commands
+        connection_cmds = (
+            f"`{prefix}connection @user1 [@user2]` - Show how people are connected\n"
+            f"`{prefix}familymembers [@user]` - Show all members of a family"
+        )
+        embed.add_field(
+            name="\U0001f517 Connections",
+            value=connection_cmds,
             inline=False
         )
 

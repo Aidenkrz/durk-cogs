@@ -1,7 +1,7 @@
 import aiosqlite
 import logging
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Set
 from datetime import datetime
 
 log = logging.getLogger("red.DurkCogs.Family.database")
@@ -86,14 +86,23 @@ class FamilyDatabase:
                 family_title TEXT,
                 family_motto TEXT,
                 family_crest_url TEXT,
+                family_owner_id INTEGER,
                 looking_for_match INTEGER DEFAULT 0,
                 match_bio TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(user_id)
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (family_owner_id) REFERENCES users(user_id)
             );
         """)
         await self.db.commit()
+
+        # Migration: Add family_owner_id column if it doesn't exist
+        try:
+            await self.db.execute("ALTER TABLE family_profiles ADD COLUMN family_owner_id INTEGER")
+            await self.db.commit()
+        except Exception:
+            pass  # Column already exists
 
     # === User Operations ===
 
@@ -433,35 +442,41 @@ class FamilyDatabase:
 
     async def set_family_title(self, user_id: int, title: Optional[str]):
         """Set a user's family title (surname, dynasty name, etc.)."""
+        # When setting a title, user becomes owner if they don't have one already
         await self.db.execute("""
-            INSERT INTO family_profiles (user_id, family_title, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO family_profiles (user_id, family_title, family_owner_id, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(user_id) DO UPDATE SET
                 family_title = excluded.family_title,
+                family_owner_id = COALESCE(family_profiles.family_owner_id, excluded.family_owner_id),
                 updated_at = CURRENT_TIMESTAMP
-        """, (user_id, title))
+        """, (user_id, title, user_id))
         await self.db.commit()
 
     async def set_family_motto(self, user_id: int, motto: Optional[str]):
         """Set a user's family motto."""
+        # When setting a motto, user becomes owner if they don't have one already
         await self.db.execute("""
-            INSERT INTO family_profiles (user_id, family_motto, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO family_profiles (user_id, family_motto, family_owner_id, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(user_id) DO UPDATE SET
                 family_motto = excluded.family_motto,
+                family_owner_id = COALESCE(family_profiles.family_owner_id, excluded.family_owner_id),
                 updated_at = CURRENT_TIMESTAMP
-        """, (user_id, motto))
+        """, (user_id, motto, user_id))
         await self.db.commit()
 
     async def set_family_crest(self, user_id: int, crest_url: Optional[str]):
         """Set a user's family crest URL."""
+        # When setting a crest, user becomes owner if they don't have one already
         await self.db.execute("""
-            INSERT INTO family_profiles (user_id, family_crest_url, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO family_profiles (user_id, family_crest_url, family_owner_id, updated_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(user_id) DO UPDATE SET
                 family_crest_url = excluded.family_crest_url,
+                family_owner_id = COALESCE(family_profiles.family_owner_id, excluded.family_owner_id),
                 updated_at = CURRENT_TIMESTAMP
-        """, (user_id, crest_url))
+        """, (user_id, crest_url, user_id))
         await self.db.commit()
 
     async def set_looking_for_match(self, user_id: int, looking: bool, bio: Optional[str] = None):
@@ -555,14 +570,19 @@ class FamilyDatabase:
         if not profile:
             return 0
 
+        # User is the owner (either explicitly or because they set the profile)
+        owner_id = profile.get("family_owner_id") or user_id
+
         descendants = await self.get_all_descendants(user_id)
         updated_count = 0
 
         for descendant_id in descendants:
             descendant_profile = await self.get_family_profile(descendant_id)
 
-            # Check what needs to be inherited
+            # Check what needs to be inherited (including owner)
             needs_update = False
+            if not descendant_profile or not descendant_profile.get("family_owner_id"):
+                needs_update = True
             if profile.get("family_title") and (not descendant_profile or not descendant_profile.get("family_title")):
                 needs_update = True
             if profile.get("family_crest_url") and (not descendant_profile or not descendant_profile.get("family_crest_url")):
@@ -571,7 +591,181 @@ class FamilyDatabase:
                 needs_update = True
 
             if needs_update:
-                await self.inherit_family_profile(descendant_id, user_id)
+                await self.inherit_family_profile_with_owner(descendant_id, user_id)
                 updated_count += 1
 
         return updated_count
+
+    async def find_relationship_path(self, user1_id: int, user2_id: int) -> Optional[List[dict]]:
+        """
+        Find the relationship path between two users using BFS.
+        Returns a list of steps like [{'user_id': X, 'relation': 'parent'}, ...] or None if not connected.
+        """
+        if user1_id == user2_id:
+            return [{'user_id': user1_id, 'relation': 'self'}]
+
+        # BFS to find path
+        from collections import deque
+
+        visited = {user1_id}
+        queue = deque([(user1_id, [{'user_id': user1_id, 'relation': 'start'}])])
+
+        while queue:
+            current_id, path = queue.popleft()
+
+            # Get all connections
+            connections = []
+
+            # Spouses
+            spouses = await self.get_spouses(current_id)
+            for spouse_id in spouses:
+                connections.append((spouse_id, 'spouse'))
+
+            # Parents
+            parents = await self.get_parents(current_id)
+            for parent_id in parents:
+                connections.append((parent_id, 'parent'))
+
+            # Children
+            children = await self.get_children(current_id)
+            for child_id in children:
+                connections.append((child_id, 'child'))
+
+            # Siblings
+            siblings = await self.get_siblings(current_id)
+            for sibling_id in siblings:
+                connections.append((sibling_id, 'sibling'))
+
+            for next_id, relation in connections:
+                if next_id == user2_id:
+                    # Found the target
+                    return path + [{'user_id': next_id, 'relation': relation}]
+
+                if next_id not in visited:
+                    visited.add(next_id)
+                    queue.append((next_id, path + [{'user_id': next_id, 'relation': relation}]))
+
+        return None  # Not connected
+
+    async def get_all_connected_users(self, user_id: int) -> Set[int]:
+        """Get all users connected to this user through any family relationship."""
+        from collections import deque
+
+        connected = set()
+        queue = deque([user_id])
+
+        while queue:
+            current_id = queue.popleft()
+            if current_id in connected:
+                continue
+            connected.add(current_id)
+
+            # Get all connections
+            spouses = await self.get_spouses(current_id)
+            parents = await self.get_parents(current_id)
+            children = await self.get_children(current_id)
+            siblings = await self.get_siblings(current_id)
+
+            for next_id in spouses + parents + children + siblings:
+                if next_id not in connected:
+                    queue.append(next_id)
+
+        return connected
+
+    # === Family Ownership Methods ===
+
+    async def get_family_owner(self, user_id: int) -> Optional[int]:
+        """Get the owner ID of a user's family profile."""
+        async with self.db.execute(
+            "SELECT family_owner_id FROM family_profiles WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+        return None
+
+    async def set_family_owner(self, user_id: int, owner_id: int):
+        """Set the owner of a user's family profile."""
+        await self.db.execute("""
+            UPDATE family_profiles SET family_owner_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        """, (owner_id, user_id))
+        await self.db.commit()
+
+    async def get_family_members(self, owner_id: int) -> List[int]:
+        """Get all users who belong to a family owned by owner_id."""
+        async with self.db.execute(
+            "SELECT user_id FROM family_profiles WHERE family_owner_id = ?",
+            (owner_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+    async def remove_from_family(self, user_id: int):
+        """Remove a user from their family (clear family profile ownership, keep matchmaking data)."""
+        await self.db.execute("""
+            UPDATE family_profiles
+            SET family_title = NULL, family_motto = NULL, family_crest_url = NULL,
+                family_owner_id = NULL, updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ?
+        """, (user_id,))
+        await self.db.commit()
+
+    async def cleanup_disconnected_family_members(self, owner_id: int) -> List[int]:
+        """
+        Remove family membership from anyone not connected to the owner.
+        Returns list of user IDs that were removed.
+        """
+        # Get all users connected to the owner
+        connected = await self.get_all_connected_users(owner_id)
+
+        # Get all current family members
+        members = await self.get_family_members(owner_id)
+
+        # Find members who are no longer connected
+        disconnected = [m for m in members if m not in connected]
+
+        # Remove disconnected members
+        for user_id in disconnected:
+            await self.remove_from_family(user_id)
+
+        return disconnected
+
+    async def inherit_family_profile_with_owner(self, child_id: int, parent_id: int):
+        """
+        Have a child inherit family profile from a parent, including the owner reference.
+        Only inherits if child doesn't already have a family owner.
+        """
+        parent_profile = await self.get_family_profile(parent_id)
+        if not parent_profile:
+            return False
+
+        child_profile = await self.get_family_profile(child_id)
+
+        # Don't override if child already has a family owner
+        if child_profile and child_profile.get("family_owner_id"):
+            return False
+
+        parent_owner = parent_profile.get("family_owner_id") or parent_id
+
+        # Only inherit if parent has profile content
+        if not any([parent_profile.get("family_title"), parent_profile.get("family_crest_url"), parent_profile.get("family_motto")]):
+            return False
+
+        title = parent_profile.get("family_title")
+        crest = parent_profile.get("family_crest_url")
+        motto = parent_profile.get("family_motto")
+
+        await self.db.execute("""
+            INSERT INTO family_profiles (user_id, family_title, family_crest_url, family_motto, family_owner_id, updated_at)
+            VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id) DO UPDATE SET
+                family_title = COALESCE(family_profiles.family_title, excluded.family_title),
+                family_crest_url = COALESCE(family_profiles.family_crest_url, excluded.family_crest_url),
+                family_motto = COALESCE(family_profiles.family_motto, excluded.family_motto),
+                family_owner_id = COALESCE(family_profiles.family_owner_id, excluded.family_owner_id),
+                updated_at = CURRENT_TIMESTAMP
+        """, (child_id, title, crest, motto, parent_owner))
+        await self.db.commit()
+        return True
