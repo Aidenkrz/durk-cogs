@@ -515,7 +515,7 @@ class FamilyDatabase:
             return [dict(row) for row in rows]
 
     async def inherit_family_profile(self, child_id: int, parent_id: int):
-        """Have a child inherit the family title and crest from a parent (if they don't have their own)."""
+        """Have a child inherit the family title, crest, and owner from a parent (if they don't have their own)."""
         parent_profile = await self.get_family_profile(parent_id)
         if not parent_profile:
             return
@@ -526,6 +526,7 @@ class FamilyDatabase:
         title_to_set = None
         crest_to_set = None
         motto_to_set = None
+        owner_to_set = None
 
         if parent_profile.get("family_title"):
             if not child_profile or not child_profile.get("family_title"):
@@ -539,17 +540,23 @@ class FamilyDatabase:
             if not child_profile or not child_profile.get("family_motto"):
                 motto_to_set = parent_profile["family_motto"]
 
+        # Inherit owner if child doesn't have one
+        if parent_profile.get("family_owner_id"):
+            if not child_profile or not child_profile.get("family_owner_id"):
+                owner_to_set = parent_profile["family_owner_id"]
+
         # Apply inheritance
-        if title_to_set or crest_to_set or motto_to_set:
+        if title_to_set or crest_to_set or motto_to_set or owner_to_set:
             await self.db.execute("""
-                INSERT INTO family_profiles (user_id, family_title, family_crest_url, family_motto, updated_at)
-                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO family_profiles (user_id, family_title, family_crest_url, family_motto, family_owner_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(user_id) DO UPDATE SET
                     family_title = COALESCE(family_profiles.family_title, excluded.family_title),
                     family_crest_url = COALESCE(family_profiles.family_crest_url, excluded.family_crest_url),
                     family_motto = COALESCE(family_profiles.family_motto, excluded.family_motto),
+                    family_owner_id = COALESCE(family_profiles.family_owner_id, excluded.family_owner_id),
                     updated_at = CURRENT_TIMESTAMP
-            """, (child_id, title_to_set, crest_to_set, motto_to_set))
+            """, (child_id, title_to_set, crest_to_set, motto_to_set, owner_to_set))
             await self.db.commit()
 
     async def get_all_descendants(self, user_id: int) -> List[int]:
@@ -1000,3 +1007,98 @@ class FamilyDatabase:
 
         await self.db.commit()
         return counts
+
+    async def get_profiles_without_owner(self) -> List[Dict[str, Any]]:
+        """Get all family profiles that have content but no owner set."""
+        async with self.db.execute("""
+            SELECT * FROM family_profiles
+            WHERE family_owner_id IS NULL
+            AND (family_title IS NOT NULL OR family_motto IS NOT NULL OR family_crest_url IS NOT NULL)
+        """) as cursor:
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def repair_profiles_without_owner(self, default_owner_id: int) -> int:
+        """
+        For profiles that have content but no owner, set the owner to the specified user
+        IF the user is connected to that owner.
+        Returns count of profiles repaired.
+        """
+        profiles = await self.get_profiles_without_owner()
+        if not profiles:
+            return 0
+
+        # Get all users connected to the default owner
+        connected = await self.get_all_connected_users(default_owner_id)
+
+        repaired = 0
+        for profile in profiles:
+            user_id = profile["user_id"]
+            if user_id in connected:
+                # This user is connected to the owner, set the owner
+                await self.db.execute("""
+                    UPDATE family_profiles
+                    SET family_owner_id = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE user_id = ?
+                """, (default_owner_id, user_id))
+                repaired += 1
+
+        await self.db.commit()
+        return repaired
+
+    async def clear_profiles_not_connected_to_owner(self) -> int:
+        """
+        Clear family profile data for users who have a family_owner_id set
+        but are no longer connected to that owner via relationships.
+        Returns count of profiles cleared.
+        """
+        # Get all profiles with an owner
+        async with self.db.execute("""
+            SELECT user_id, family_owner_id FROM family_profiles
+            WHERE family_owner_id IS NOT NULL
+            AND (family_title IS NOT NULL OR family_motto IS NOT NULL OR family_crest_url IS NOT NULL)
+        """) as cursor:
+            rows = await cursor.fetchall()
+
+        cleared = 0
+        for row in rows:
+            user_id = row[0]
+            owner_id = row[1]
+
+            # Check if user is connected to owner
+            connected = await self.get_all_connected_users(owner_id)
+            if user_id not in connected:
+                # Not connected - clear their profile
+                await self.remove_from_family(user_id)
+                cleared += 1
+
+        return cleared
+
+    async def clear_profiles_without_relationships(self) -> int:
+        """
+        Clear family profile data for users who have profile content
+        but have NO relationships at all (not in marriages or parent_child tables).
+        Returns count of profiles cleared.
+        """
+        # Get all users who have relationships
+        users_with_relations = await self.get_all_users_with_relations()
+
+        if users_with_relations:
+            placeholders = ",".join("?" * len(users_with_relations))
+            cursor = await self.db.execute(f"""
+                UPDATE family_profiles
+                SET family_title = NULL, family_motto = NULL, family_crest_url = NULL,
+                    family_owner_id = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE user_id NOT IN ({placeholders})
+                AND (family_title IS NOT NULL OR family_motto IS NOT NULL OR family_crest_url IS NOT NULL)
+            """, tuple(users_with_relations))
+        else:
+            cursor = await self.db.execute("""
+                UPDATE family_profiles
+                SET family_title = NULL, family_motto = NULL, family_crest_url = NULL,
+                    family_owner_id = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE family_title IS NOT NULL OR family_motto IS NOT NULL OR family_crest_url IS NOT NULL
+            """)
+
+        await self.db.commit()
+        return cursor.rowcount

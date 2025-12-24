@@ -1692,16 +1692,15 @@ class Family(commands.Cog):
         # Admin commands
         admin_cmds = (
             f"`{prefix}familyadmin stats` - View system statistics\n"
-            f"`{prefix}familyadmin ban @user [reason]` - Ban user\n"
-            f"`{prefix}familyadmin unban @user` - Unban user\n"
-            f"`{prefix}familyadmin banlist` - View banned users\n"
+            f"`{prefix}familyadmin ban/unban/banlist` - Manage bans\n"
             f"`{prefix}familyadmin deleteuser @user` - Delete all connections\n"
             f"`{prefix}familyadmin forcedivorce @u1 @u2` - Force divorce\n"
             f"`{prefix}familyadmin forcedisown @p @c` - Force disown\n"
-            f"`{prefix}familyadmin cleanup` - Remove orphaned profiles\n"
+            f"`{prefix}familyadmin cleanup` - Comprehensive cleanup\n"
+            f"`{prefix}familyadmin repair @owner` - Fix missing owners\n"
             f"`{prefix}familyadmin userinfo @user` - View user info\n"
             f"`{prefix}familyadmin trees` - View all family trees\n"
-            f"`{prefix}familyadmin orphaned @user` - Find disconnected users\n"
+            f"`{prefix}familyadmin orphaned @user` - Find disconnected\n"
             f"`{prefix}familyadmin deleteorphaned @user` - Delete disconnected"
         )
         embed.add_field(
@@ -2040,13 +2039,82 @@ class Family(commands.Cog):
 
     @familyadmin.command(name="cleanup")
     async def familyadmin_cleanup(self, ctx: commands.Context):
-        """Clean up orphaned family profiles (profiles for users with no connections)."""
-        removed = await self.db.cleanup_all_orphaned_profiles()
+        """
+        Clean up orphaned family profiles comprehensively.
 
-        if removed:
-            await ctx.send(f"Cleaned up **{removed}** orphaned family profile(s).")
+        This runs three cleanup operations:
+        1. Clears profiles for users with NO relationships at all
+        2. Clears profiles for users disconnected from their family owner
+        3. Deletes empty profile records
+        """
+        # Step 1: Clear profiles for users with no relationships
+        no_relations = await self.db.clear_profiles_without_relationships()
+
+        # Step 2: Clear profiles for users disconnected from owner
+        disconnected = await self.db.clear_profiles_not_connected_to_owner()
+
+        # Step 3: Delete truly orphaned profile records
+        deleted = await self.db.cleanup_all_orphaned_profiles()
+
+        total = no_relations + disconnected + deleted
+
+        if total:
+            embed = discord.Embed(
+                title="Cleanup Complete",
+                color=discord.Color.green()
+            )
+            embed.add_field(name="No Relationships", value=str(no_relations), inline=True)
+            embed.add_field(name="Disconnected from Owner", value=str(disconnected), inline=True)
+            embed.add_field(name="Empty Records Deleted", value=str(deleted), inline=True)
+            await ctx.send(embed=embed)
         else:
             await ctx.send("No orphaned family profiles found.")
+
+    @familyadmin.command(name="repair")
+    async def familyadmin_repair(self, ctx: commands.Context, owner: discord.Member):
+        """
+        Repair family profiles that are missing owner information.
+
+        This finds all profiles with content but no owner set, and assigns
+        ownership to the specified user IF they are connected via relationships.
+        Profiles for users NOT connected to the owner will be left alone.
+        """
+        # First show how many need repair
+        profiles = await self.db.get_profiles_without_owner()
+
+        if not profiles:
+            await ctx.send("No profiles need repair - all profiles with content have an owner set.")
+            return
+
+        # Get connected users to see how many will be repaired
+        connected = await self.db.get_all_connected_users(owner.id)
+        will_repair = [p for p in profiles if p["user_id"] in connected]
+        will_skip = [p for p in profiles if p["user_id"] not in connected]
+
+        repaired = await self.db.repair_profiles_without_owner(owner.id)
+
+        embed = discord.Embed(
+            title="Profile Repair Complete",
+            color=discord.Color.blue()
+        )
+        embed.add_field(name="Profiles Repaired", value=str(repaired), inline=True)
+        embed.add_field(name="Skipped (not connected)", value=str(len(will_skip)), inline=True)
+
+        if will_skip:
+            skip_names = []
+            for p in will_skip[:5]:
+                user = self.bot.get_user(p["user_id"])
+                skip_names.append(user.display_name if user else f"User {p['user_id']}")
+            if len(will_skip) > 5:
+                skip_names.append(f"...and {len(will_skip) - 5} more")
+            embed.add_field(
+                name="Skipped Users",
+                value="\n".join(skip_names),
+                inline=False
+            )
+            embed.set_footer(text="Skipped users have profiles but aren't connected to the owner. Run cleanup to clear them.")
+
+        await ctx.send(embed=embed)
 
     @familyadmin.command(name="userinfo")
     async def familyadmin_userinfo(self, ctx: commands.Context, user: discord.Member):
