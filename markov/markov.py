@@ -180,7 +180,7 @@ class Markov(commands.Cog):
         )
 
         if text:
-            await message.reply(text, mention_author=False)
+            await message.reply(text, mention_author=True)
 
     @commands.group(invoke_without_command=True)
     @commands.guild_only()
