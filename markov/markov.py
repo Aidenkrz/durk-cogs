@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
+from collections import Counter
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 import discord
 from redbot.core import Config, checks, commands
 from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
 
-from .chain import MarkovChain, sanitize_message
+from .chain import MarkovChain, TokenInfo, sanitize_message
 from .storage import MarkovStorage
 
 log = logging.getLogger("red.DurkCogs.Markov")
@@ -29,6 +32,7 @@ class Markov(commands.Cog):
             "enabled": False,
             "channels": [],  # Whitelisted channel IDs (empty = all)
             "order": 2,  # N-gram order
+            "max_order": 3,  # Max order for backoff
             "min_length": 5,  # Min words in output
             "max_length": 50,  # Max words in output (for admins)
             "user_max_length": 10,  # Max words for normal users
@@ -38,6 +42,9 @@ class Markov(commands.Cog):
 
         self.config.register_guild(**default_guild)
         self._storage: Dict[int, MarkovStorage] = {}
+
+        # Cache for active quiz games
+        self._quiz_games: Dict[int, dict] = {}
 
     async def cog_unload(self) -> None:
         """Clean up storage connections."""
@@ -54,22 +61,69 @@ class Markov(commands.Cog):
         return self._storage[guild_id]
 
     async def _train_message(
-        self, guild_id: int, user_id: int, text: str, order: int
+        self, guild_id: int, user_id: int, text: str, order: int, max_order: int = None
     ) -> None:
         """Train the chain with a message."""
-        chain = MarkovChain(order=order)
+        max_order = max_order or order
+        chain = MarkovChain(order=order, max_order=max_order)
         chain.train(text)
 
         if not chain.chain:
             return
 
         storage = await self._get_storage(guild_id)
+
         # Add to guild chain
         await storage.add_transitions(chain.chain)
         # Add to user chain
         await storage.add_transitions(chain.chain, user_id=user_id)
+
+        # Save enhanced chain data
+        await storage.add_reverse_transitions(chain.reverse_chain)
+        await storage.add_skip_transitions(chain.skip_chain)
+
+        # Save order chains
+        for o, order_chain in chain.order_chains.items():
+            await storage.add_order_transitions(o, order_chain)
+
+        # Save case memory
+        case_data = {k: dict(v.original_forms) for k, v in chain.case_memory.items()}
+        await storage.add_case_memory(case_data)
+
         # Increment message count
         await storage.increment_message_count(user_id)
+
+    async def _load_full_chain(
+        self, guild_id: int, order: int, max_order: int = None, user_id: int = None
+    ) -> MarkovChain:
+        """Load a fully-featured chain from storage."""
+        max_order = max_order or order
+        storage = await self._get_storage(guild_id)
+
+        chain = MarkovChain(order=order, max_order=max_order)
+
+        # Load primary chain
+        if user_id:
+            chain.chain = await storage.get_user_chain(user_id)
+        else:
+            chain.chain = await storage.get_guild_chain()
+
+        # Load enhanced data
+        chain.reverse_chain = await storage.get_reverse_chain()
+        chain.skip_chain = await storage.get_skip_chain()
+        chain.order_chains = await storage.get_all_order_chains()
+
+        # Load case memory
+        case_data = await storage.get_case_memory()
+        for word, forms in case_data.items():
+            chain.case_memory[word] = TokenInfo(lowercase=word)
+            chain.case_memory[word].original_forms = forms
+
+        # Rebuild bloom filter
+        for state in chain.chain:
+            chain.bloom.add(str(state))
+
+        return chain
 
     async def _generate_text(
         self,
@@ -79,27 +133,28 @@ class Markov(commands.Cog):
         max_length: int,
         user_id: Optional[int] = None,
         seed_words: Optional[str] = None,
+        temperature: float = 1.0,
     ) -> str:
         """Generate text from the chain."""
-        storage = await self._get_storage(guild_id)
+        settings = await self.config.guild_from_id(guild_id).all()
+        max_order = settings.get("max_order", order)
 
-        if user_id:
-            chain_data = await storage.get_user_chain(user_id)
-        else:
-            chain_data = await storage.get_guild_chain()
+        chain = await self._load_full_chain(guild_id, order, max_order, user_id)
 
-        if not chain_data:
+        if not chain.chain:
             return ""
-
-        chain = MarkovChain(order=order)
-        chain.chain = chain_data
 
         seed = None
         if seed_words:
             words = seed_words.split()
             seed = chain.find_seed(words)
 
-        return chain.generate(min_words=min_length, max_words=max_length, seed=seed)
+        return chain.generate(
+            min_words=min_length,
+            max_words=max_length,
+            seed=seed,
+            temperature=temperature,
+        )
 
     def _get_max_length(self, member: discord.Member, guild_settings: dict) -> int:
         """Get the maximum length allowed for a user."""
@@ -135,7 +190,11 @@ class Markov(commands.Cog):
             return
 
         await self._train_message(
-            message.guild.id, message.author.id, text, settings["order"]
+            message.guild.id,
+            message.author.id,
+            text,
+            settings["order"],
+            settings.get("max_order", settings["order"]),
         )
 
     @commands.Cog.listener()
@@ -146,7 +205,7 @@ class Markov(commands.Cog):
         if not payload.guild_id:
             return
 
-        # Check if it's the chains emoji (⛓ or ⛓️)
+        # Check if it's the chains emoji
         if payload.emoji.name not in ("\u26d3", "\u26d3\ufe0f"):
             return
 
@@ -235,8 +294,18 @@ class Markov(commands.Cog):
             inline=False,
         )
         embed.add_field(
+            name=f"{prefix}markov fuse @user1 @user2",
+            value="Blend two users' speech patterns together.",
+            inline=False,
+        )
+        embed.add_field(
             name=f"{prefix}markov seed <words>",
             value="Generate text starting from specific words.",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"{prefix}markov quiz",
+            value="Play 'Who Said It?' - guess if text is real or generated.",
             inline=False,
         )
         embed.add_field(
@@ -292,6 +361,185 @@ class Markov(commands.Cog):
         else:
             await ctx.send(f"No chain data for {user.display_name} yet.")
 
+    @markov.command(name="fuse")
+    @commands.guild_only()
+    async def markov_fuse(
+        self,
+        ctx: commands.Context,
+        user1: discord.Member,
+        user2: discord.Member,
+        length: Optional[int] = None,
+    ) -> None:
+        """Fuse two users' speech patterns together."""
+        settings = await self.config.guild(ctx.guild).all()
+        max_allowed = self._get_max_length(ctx.author, settings)
+        max_order = settings.get("max_order", settings["order"])
+
+        if length is None:
+            length = settings["min_length"]
+        else:
+            length = min(length, max_allowed)
+
+        # Load both user chains
+        chain1 = await self._load_full_chain(
+            ctx.guild.id, settings["order"], max_order, user1.id
+        )
+        chain2 = await self._load_full_chain(
+            ctx.guild.id, settings["order"], max_order, user2.id
+        )
+
+        if not chain1.chain:
+            await ctx.send(f"No chain data for {user1.display_name}.")
+            return
+        if not chain2.chain:
+            await ctx.send(f"No chain data for {user2.display_name}.")
+            return
+
+        # Merge with 50/50 blend
+        fused = chain1.merge_weighted(chain2, weight=0.5)
+
+        text = fused.generate(
+            min_words=settings["min_length"],
+            max_words=length,
+        )
+
+        if text:
+            await ctx.send(f"**{user1.display_name} + {user2.display_name}:** {text}")
+        else:
+            await ctx.send("Couldn't generate fused text.")
+
+    @markov.command(name="quiz")
+    @commands.guild_only()
+    async def markov_quiz(self, ctx: commands.Context) -> None:
+        """Play 'Who Said It?' - guess if the message is real or Markov-generated."""
+        settings = await self.config.guild(ctx.guild).all()
+
+        # Check if there's already a game in this channel
+        if ctx.channel.id in self._quiz_games:
+            await ctx.send("A quiz is already running in this channel!")
+            return
+
+        storage = await self._get_storage(ctx.guild.id)
+        stats = await storage.get_stats()
+
+        if not stats["top_contributors"]:
+            await ctx.send("Not enough data to play the quiz. Train the chain first!")
+            return
+
+        # Pick a random user with enough messages
+        eligible_users = [
+            (uid, count) for uid, count in stats["top_contributors"] if count >= 10
+        ]
+        if not eligible_users:
+            await ctx.send("Not enough user data to play the quiz.")
+            return
+
+        user_id, _ = random.choice(eligible_users)
+        member = ctx.guild.get_member(user_id)
+        if not member:
+            await ctx.send("Couldn't find a valid user for the quiz.")
+            return
+
+        # 50% chance real, 50% generated
+        is_real = random.random() < 0.5
+
+        if is_real:
+            # Try to find a real message from this user
+            real_message = None
+            for channel in ctx.guild.text_channels:
+                try:
+                    async for msg in channel.history(limit=500):
+                        if msg.author.id == user_id and len(msg.content.split()) >= 5:
+                            if not msg.content.startswith(ctx.prefix or "."):
+                                real_message = sanitize_message(msg.content)
+                                break
+                except discord.Forbidden:
+                    continue
+                if real_message:
+                    break
+
+            if not real_message:
+                is_real = False  # Fall back to generated
+
+        if not is_real:
+            # Generate fake message
+            text = await self._generate_text(
+                ctx.guild.id,
+                settings["order"],
+                min_length=5,
+                max_length=20,
+                user_id=user_id,
+            )
+            if not text:
+                await ctx.send("Couldn't generate quiz text.")
+                return
+            quiz_text = text
+        else:
+            quiz_text = real_message
+
+        # Store game state
+        self._quiz_games[ctx.channel.id] = {
+            "is_real": is_real,
+            "user": member,
+            "text": quiz_text,
+            "votes": {},  # user_id -> vote (True = real, False = fake)
+        }
+
+        embed = discord.Embed(
+            title="Who Said It?",
+            description=f'**"{quiz_text}"**\n\n- {member.display_name}',
+            color=await ctx.embed_color(),
+        )
+        embed.add_field(
+            name="Is this real or Markov-generated?",
+            value="React with \u2705 for REAL or \u274c for FAKE\nYou have 30 seconds!",
+        )
+
+        msg = await ctx.send(embed=embed)
+        await msg.add_reaction("\u2705")  # checkmark
+        await msg.add_reaction("\u274c")  # X
+
+        # Wait for reactions
+        await asyncio.sleep(30)
+
+        # Collect results
+        game = self._quiz_games.pop(ctx.channel.id, None)
+        if not game:
+            return
+
+        try:
+            msg = await ctx.channel.fetch_message(msg.id)
+        except discord.NotFound:
+            return
+
+        real_votes = 0
+        fake_votes = 0
+
+        for reaction in msg.reactions:
+            if str(reaction.emoji) == "\u2705":
+                real_votes = reaction.count - 1  # Subtract bot's reaction
+            elif str(reaction.emoji) == "\u274c":
+                fake_votes = reaction.count - 1
+
+        answer = "REAL" if game["is_real"] else "MARKOV-GENERATED"
+        winners = real_votes if game["is_real"] else fake_votes
+
+        result_embed = discord.Embed(
+            title="Quiz Results!",
+            description=f'**"{game["text"]}"**\n\nThis was **{answer}**!',
+            color=discord.Color.green() if game["is_real"] else discord.Color.red(),
+        )
+        result_embed.add_field(
+            name="Votes",
+            value=f"Real: {real_votes} | Fake: {fake_votes}",
+        )
+        result_embed.add_field(
+            name="Winners",
+            value=f"{winners} people guessed correctly!",
+        )
+
+        await ctx.send(embed=result_embed)
+
     @markov.command(name="seed")
     @commands.guild_only()
     async def markov_seed(
@@ -327,7 +575,12 @@ class Markov(commands.Cog):
         )
         embed.add_field(
             name="Chain Size",
-            value=f"{stats['state_count']:,} states\n{stats['transition_count']:,} transitions",
+            value=(
+                f"{stats['state_count']:,} states\n"
+                f"{stats['transition_count']:,} transitions\n"
+                f"{stats.get('unique_words', 0):,} unique words\n"
+                f"{stats.get('skip_gram_count', 0):,} skip-grams"
+            ),
             inline=False,
         )
 
@@ -375,6 +628,7 @@ class Markov(commands.Cog):
         )
         embed.add_field(name="Enabled", value="Yes" if settings["enabled"] else "No")
         embed.add_field(name="Order", value=str(settings["order"]))
+        embed.add_field(name="Max Order (backoff)", value=str(settings.get("max_order", settings["order"])))
         embed.add_field(name="User Max Length", value=str(settings["user_max_length"]))
         embed.add_field(name="Admin Max Length", value=str(settings["admin_max_length"]))
 
@@ -496,7 +750,11 @@ class Markov(commands.Cog):
                 continue
 
             await self._train_message(
-                ctx.guild.id, message.author.id, text, settings["order"]
+                ctx.guild.id,
+                message.author.id,
+                text,
+                settings["order"],
+                settings.get("max_order", settings["order"]),
             )
             count += 1
 
@@ -526,7 +784,24 @@ class Markov(commands.Cog):
             await ctx.send("Order must be between 1 and 4.")
             return
         await self.config.guild(ctx.guild).order.set(order)
+        # Also update max_order if it's lower
+        max_order = await self.config.guild(ctx.guild).max_order()
+        if max_order < order:
+            await self.config.guild(ctx.guild).max_order.set(order)
         await ctx.send(f"Set n-gram order to {order}.")
+
+    @markovset.command(name="maxorder")
+    async def markovset_maxorder(self, ctx: commands.Context, max_order: int) -> None:
+        """Set the maximum order for backoff (1-4)."""
+        if max_order < 1 or max_order > 4:
+            await ctx.send("Max order must be between 1 and 4.")
+            return
+        order = await self.config.guild(ctx.guild).order()
+        if max_order < order:
+            await ctx.send(f"Max order cannot be less than current order ({order}).")
+            return
+        await self.config.guild(ctx.guild).max_order.set(max_order)
+        await ctx.send(f"Set max order to {max_order}. Chain will train orders 1-{max_order} for backoff.")
 
     @markovset.command(name="length")
     async def markovset_length(

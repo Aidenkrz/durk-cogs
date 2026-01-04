@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple, Union
 
 import aiosqlite
 
@@ -59,21 +60,46 @@ class MarkovStorage:
                 message_count INTEGER DEFAULT 0
             );
 
+            CREATE TABLE IF NOT EXISTS case_memory (
+                word TEXT PRIMARY KEY,
+                forms TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reverse_chain (
+                state TEXT PRIMARY KEY,
+                transitions TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS skip_chain (
+                state TEXT PRIMARY KEY,
+                transitions TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS order_chains (
+                chain_order INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                transitions TEXT NOT NULL,
+                PRIMARY KEY (chain_order, state)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_user_chains_user
             ON user_chains(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_order_chains_order
+            ON order_chains(chain_order);
             """
         )
         await self._connection.commit()
 
     async def add_transitions(
         self,
-        chain_data: Dict[Tuple[str, ...], List[str]],
+        chain_data: Dict[Tuple[str, ...], Counter],
         user_id: Optional[int] = None,
     ) -> None:
         """Add transitions to the chain.
 
         Args:
-            chain_data: Dictionary mapping states to transitions.
+            chain_data: Dictionary mapping states to Counter of transitions.
             user_id: If provided, add to user's chain. Otherwise, add to guild chain.
         """
         if not chain_data:
@@ -85,35 +111,34 @@ class MarkovStorage:
             await self._add_guild_transitions(chain_data)
 
     async def _add_guild_transitions(
-        self, chain_data: Dict[Tuple[str, ...], List[str]]
+        self, chain_data: Dict[Tuple[str, ...], Counter]
     ) -> None:
         """Add transitions to the guild chain."""
         for state, new_transitions in chain_data.items():
             state_key = json.dumps(list(state))
 
-            # Get existing transitions
             cursor = await self._connection.execute(
                 "SELECT transitions FROM guild_chain WHERE state = ?", (state_key,)
             )
             row = await cursor.fetchone()
 
             if row:
-                existing = json.loads(row[0])
-                existing.extend(new_transitions)
+                existing = Counter(json.loads(row[0]))
+                existing.update(new_transitions)
                 await self._connection.execute(
                     "UPDATE guild_chain SET transitions = ? WHERE state = ?",
-                    (json.dumps(existing), state_key),
+                    (json.dumps(dict(existing)), state_key),
                 )
             else:
                 await self._connection.execute(
                     "INSERT INTO guild_chain (state, transitions) VALUES (?, ?)",
-                    (state_key, json.dumps(new_transitions)),
+                    (state_key, json.dumps(dict(new_transitions))),
                 )
 
         await self._connection.commit()
 
     async def _add_user_transitions(
-        self, user_id: int, chain_data: Dict[Tuple[str, ...], List[str]]
+        self, user_id: int, chain_data: Dict[Tuple[str, ...], Counter]
     ) -> None:
         """Add transitions to a user's chain."""
         for state, new_transitions in chain_data.items():
@@ -126,55 +151,204 @@ class MarkovStorage:
             row = await cursor.fetchone()
 
             if row:
-                existing = json.loads(row[0])
-                existing.extend(new_transitions)
+                existing = Counter(json.loads(row[0]))
+                existing.update(new_transitions)
                 await self._connection.execute(
                     "UPDATE user_chains SET transitions = ? WHERE user_id = ? AND state = ?",
-                    (json.dumps(existing), user_id, state_key),
+                    (json.dumps(dict(existing)), user_id, state_key),
                 )
             else:
                 await self._connection.execute(
                     "INSERT INTO user_chains (user_id, state, transitions) VALUES (?, ?, ?)",
-                    (user_id, state_key, json.dumps(new_transitions)),
+                    (user_id, state_key, json.dumps(dict(new_transitions))),
                 )
 
         await self._connection.commit()
 
-    async def get_guild_chain(self) -> Dict[Tuple[str, ...], List[str]]:
+    async def add_reverse_transitions(
+        self, chain_data: Dict[Tuple[str, ...], Counter]
+    ) -> None:
+        """Add reverse chain transitions."""
+        for state, new_transitions in chain_data.items():
+            state_key = json.dumps(list(state))
+
+            cursor = await self._connection.execute(
+                "SELECT transitions FROM reverse_chain WHERE state = ?", (state_key,)
+            )
+            row = await cursor.fetchone()
+
+            if row:
+                existing = Counter(json.loads(row[0]))
+                existing.update(new_transitions)
+                await self._connection.execute(
+                    "UPDATE reverse_chain SET transitions = ? WHERE state = ?",
+                    (json.dumps(dict(existing)), state_key),
+                )
+            else:
+                await self._connection.execute(
+                    "INSERT INTO reverse_chain (state, transitions) VALUES (?, ?)",
+                    (state_key, json.dumps(dict(new_transitions))),
+                )
+
+        await self._connection.commit()
+
+    async def add_skip_transitions(
+        self, chain_data: Dict[Tuple[str, str], Counter]
+    ) -> None:
+        """Add skip-gram transitions."""
+        for state, new_transitions in chain_data.items():
+            state_key = json.dumps(list(state))
+
+            cursor = await self._connection.execute(
+                "SELECT transitions FROM skip_chain WHERE state = ?", (state_key,)
+            )
+            row = await cursor.fetchone()
+
+            if row:
+                existing = Counter(json.loads(row[0]))
+                existing.update(new_transitions)
+                await self._connection.execute(
+                    "UPDATE skip_chain SET transitions = ? WHERE state = ?",
+                    (json.dumps(dict(existing)), state_key),
+                )
+            else:
+                await self._connection.execute(
+                    "INSERT INTO skip_chain (state, transitions) VALUES (?, ?)",
+                    (state_key, json.dumps(dict(new_transitions))),
+                )
+
+        await self._connection.commit()
+
+    async def add_order_transitions(
+        self, order: int, chain_data: Dict[Tuple[str, ...], Counter]
+    ) -> None:
+        """Add transitions for a specific order chain."""
+        for state, new_transitions in chain_data.items():
+            state_key = json.dumps(list(state))
+
+            cursor = await self._connection.execute(
+                "SELECT transitions FROM order_chains WHERE chain_order = ? AND state = ?",
+                (order, state_key),
+            )
+            row = await cursor.fetchone()
+
+            if row:
+                existing = Counter(json.loads(row[0]))
+                existing.update(new_transitions)
+                await self._connection.execute(
+                    "UPDATE order_chains SET transitions = ? WHERE chain_order = ? AND state = ?",
+                    (json.dumps(dict(existing)), order, state_key),
+                )
+            else:
+                await self._connection.execute(
+                    "INSERT INTO order_chains (chain_order, state, transitions) VALUES (?, ?, ?)",
+                    (order, state_key, json.dumps(dict(new_transitions))),
+                )
+
+        await self._connection.commit()
+
+    async def add_case_memory(self, case_data: Dict[str, Dict[str, int]]) -> None:
+        """Add case memory data."""
+        for word, forms in case_data.items():
+            cursor = await self._connection.execute(
+                "SELECT forms FROM case_memory WHERE word = ?", (word,)
+            )
+            row = await cursor.fetchone()
+
+            if row:
+                existing = Counter(json.loads(row[0]))
+                existing.update(forms)
+                await self._connection.execute(
+                    "UPDATE case_memory SET forms = ? WHERE word = ?",
+                    (json.dumps(dict(existing)), word),
+                )
+            else:
+                await self._connection.execute(
+                    "INSERT INTO case_memory (word, forms) VALUES (?, ?)",
+                    (word, json.dumps(forms)),
+                )
+
+        await self._connection.commit()
+
+    async def get_guild_chain(self) -> Dict[Tuple[str, ...], Counter]:
         """Get the full guild chain.
 
         Returns:
-            Dictionary mapping states to transitions.
+            Dictionary mapping states to Counter of transitions.
         """
         cursor = await self._connection.execute(
             "SELECT state, transitions FROM guild_chain"
         )
         rows = await cursor.fetchall()
 
-        return {tuple(json.loads(row[0])): json.loads(row[1]) for row in rows}
+        return {tuple(json.loads(row[0])): Counter(json.loads(row[1])) for row in rows}
 
-    async def get_user_chain(self, user_id: int) -> Dict[Tuple[str, ...], List[str]]:
+    async def get_user_chain(self, user_id: int) -> Dict[Tuple[str, ...], Counter]:
         """Get a user's chain.
 
         Args:
             user_id: The user ID.
 
         Returns:
-            Dictionary mapping states to transitions.
+            Dictionary mapping states to Counter of transitions.
         """
         cursor = await self._connection.execute(
             "SELECT state, transitions FROM user_chains WHERE user_id = ?", (user_id,)
         )
         rows = await cursor.fetchall()
 
-        return {tuple(json.loads(row[0])): json.loads(row[1]) for row in rows}
+        return {tuple(json.loads(row[0])): Counter(json.loads(row[1])) for row in rows}
+
+    async def get_reverse_chain(self) -> Dict[Tuple[str, ...], Counter]:
+        """Get the reverse chain."""
+        cursor = await self._connection.execute(
+            "SELECT state, transitions FROM reverse_chain"
+        )
+        rows = await cursor.fetchall()
+
+        return {tuple(json.loads(row[0])): Counter(json.loads(row[1])) for row in rows}
+
+    async def get_skip_chain(self) -> Dict[Tuple[str, str], Counter]:
+        """Get the skip-gram chain."""
+        cursor = await self._connection.execute(
+            "SELECT state, transitions FROM skip_chain"
+        )
+        rows = await cursor.fetchall()
+
+        return {tuple(json.loads(row[0])): Counter(json.loads(row[1])) for row in rows}
+
+    async def get_order_chain(self, order: int) -> Dict[Tuple[str, ...], Counter]:
+        """Get a specific order chain."""
+        cursor = await self._connection.execute(
+            "SELECT state, transitions FROM order_chains WHERE chain_order = ?", (order,)
+        )
+        rows = await cursor.fetchall()
+
+        return {tuple(json.loads(row[0])): Counter(json.loads(row[1])) for row in rows}
+
+    async def get_all_order_chains(self) -> Dict[int, Dict[Tuple[str, ...], Counter]]:
+        """Get all order chains."""
+        cursor = await self._connection.execute(
+            "SELECT DISTINCT chain_order FROM order_chains"
+        )
+        orders = [row[0] for row in await cursor.fetchall()]
+
+        result = {}
+        for order in orders:
+            result[order] = await self.get_order_chain(order)
+        return result
+
+    async def get_case_memory(self) -> Dict[str, Counter]:
+        """Get case memory."""
+        cursor = await self._connection.execute(
+            "SELECT word, forms FROM case_memory"
+        )
+        rows = await cursor.fetchall()
+
+        return {row[0]: Counter(json.loads(row[1])) for row in rows}
 
     async def increment_message_count(self, user_id: int) -> None:
-        """Increment a user's message count.
-
-        Args:
-            user_id: The user ID.
-        """
+        """Increment a user's message count."""
         await self._connection.execute(
             """
             INSERT INTO stats (user_id, message_count) VALUES (?, 1)
@@ -185,18 +359,16 @@ class MarkovStorage:
         await self._connection.commit()
 
     async def get_stats(self) -> Dict:
-        """Get chain statistics.
-
-        Returns:
-            Dictionary with guild stats and top contributors.
-        """
-        # Guild chain stats
+        """Get chain statistics."""
+        # Guild chain stats - count total transitions from Counter dicts
         cursor = await self._connection.execute(
-            "SELECT COUNT(*), SUM(json_array_length(transitions)) FROM guild_chain"
+            "SELECT state, transitions FROM guild_chain"
         )
-        row = await cursor.fetchone()
-        state_count = row[0] or 0
-        transition_count = row[1] or 0
+        rows = await cursor.fetchall()
+        state_count = len(rows)
+        transition_count = sum(
+            sum(json.loads(row[1]).values()) for row in rows
+        )
 
         # Top contributors
         cursor = await self._connection.execute(
@@ -204,9 +376,19 @@ class MarkovStorage:
         )
         top_contributors = await cursor.fetchall()
 
+        # Unique words
+        cursor = await self._connection.execute("SELECT COUNT(*) FROM case_memory")
+        unique_words = (await cursor.fetchone())[0] or 0
+
+        # Skip-gram count
+        cursor = await self._connection.execute("SELECT COUNT(*) FROM skip_chain")
+        skip_count = (await cursor.fetchone())[0] or 0
+
         return {
             "state_count": state_count,
             "transition_count": transition_count,
+            "unique_words": unique_words,
+            "skip_gram_count": skip_count,
             "top_contributors": [(row[0], row[1]) for row in top_contributors],
         }
 
@@ -217,16 +399,16 @@ class MarkovStorage:
             DELETE FROM guild_chain;
             DELETE FROM user_chains;
             DELETE FROM stats;
+            DELETE FROM case_memory;
+            DELETE FROM reverse_chain;
+            DELETE FROM skip_chain;
+            DELETE FROM order_chains;
             """
         )
         await self._connection.commit()
 
     async def clear_user(self, user_id: int) -> None:
-        """Clear a specific user's chain data.
-
-        Args:
-            user_id: The user ID to clear.
-        """
+        """Clear a specific user's chain data."""
         await self._connection.execute(
             "DELETE FROM user_chains WHERE user_id = ?", (user_id,)
         )
