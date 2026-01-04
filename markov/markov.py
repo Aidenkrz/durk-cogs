@@ -485,10 +485,12 @@ class Markov(commands.Cog):
             try:
                 stats = await storage.get_stats()
             except MigrationRequiredError:
+                self._quiz_games.pop(ctx.channel.id, None)
                 await ctx.send("Database needs migration. Run `.markovset migrate` first.")
                 return
 
             if not stats["top_contributors"]:
+                self._quiz_games.pop(ctx.channel.id, None)
                 await ctx.send("Not enough data to play the quiz. Train the chain first!")
                 return
 
@@ -497,46 +499,63 @@ class Markov(commands.Cog):
                 (uid, count) for uid, count in stats["top_contributors"] if count >= 20
             ]
             if not eligible_users:
+                self._quiz_games.pop(ctx.channel.id, None)
                 await ctx.send("Not enough user data to play the quiz (need users with 20+ messages).")
                 return
 
-            user_id, _ = random.choice(eligible_users)
-            member = ctx.guild.get_member(user_id)
-            if not member:
-                await ctx.send("Couldn't find a valid user for the quiz.")
-                return
-
-            # Collect 3 real messages from this user
+            # Shuffle eligible users and try each until we find one with enough channel messages
+            random.shuffle(eligible_users)
+            member = None
             real_messages: List[str] = []
-            try:
-                async for msg in ctx.channel.history(limit=500):
-                    if msg.author.id == user_id and len(msg.content.split()) >= 4:
-                        if not msg.content.startswith(ctx.prefix or "."):
-                            sanitized = sanitize_message(msg.content)
-                            if sanitized and len(sanitized) > 10:
-                                real_messages.append(sanitized)
-                                if len(real_messages) >= 3:
-                                    break
-            except discord.Forbidden:
-                pass
 
-            if len(real_messages) < 3:
-                await ctx.send(f"Couldn't find enough messages from {member.display_name} in this channel.")
+            for user_id, _ in eligible_users:
+                candidate = ctx.guild.get_member(user_id)
+                if not candidate:
+                    continue
+
+                # Collect real messages from this user in the current channel
+                real_messages = []
+                try:
+                    async for msg in ctx.channel.history(limit=500):
+                        if msg.author.id == user_id and len(msg.content.split()) >= 4:
+                            if not msg.content.startswith(ctx.prefix or "."):
+                                sanitized = sanitize_message(msg.content)
+                                if sanitized and len(sanitized) > 10:
+                                    real_messages.append(sanitized)
+                                    if len(real_messages) >= 3:
+                                        break
+                except discord.Forbidden:
+                    continue
+
+                if len(real_messages) >= 3:
+                    member = candidate
+                    break
+
+            if not member or len(real_messages) < 3:
+                self._quiz_games.pop(ctx.channel.id, None)
+                await ctx.send("Couldn't find a user with enough messages in this channel for the quiz.")
                 return
 
-            # Generate 1 fake message
+            # Calculate target length based on real messages (average word count)
+            avg_words = sum(len(m.split()) for m in real_messages) // len(real_messages)
+            target_min = max(3, avg_words - 2)
+            target_max = avg_words + 3
+
+            # Generate 1 fake message with similar length
             try:
                 fake_message = await self._generate_text(
                     ctx.guild.id,
                     order,
-                    min_length=5,
-                    max_length=20,
+                    min_length=target_min,
+                    max_length=target_max,
                 )
             except MigrationRequiredError:
+                self._quiz_games.pop(ctx.channel.id, None)
                 await ctx.send("Database needs migration. Run `.markovset migrate` first.")
                 return
 
             if not fake_message:
+                self._quiz_games.pop(ctx.channel.id, None)
                 await ctx.send("Couldn't generate quiz text. Try training more data first.")
                 return
 
@@ -611,7 +630,10 @@ class Markov(commands.Cog):
 
         result_embed = discord.Embed(
             title="Quiz Results!",
-            description=f"The fake message was **#{correct_answer}**:\n\n\"{game['fake_message']}\"",
+            description=(
+                f"**User:** {game['user'].display_name}\n"
+                f"**The fake message was #{correct_answer}:**\n\n\"{game['fake_message']}\""
+            ),
             color=discord.Color.green(),
         )
         result_embed.add_field(
