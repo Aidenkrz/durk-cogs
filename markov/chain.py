@@ -62,36 +62,103 @@ class MarkovChain:
         if not self.chain:
             return ""
 
+        result: List[str] = []
+
         # Use seed or start from beginning
         if seed:
             state = seed
-            result = list(seed) if seed[0] != self.START else []
+            if seed[0] != self.START:
+                result = list(seed)
         else:
             state = (self.START,) * self.order
-            result = []
 
-        attempts = 0
-        max_attempts = 10
+        dead_ends = 0
+        max_dead_ends = 10  # Prevent infinite loops
 
-        while attempts < max_attempts:
-            for _ in range(max_words):
-                if state not in self.chain:
+        while len(result) < max_words and dead_ends < max_dead_ends:
+            if state not in self.chain:
+                # Dead end - try to find a new state using last word(s)
+                new_state = self._find_continuation_state(result)
+                if new_state:
+                    state = new_state
+                    dead_ends += 1
+                    continue
+                else:
                     break
-                next_word = random.choice(self.chain[state])
-                if next_word == self.END:
+
+            next_word = random.choice(self.chain[state])
+
+            if next_word == self.END:
+                # If we haven't reached min_words, try to continue
+                if len(result) < min_words:
+                    # Try to find a state using the last word(s) to continue
+                    new_state = self._find_continuation_state(result)
+                    if new_state:
+                        state = new_state
+                        dead_ends += 1
+                        continue
+                    else:
+                        # No continuation found, try picking a non-END word
+                        alternatives = [w for w in self.chain[state] if w != self.END]
+                        if alternatives:
+                            next_word = random.choice(alternatives)
+                        else:
+                            break
+                else:
                     break
-                result.append(next_word)
-                state = (*state[1:], next_word)
 
-            if len(result) >= min_words:
-                break
-
-            # Retry if too short
-            attempts += 1
-            state = (self.START,) * self.order
-            result = []
+            result.append(next_word)
+            state = (*state[1:], next_word)
 
         return " ".join(result)
+
+    def _find_continuation_state(
+        self, result: List[str]
+    ) -> Optional[Tuple[str, ...]]:
+        """Find a state to continue from based on the last words generated.
+
+        Args:
+            result: The words generated so far.
+
+        Returns:
+            A valid state tuple to continue from, or None.
+        """
+        if not result:
+            # No words yet, start fresh
+            start_state = (self.START,) * self.order
+            if start_state in self.chain:
+                return start_state
+            return None
+
+        # Try to find a state that starts with the last word(s)
+        last_words = result[-self.order :] if len(result) >= self.order else result
+
+        # First, try exact match with last N words
+        if len(last_words) == self.order:
+            candidate = tuple(last_words)
+            if candidate in self.chain:
+                return candidate
+
+        # Try to find any state that starts with the last word
+        last_word = result[-1]
+        candidates = [s for s in self.chain if s[0] == last_word and s[0] != self.START]
+        if candidates:
+            return random.choice(candidates)
+
+        # Last resort: find any state containing the last word
+        candidates = [
+            s for s in self.chain
+            if last_word in s and self.START not in s and self.END not in s
+        ]
+        if candidates:
+            return random.choice(candidates)
+
+        # Nothing found, restart from beginning
+        start_state = (self.START,) * self.order
+        if start_state in self.chain:
+            return start_state
+
+        return None
 
     def find_seed(self, words: List[str]) -> Optional[Tuple[str, ...]]:
         """Find a valid seed state containing the given words.
