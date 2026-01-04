@@ -13,6 +13,12 @@ import aiosqlite
 log = logging.getLogger("red.DurkCogs.Markov")
 
 
+class MigrationRequiredError(Exception):
+    """Raised when the database needs migration to the new format."""
+
+    pass
+
+
 class MarkovStorage:
     """Async SQLite storage for Markov chain data."""
 
@@ -270,6 +276,21 @@ class MarkovStorage:
 
         await self._connection.commit()
 
+    def _parse_transitions(self, data: str) -> Counter:
+        """Parse transitions from JSON.
+
+        Raises:
+            MigrationRequiredError: If data is in old list format.
+        """
+        parsed = json.loads(data)
+        if isinstance(parsed, dict):
+            return Counter(parsed)
+        elif isinstance(parsed, list):
+            raise MigrationRequiredError(
+                "Database is in old format. Run `.markovset migrate` to convert."
+            )
+        return Counter()
+
     async def get_guild_chain(self) -> Dict[Tuple[str, ...], Counter]:
         """Get the full guild chain.
 
@@ -281,7 +302,10 @@ class MarkovStorage:
         )
         rows = await cursor.fetchall()
 
-        return {tuple(json.loads(row[0])): Counter(json.loads(row[1])) for row in rows}
+        return {
+            tuple(json.loads(row[0])): self._parse_transitions(row[1])
+            for row in rows
+        }
 
     async def get_user_chain(self, user_id: int) -> Dict[Tuple[str, ...], Counter]:
         """Get a user's chain.
@@ -297,7 +321,10 @@ class MarkovStorage:
         )
         rows = await cursor.fetchall()
 
-        return {tuple(json.loads(row[0])): Counter(json.loads(row[1])) for row in rows}
+        return {
+            tuple(json.loads(row[0])): self._parse_transitions(row[1])
+            for row in rows
+        }
 
     async def get_reverse_chain(self) -> Dict[Tuple[str, ...], Counter]:
         """Get the reverse chain."""
@@ -359,16 +386,26 @@ class MarkovStorage:
         await self._connection.commit()
 
     async def get_stats(self) -> Dict:
-        """Get chain statistics."""
-        # Guild chain stats - count total transitions from Counter dicts
+        """Get chain statistics.
+
+        Raises:
+            MigrationRequiredError: If data is in old list format.
+        """
+        # Guild chain stats - count total transitions
         cursor = await self._connection.execute(
             "SELECT state, transitions FROM guild_chain"
         )
         rows = await cursor.fetchall()
         state_count = len(rows)
-        transition_count = sum(
-            sum(json.loads(row[1]).values()) for row in rows
-        )
+        transition_count = 0
+        for row in rows:
+            data = json.loads(row[1])
+            if isinstance(data, dict):
+                transition_count += sum(data.values())
+            elif isinstance(data, list):
+                raise MigrationRequiredError(
+                    "Database is in old format. Run `.markovset migrate` to convert."
+                )
 
         # Top contributors
         cursor = await self._connection.execute(
@@ -406,6 +443,48 @@ class MarkovStorage:
             """
         )
         await self._connection.commit()
+
+    async def migrate_to_counter_format(self) -> int:
+        """Migrate old list-based transitions to new Counter/dict format.
+
+        Returns:
+            Number of rows migrated.
+        """
+        migrated = 0
+
+        # Migrate guild_chain
+        cursor = await self._connection.execute(
+            "SELECT state, transitions FROM guild_chain"
+        )
+        rows = await cursor.fetchall()
+        for state_key, transitions_json in rows:
+            parsed = json.loads(transitions_json)
+            if isinstance(parsed, list):
+                # Convert list to Counter dict
+                counter = Counter(parsed)
+                await self._connection.execute(
+                    "UPDATE guild_chain SET transitions = ? WHERE state = ?",
+                    (json.dumps(dict(counter)), state_key),
+                )
+                migrated += 1
+
+        # Migrate user_chains
+        cursor = await self._connection.execute(
+            "SELECT user_id, state, transitions FROM user_chains"
+        )
+        rows = await cursor.fetchall()
+        for user_id, state_key, transitions_json in rows:
+            parsed = json.loads(transitions_json)
+            if isinstance(parsed, list):
+                counter = Counter(parsed)
+                await self._connection.execute(
+                    "UPDATE user_chains SET transitions = ? WHERE user_id = ? AND state = ?",
+                    (json.dumps(dict(counter)), user_id, state_key),
+                )
+                migrated += 1
+
+        await self._connection.commit()
+        return migrated
 
     async def clear_user(self, user_id: int) -> None:
         """Clear a specific user's chain data."""

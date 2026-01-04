@@ -15,7 +15,7 @@ from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
 
 from .chain import MarkovChain, TokenInfo, sanitize_message
-from .storage import MarkovStorage
+from .storage import MarkovStorage, MigrationRequiredError
 
 log = logging.getLogger("red.DurkCogs.Markov")
 
@@ -172,6 +172,10 @@ class Markov(commands.Cog):
         if not message.content:
             return
 
+        # Skip messages starting with bot prefix (commands)
+        if message.content.startswith("."):
+            return
+
         # Check if this looks like a command
         ctx = await self.bot.get_context(message)
         if ctx.valid:
@@ -231,12 +235,16 @@ class Markov(commands.Cog):
             return
 
         # Generate a short response
-        text = await self._generate_text(
-            guild.id,
-            settings["order"],
-            min_length=3,
-            max_length=15,
-        )
+        try:
+            text = await self._generate_text(
+                guild.id,
+                settings["order"],
+                min_length=3,
+                max_length=15,
+            )
+        except MigrationRequiredError:
+            # Silently fail for reactions - user needs to run migrate command
+            return
 
         if text:
             await message.reply(text, mention_author=True)
@@ -256,12 +264,16 @@ class Markov(commands.Cog):
         else:
             length = min(length, max_allowed)
 
-        text = await self._generate_text(
-            ctx.guild.id,
-            settings["order"],
-            min_length=settings["min_length"],
-            max_length=length,
-        )
+        try:
+            text = await self._generate_text(
+                ctx.guild.id,
+                settings["order"],
+                min_length=settings["min_length"],
+                max_length=length,
+            )
+        except MigrationRequiredError:
+            await ctx.send("Database needs migration. Run `.markovset migrate` first.")
+            return
 
         if text:
             await ctx.send(text)
@@ -348,13 +360,17 @@ class Markov(commands.Cog):
         else:
             length = min(length, max_allowed)
 
-        text = await self._generate_text(
-            ctx.guild.id,
-            settings["order"],
-            min_length=settings["min_length"],
-            max_length=length,
-            user_id=user.id,
-        )
+        try:
+            text = await self._generate_text(
+                ctx.guild.id,
+                settings["order"],
+                min_length=settings["min_length"],
+                max_length=length,
+                user_id=user.id,
+            )
+        except MigrationRequiredError:
+            await ctx.send("Database needs migration. Run `.markovset migrate` first.")
+            return
 
         if text:
             await ctx.send(f"**{user.display_name}:** {text}")
@@ -381,12 +397,16 @@ class Markov(commands.Cog):
             length = min(length, max_allowed)
 
         # Load both user chains
-        chain1 = await self._load_full_chain(
-            ctx.guild.id, settings["order"], max_order, user1.id
-        )
-        chain2 = await self._load_full_chain(
-            ctx.guild.id, settings["order"], max_order, user2.id
-        )
+        try:
+            chain1 = await self._load_full_chain(
+                ctx.guild.id, settings["order"], max_order, user1.id
+            )
+            chain2 = await self._load_full_chain(
+                ctx.guild.id, settings["order"], max_order, user2.id
+            )
+        except MigrationRequiredError:
+            await ctx.send("Database needs migration. Run `.markovset migrate` first.")
+            return
 
         if not chain1.chain:
             await ctx.send(f"No chain data for {user1.display_name}.")
@@ -420,7 +440,11 @@ class Markov(commands.Cog):
             return
 
         storage = await self._get_storage(ctx.guild.id)
-        stats = await storage.get_stats()
+        try:
+            stats = await storage.get_stats()
+        except MigrationRequiredError:
+            await ctx.send("Database needs migration. Run `.markovset migrate` first.")
+            return
 
         if not stats["top_contributors"]:
             await ctx.send("Not enough data to play the quiz. Train the chain first!")
@@ -463,13 +487,17 @@ class Markov(commands.Cog):
 
         if not is_real:
             # Generate fake message
-            text = await self._generate_text(
-                ctx.guild.id,
-                settings["order"],
-                min_length=5,
-                max_length=20,
-                user_id=user_id,
-            )
+            try:
+                text = await self._generate_text(
+                    ctx.guild.id,
+                    settings["order"],
+                    min_length=5,
+                    max_length=20,
+                    user_id=user_id,
+                )
+            except MigrationRequiredError:
+                await ctx.send("Database needs migration. Run `.markovset migrate` first.")
+                return
             if not text:
                 await ctx.send("Couldn't generate quiz text.")
                 return
@@ -549,13 +577,17 @@ class Markov(commands.Cog):
         settings = await self.config.guild(ctx.guild).all()
         max_allowed = self._get_max_length(ctx.author, settings)
 
-        text = await self._generate_text(
-            ctx.guild.id,
-            settings["order"],
-            min_length=settings["min_length"],
-            max_length=max_allowed,
-            seed_words=seed_words,
-        )
+        try:
+            text = await self._generate_text(
+                ctx.guild.id,
+                settings["order"],
+                min_length=settings["min_length"],
+                max_length=max_allowed,
+                seed_words=seed_words,
+            )
+        except MigrationRequiredError:
+            await ctx.send("Database needs migration. Run `.markovset migrate` first.")
+            return
 
         if text:
             await ctx.send(text)
@@ -567,7 +599,11 @@ class Markov(commands.Cog):
     async def markov_stats(self, ctx: commands.Context) -> None:
         """Show Markov chain statistics."""
         storage = await self._get_storage(ctx.guild.id)
-        stats = await storage.get_stats()
+        try:
+            stats = await storage.get_stats()
+        except MigrationRequiredError:
+            await ctx.send("Database needs migration. Run `.markovset migrate` first.")
+            return
 
         embed = discord.Embed(
             title="Markov Chain Stats",
@@ -818,3 +854,23 @@ class Markov(commands.Cog):
         await self.config.guild(ctx.guild).user_max_length.set(user_max)
         await self.config.guild(ctx.guild).admin_max_length.set(admin_max)
         await ctx.send(f"Set user max length to {user_max}, admin max length to {admin_max}.")
+
+    @markovset.command(name="migrate")
+    async def markovset_migrate(self, ctx: commands.Context) -> None:
+        """Migrate old database format to new weighted format.
+
+        Run this once after updating if you have existing chain data.
+        """
+        storage = await self._get_storage(ctx.guild.id)
+
+        msg = await ctx.send("Migrating database to new format...")
+
+        try:
+            migrated = await storage.migrate_to_counter_format()
+            if migrated > 0:
+                await msg.edit(content=f"Migration complete! Converted {migrated:,} rows to new format.")
+            else:
+                await msg.edit(content="No migration needed - database already in new format.")
+        except Exception as e:
+            log.error(f"Migration failed: {e}", exc_info=True)
+            await msg.edit(content=f"Migration failed: {e}")
