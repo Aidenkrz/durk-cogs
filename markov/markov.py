@@ -146,8 +146,8 @@ class Markov(commands.Cog):
         if not payload.guild_id:
             return
 
-        # Check if it's the chains emoji
-        if payload.emoji.name != "\U0001f517":  # :chains: emoji
+        # Check if it's the chains emoji (⛓ or ⛓️)
+        if payload.emoji.name not in ("\u26d3", "\u26d3\ufe0f"):
             return
 
         guild = self.bot.get_guild(payload.guild_id)
