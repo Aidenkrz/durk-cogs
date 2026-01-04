@@ -439,7 +439,9 @@ class Markov(commands.Cog):
     async def markov_quiz(
         self, ctx: commands.Context, order: Optional[int] = None, duration: Optional[int] = None
     ) -> None:
-        """Play 'Who Said It?' - guess if the message is real or Markov-generated.
+        """Play 'Spot the Fake' - guess which message is Markov-generated.
+
+        Shows 3 real messages and 1 fake one. Pick the fake!
 
         Admins can optionally specify:
         - order: The n-gram order to use (1-4)
@@ -475,56 +477,56 @@ class Markov(commands.Cog):
             await ctx.send("A quiz is already running in this channel!")
             return
 
-        storage = await self._get_storage(ctx.guild.id)
+        # Immediately reserve the slot to prevent duplicate quizzes
+        self._quiz_games[ctx.channel.id] = {"pending": True}
+
         try:
-            stats = await storage.get_stats()
-        except MigrationRequiredError:
-            await ctx.send("Database needs migration. Run `.markovset migrate` first.")
-            return
-
-        if not stats["top_contributors"]:
-            await ctx.send("Not enough data to play the quiz. Train the chain first!")
-            return
-
-        # Pick a random user with enough messages
-        eligible_users = [
-            (uid, count) for uid, count in stats["top_contributors"] if count >= 10
-        ]
-        if not eligible_users:
-            await ctx.send("Not enough user data to play the quiz.")
-            return
-
-        user_id, _ = random.choice(eligible_users)
-        member = ctx.guild.get_member(user_id)
-        if not member:
-            await ctx.send("Couldn't find a valid user for the quiz.")
-            return
-
-        # 50% chance real, 50% generated
-        is_real = random.random() < 0.5
-
-        if is_real:
-            # Try to find a real message from this user
-            real_message = None
-            for channel in ctx.guild.text_channels:
-                try:
-                    async for msg in channel.history(limit=500):
-                        if msg.author.id == user_id and len(msg.content.split()) >= 5:
-                            if not msg.content.startswith(ctx.prefix or "."):
-                                real_message = sanitize_message(msg.content)
-                                break
-                except discord.Forbidden:
-                    continue
-                if real_message:
-                    break
-
-            if not real_message:
-                is_real = False  # Fall back to generated
-
-        if not is_real:
-            # Generate fake message using guild chain (more reliable than user chain)
+            storage = await self._get_storage(ctx.guild.id)
             try:
-                text = await self._generate_text(
+                stats = await storage.get_stats()
+            except MigrationRequiredError:
+                await ctx.send("Database needs migration. Run `.markovset migrate` first.")
+                return
+
+            if not stats["top_contributors"]:
+                await ctx.send("Not enough data to play the quiz. Train the chain first!")
+                return
+
+            # Pick a random user with enough messages
+            eligible_users = [
+                (uid, count) for uid, count in stats["top_contributors"] if count >= 20
+            ]
+            if not eligible_users:
+                await ctx.send("Not enough user data to play the quiz (need users with 20+ messages).")
+                return
+
+            user_id, _ = random.choice(eligible_users)
+            member = ctx.guild.get_member(user_id)
+            if not member:
+                await ctx.send("Couldn't find a valid user for the quiz.")
+                return
+
+            # Collect 3 real messages from this user
+            real_messages: List[str] = []
+            try:
+                async for msg in ctx.channel.history(limit=500):
+                    if msg.author.id == user_id and len(msg.content.split()) >= 4:
+                        if not msg.content.startswith(ctx.prefix or "."):
+                            sanitized = sanitize_message(msg.content)
+                            if sanitized and len(sanitized) > 10:
+                                real_messages.append(sanitized)
+                                if len(real_messages) >= 3:
+                                    break
+            except discord.Forbidden:
+                pass
+
+            if len(real_messages) < 3:
+                await ctx.send(f"Couldn't find enough messages from {member.display_name} in this channel.")
+                return
+
+            # Generate 1 fake message
+            try:
+                fake_message = await self._generate_text(
                     ctx.guild.id,
                     order,
                     min_length=5,
@@ -533,34 +535,51 @@ class Markov(commands.Cog):
             except MigrationRequiredError:
                 await ctx.send("Database needs migration. Run `.markovset migrate` first.")
                 return
-            if not text:
+
+            if not fake_message:
                 await ctx.send("Couldn't generate quiz text. Try training more data first.")
                 return
-            quiz_text = text
-        else:
-            quiz_text = real_message
 
-        embed = discord.Embed(
-            title="Who Said It?",
-            description=f'**"{quiz_text}"**\n\n- {member.display_name}',
-            color=await ctx.embed_color(),
-        )
-        embed.add_field(
-            name="Is this real or Markov-generated?",
-            value=f"React with \u2705 for REAL or \u274c for FAKE\nYou have {duration} seconds!",
-        )
+            # Combine and shuffle - track which index is fake
+            all_messages = real_messages + [fake_message]
+            indices = list(range(4))
+            random.shuffle(indices)
 
-        quiz_msg = await ctx.send(embed=embed)
-        await quiz_msg.add_reaction("\u2705")  # checkmark
-        await quiz_msg.add_reaction("\u274c")  # X
+            # Find where the fake ended up (it was at index 3 before shuffle)
+            fake_index = indices.index(3)
+            shuffled_messages = [all_messages[i] for i in indices]
 
-        # Store game state with message ID to prevent race conditions
-        self._quiz_games[ctx.channel.id] = {
-            "message_id": quiz_msg.id,
-            "is_real": is_real,
-            "user": member,
-            "text": quiz_text,
-        }
+            # Number emojis for reactions
+            number_emojis = ["1\u20e3", "2\u20e3", "3\u20e3", "4\u20e3"]
+
+            # Build the quiz embed
+            description_lines = [f"**{member.display_name} said 3 of these. One is fake!**\n"]
+            for i, msg in enumerate(shuffled_messages, 1):
+                description_lines.append(f"{i}. \"{msg}\"")
+
+            embed = discord.Embed(
+                title="🔍 Spot the Fake!",
+                description="\n".join(description_lines),
+                color=await ctx.embed_color(),
+            )
+            embed.set_footer(text=f"React with the number of the fake message! You have {duration} seconds.")
+
+            quiz_msg = await ctx.send(embed=embed)
+            for emoji in number_emojis:
+                await quiz_msg.add_reaction(emoji)
+
+            # Update game state with actual quiz info
+            self._quiz_games[ctx.channel.id] = {
+                "message_id": quiz_msg.id,
+                "fake_index": fake_index,
+                "fake_message": fake_message,
+                "user": member,
+            }
+
+        except Exception:
+            # Clean up on any error during setup
+            self._quiz_games.pop(ctx.channel.id, None)
+            raise
 
         # Wait for reactions
         await asyncio.sleep(duration)
@@ -568,7 +587,6 @@ class Markov(commands.Cog):
         # Collect results - verify this is still our game
         game = self._quiz_games.get(ctx.channel.id)
         if not game or game.get("message_id") != quiz_msg.id:
-            # Another quiz took over or game was cleared
             return
 
         # Now safe to remove
@@ -579,30 +597,30 @@ class Markov(commands.Cog):
         except discord.NotFound:
             return
 
-        real_votes = 0
-        fake_votes = 0
-
+        # Count votes for each option
+        votes = [0, 0, 0, 0]
         for reaction in quiz_msg.reactions:
-            if str(reaction.emoji) == "\u2705":
-                real_votes = reaction.count - 1  # Subtract bot's reaction
-            elif str(reaction.emoji) == "\u274c":
-                fake_votes = reaction.count - 1
+            emoji_str = str(reaction.emoji)
+            for i, num_emoji in enumerate(number_emojis):
+                if emoji_str == num_emoji:
+                    votes[i] = reaction.count - 1  # Subtract bot's reaction
+                    break
 
-        answer = "REAL" if game["is_real"] else "MARKOV-GENERATED"
-        winners = real_votes if game["is_real"] else fake_votes
+        correct_answer = game["fake_index"] + 1  # 1-indexed for display
+        winners = votes[game["fake_index"]]
 
         result_embed = discord.Embed(
             title="Quiz Results!",
-            description=f'**"{game["text"]}"**\n\nThis was **{answer}**!',
-            color=discord.Color.green() if game["is_real"] else discord.Color.red(),
+            description=f"The fake message was **#{correct_answer}**:\n\n\"{game['fake_message']}\"",
+            color=discord.Color.green(),
         )
         result_embed.add_field(
             name="Votes",
-            value=f"Real: {real_votes} | Fake: {fake_votes}",
+            value=" | ".join(f"#{i+1}: {v}" for i, v in enumerate(votes)),
         )
         result_embed.add_field(
             name="Winners",
-            value=f"{winners} people guessed correctly!",
+            value=f"{winners} {'person' if winners == 1 else 'people'} guessed correctly!",
         )
 
         await ctx.send(embed=result_embed)
