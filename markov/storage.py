@@ -444,8 +444,38 @@ class MarkovStorage:
         )
         await self._connection.commit()
 
+    async def needs_migration(self) -> bool:
+        """Check if the database has any old-format data that needs migration.
+
+        Returns:
+            True if migration is needed, False otherwise.
+        """
+        # Check guild_chain
+        cursor = await self._connection.execute(
+            "SELECT transitions FROM guild_chain LIMIT 100"
+        )
+        rows = await cursor.fetchall()
+        for (transitions_json,) in rows:
+            parsed = json.loads(transitions_json)
+            if isinstance(parsed, list):
+                return True
+
+        # Check user_chains
+        cursor = await self._connection.execute(
+            "SELECT transitions FROM user_chains LIMIT 100"
+        )
+        rows = await cursor.fetchall()
+        for (transitions_json,) in rows:
+            parsed = json.loads(transitions_json)
+            if isinstance(parsed, list):
+                return True
+
+        return False
+
     async def migrate_to_counter_format(self) -> int:
         """Migrate old list-based transitions to new Counter/dict format.
+
+        This safely handles mixed old/new data - only converts list-format rows.
 
         Returns:
             Number of rows migrated.

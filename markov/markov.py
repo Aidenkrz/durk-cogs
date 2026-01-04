@@ -96,7 +96,12 @@ class Markov(commands.Cog):
     async def _load_full_chain(
         self, guild_id: int, order: int, max_order: int = None, user_id: int = None
     ) -> MarkovChain:
-        """Load a fully-featured chain from storage."""
+        """Load a fully-featured chain from storage.
+
+        For user-specific chains, only the primary chain is loaded to keep
+        generation true to the user's speech patterns. Guild-wide auxiliary
+        features (reverse chain, skip-grams, etc.) are only used for guild chains.
+        """
         max_order = max_order or order
         storage = await self._get_storage(guild_id)
 
@@ -108,12 +113,13 @@ class Markov(commands.Cog):
         else:
             chain.chain = await storage.get_guild_chain()
 
-        # Load enhanced data
-        chain.reverse_chain = await storage.get_reverse_chain()
-        chain.skip_chain = await storage.get_skip_chain()
-        chain.order_chains = await storage.get_all_order_chains()
+            # Only load enhanced data for guild-wide chain
+            # User chains use only their own data for accurate mimicry
+            chain.reverse_chain = await storage.get_reverse_chain()
+            chain.skip_chain = await storage.get_skip_chain()
+            chain.order_chains = await storage.get_all_order_chains()
 
-        # Load case memory
+        # Load case memory (shared - just for proper capitalization)
         case_data = await storage.get_case_memory()
         for word, forms in case_data.items():
             chain.case_memory[word] = TokenInfo(lowercase=word)
@@ -860,17 +866,21 @@ class Markov(commands.Cog):
         """Migrate old database format to new weighted format.
 
         Run this once after updating if you have existing chain data.
+        This safely handles databases with mixed old/new format data.
         """
         storage = await self._get_storage(ctx.guild.id)
+
+        # Check if migration is actually needed
+        needs_migration = await storage.needs_migration()
+        if not needs_migration:
+            await ctx.send("No migration needed - database already in new format.")
+            return
 
         msg = await ctx.send("Migrating database to new format...")
 
         try:
             migrated = await storage.migrate_to_counter_format()
-            if migrated > 0:
-                await msg.edit(content=f"Migration complete! Converted {migrated:,} rows to new format.")
-            else:
-                await msg.edit(content="No migration needed - database already in new format.")
+            await msg.edit(content=f"Migration complete! Converted {migrated:,} rows to new format.")
         except Exception as e:
             log.error(f"Migration failed: {e}", exc_info=True)
             await msg.edit(content=f"Migration failed: {e}")
