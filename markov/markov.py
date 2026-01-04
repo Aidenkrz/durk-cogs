@@ -209,6 +209,62 @@ class Markov(commands.Cog):
         else:
             await ctx.send("No chain data yet. Enable training and send some messages!")
 
+    @markov.command(name="help")
+    @commands.guild_only()
+    async def markov_help(self, ctx: commands.Context) -> None:
+        """Show help for Markov commands."""
+        settings = await self.config.guild(ctx.guild).all()
+        max_allowed = self._get_max_length(ctx.author, settings)
+
+        embed = discord.Embed(
+            title="Markov Chain Commands",
+            description="Generate text based on server message history.",
+            color=await ctx.embed_color(),
+        )
+
+        prefix = ctx.clean_prefix
+
+        embed.add_field(
+            name=f"{prefix}markov [length]",
+            value=f"Generate random text. Max length: {max_allowed} words.",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"{prefix}markov user @user [length]",
+            value="Generate text mimicking a specific user.",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"{prefix}markov seed <words>",
+            value="Generate text starting from specific words.",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"{prefix}markov stats",
+            value="Show chain statistics and top contributors.",
+            inline=False,
+        )
+
+        if ctx.author.guild_permissions.administrator:
+            embed.add_field(
+                name="Admin Commands",
+                value=(
+                    f"`{prefix}markovset enable/disable` - Toggle training\n"
+                    f"`{prefix}markovset channel add/remove` - Manage channel whitelist\n"
+                    f"`{prefix}markovset whitelist add/remove` - Manage reaction whitelist\n"
+                    f"`{prefix}markovset train #channel [limit]` - Bulk train from history\n"
+                    f"`{prefix}markovset clear [user]` - Clear chain data\n"
+                    f"`{prefix}markovset order <1-4>` - Set n-gram order\n"
+                    f"`{prefix}markovset length <user> <admin>` - Set max lengths\n"
+                    f"`{prefix}markovset status` - Show current settings"
+                ),
+                inline=False,
+            )
+
+        embed.set_footer(text="React with \u26d3 (chains) to trigger a Markov reply (if whitelisted)")
+
+        await ctx.send(embed=embed)
+
     @markov.command(name="user")
     @commands.guild_only()
     async def markov_user(
