@@ -436,9 +436,39 @@ class Markov(commands.Cog):
 
     @markov.command(name="quiz")
     @commands.guild_only()
-    async def markov_quiz(self, ctx: commands.Context) -> None:
-        """Play 'Who Said It?' - guess if the message is real or Markov-generated."""
+    async def markov_quiz(
+        self, ctx: commands.Context, order: Optional[int] = None, duration: Optional[int] = None
+    ) -> None:
+        """Play 'Who Said It?' - guess if the message is real or Markov-generated.
+
+        Admins can optionally specify:
+        - order: The n-gram order to use (1-4)
+        - duration: How long the quiz runs in seconds (max 30)
+        """
         settings = await self.config.guild(ctx.guild).all()
+        is_admin = ctx.author.guild_permissions.administrator
+
+        # Handle order parameter (admin only)
+        if order is not None:
+            if not is_admin:
+                await ctx.send("Only admins can change the quiz order.")
+                return
+            if order < 1 or order > 4:
+                await ctx.send("Order must be between 1 and 4.")
+                return
+        else:
+            order = settings["order"]
+
+        # Handle duration parameter (admin only, max 30)
+        if duration is not None:
+            if not is_admin:
+                await ctx.send("Only admins can change the quiz duration.")
+                return
+            if duration < 5 or duration > 30:
+                await ctx.send("Duration must be between 5 and 30 seconds.")
+                return
+        else:
+            duration = 15  # Default duration
 
         # Check if there's already a game in this channel
         if ctx.channel.id in self._quiz_games:
@@ -492,32 +522,23 @@ class Markov(commands.Cog):
                 is_real = False  # Fall back to generated
 
         if not is_real:
-            # Generate fake message
+            # Generate fake message using guild chain (more reliable than user chain)
             try:
                 text = await self._generate_text(
                     ctx.guild.id,
-                    settings["order"],
+                    order,
                     min_length=5,
                     max_length=20,
-                    user_id=user_id,
                 )
             except MigrationRequiredError:
                 await ctx.send("Database needs migration. Run `.markovset migrate` first.")
                 return
             if not text:
-                await ctx.send("Couldn't generate quiz text.")
+                await ctx.send("Couldn't generate quiz text. Try training more data first.")
                 return
             quiz_text = text
         else:
             quiz_text = real_message
-
-        # Store game state
-        self._quiz_games[ctx.channel.id] = {
-            "is_real": is_real,
-            "user": member,
-            "text": quiz_text,
-            "votes": {},  # user_id -> vote (True = real, False = fake)
-        }
 
         embed = discord.Embed(
             title="Who Said It?",
@@ -526,30 +547,42 @@ class Markov(commands.Cog):
         )
         embed.add_field(
             name="Is this real or Markov-generated?",
-            value="React with \u2705 for REAL or \u274c for FAKE\nYou have 30 seconds!",
+            value=f"React with \u2705 for REAL or \u274c for FAKE\nYou have {duration} seconds!",
         )
 
-        msg = await ctx.send(embed=embed)
-        await msg.add_reaction("\u2705")  # checkmark
-        await msg.add_reaction("\u274c")  # X
+        quiz_msg = await ctx.send(embed=embed)
+        await quiz_msg.add_reaction("\u2705")  # checkmark
+        await quiz_msg.add_reaction("\u274c")  # X
+
+        # Store game state with message ID to prevent race conditions
+        self._quiz_games[ctx.channel.id] = {
+            "message_id": quiz_msg.id,
+            "is_real": is_real,
+            "user": member,
+            "text": quiz_text,
+        }
 
         # Wait for reactions
-        await asyncio.sleep(30)
+        await asyncio.sleep(duration)
 
-        # Collect results
-        game = self._quiz_games.pop(ctx.channel.id, None)
-        if not game:
+        # Collect results - verify this is still our game
+        game = self._quiz_games.get(ctx.channel.id)
+        if not game or game.get("message_id") != quiz_msg.id:
+            # Another quiz took over or game was cleared
             return
 
+        # Now safe to remove
+        self._quiz_games.pop(ctx.channel.id, None)
+
         try:
-            msg = await ctx.channel.fetch_message(msg.id)
+            quiz_msg = await ctx.channel.fetch_message(quiz_msg.id)
         except discord.NotFound:
             return
 
         real_votes = 0
         fake_votes = 0
 
-        for reaction in msg.reactions:
+        for reaction in quiz_msg.reactions:
             if str(reaction.emoji) == "\u2705":
                 real_votes = reaction.count - 1  # Subtract bot's reaction
             elif str(reaction.emoji) == "\u274c":
