@@ -1,0 +1,10 @@
+{
+    "author": ["Durk"],
+    "name": "Markov",
+    "short": "Generate text using Markov chains from Discord messages.",
+    "description": "A cog that builds Markov chains from Discord message history and generates text that mimics the chat patterns of a server or specific users. Supports bulk training from channel history, per-user chains, and configurable n-gram order.",
+    "tags": ["fun", "markov", "text", "generator"],
+    "requirements": ["aiosqlite"],
+    "min_bot_version": "3.5.0",
+    "end_user_data_statement": "This cog stores Discord user IDs and message content (sanitized) to build Markov chains for text generation."
+}
