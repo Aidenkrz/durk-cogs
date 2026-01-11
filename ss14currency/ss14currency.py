@@ -210,6 +210,394 @@ class DbConfigModal(Modal, title="Database Configuration"):
             await interaction.followup.send(f"Failed to connect using the provided details. Please check them and try again.\n(Attempted connection: `{safe_debug_string}`)", ephemeral=True)
         return False
 
+from typing import List, Tuple
+
+class Card:
+    """Represents a playing card."""
+    # Internal representations
+    SUITS = ['spades', 'hearts', 'diamonds', 'clubs']
+    RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
+    
+    # Discord emoji representations
+    SUIT_EMOJIS = {
+        'spades': ':spades:',
+        'hearts': ':hearts:',
+        'diamonds': ':diamonds:',
+        'clubs': ':clubs:'
+    }
+    
+    RANK_EMOJIS = {
+        'A': ':regional_indicator_a:',
+        '2': ':two:',
+        '3': ':three:',
+        '4': ':four:',
+        '5': ':five:',
+        '6': ':six:',
+        '7': ':seven:',
+        '8': ':eight:',
+        '9': ':nine:',
+        '10': ':keycap_ten:',
+        'J': ':regional_indicator_j:',
+        'Q': ':regional_indicator_q:',
+        'K': ':regional_indicator_k:'
+    }
+    
+    def __init__(self, rank: str, suit: str):
+        self.rank = rank
+        self.suit = suit
+    
+    def value(self) -> int:
+        """Returns the value of the card (aces count as 11)."""
+        if self.rank in ['J', 'Q', 'K']:
+            return 10
+        elif self.rank == 'A':
+            return 11
+        else:
+            return int(self.rank)
+    
+    def __str__(self) -> str:
+        """Return emoji representation of card."""
+        return f"{self.RANK_EMOJIS[self.rank]}{self.SUIT_EMOJIS[self.suit]}"
+    
+    def simple_str(self) -> str:
+        """Return simple text representation (for fallback)."""
+        suit_symbols = {'spades': '♠', 'hearts': '♥', 'diamonds': '♦', 'clubs': '♣'}
+        return f"{self.rank}{suit_symbols[self.suit]}"
+
+
+class Hand:
+    """Represents a hand of cards."""
+    def __init__(self):
+        self.cards: List[Card] = []
+    
+    def add_card(self, card: Card):
+        self.cards.append(card)
+    
+    def value(self) -> int:
+        """Calculate the best value for the hand."""
+        total = sum(card.value() for card in self.cards)
+        aces = sum(1 for card in self.cards if card.rank == 'A')
+        
+        # Adjust for aces (count as 1 instead of 11 if busted)
+        while total > 21 and aces > 0:
+            total -= 10
+            aces -= 1
+        
+        return total
+    
+    def is_blackjack(self) -> bool:
+        """Check if hand is a natural blackjack."""
+        return len(self.cards) == 2 and self.value() == 21
+    
+    def is_busted(self) -> bool:
+        """Check if hand is busted."""
+        return self.value() > 21
+    
+    def __str__(self) -> str:
+        return ' '.join(str(card) for card in self.cards)
+
+
+class BlackjackGame:
+    """Represents a blackjack game state."""
+    def __init__(self, player_id: uuid.UUID, player_name: str, wager: int):
+        self.player_id = player_id
+        self.player_name = player_name
+        self.wager = wager
+        self.deck = self._create_deck()
+        random.shuffle(self.deck)
+        
+        self.player_hand = Hand()
+        self.dealer_hand = Hand()
+        
+        # Deal initial cards
+        self.player_hand.add_card(self.deck.pop())
+        self.dealer_hand.add_card(self.deck.pop())
+        self.player_hand.add_card(self.deck.pop())
+        self.dealer_hand.add_card(self.deck.pop())
+        
+        self.finished = False
+        self.result = None
+        self.doubled = False
+    
+    def _create_deck(self) -> List[Card]:
+        """Create a standard 52-card deck."""
+        return [Card(rank, suit) for suit in Card.SUITS for rank in Card.RANKS]
+    
+    def hit(self) -> Card:
+        """Player hits - draw a card."""
+        card = self.deck.pop()
+        self.player_hand.add_card(card)
+        return card
+    
+    def stand(self):
+        """Player stands - dealer plays."""
+        # Dealer hits until 17 or higher
+        while self.dealer_hand.value() < 17:
+            self.dealer_hand.add_card(self.deck.pop())
+        
+        self.finished = True
+        self._determine_result()
+    
+    def _determine_result(self) -> Tuple[str, float]:
+        """Determine the game result and payout multiplier."""
+        player_value = self.player_hand.value()
+        dealer_value = self.dealer_hand.value()
+        
+        # Player busted
+        if self.player_hand.is_busted():
+            self.result = ("bust", 0)
+            return self.result
+        
+        # Player blackjack
+        if self.player_hand.is_blackjack():
+            if self.dealer_hand.is_blackjack():
+                self.result = ("push", 1)  # Return wager
+            else:
+                self.result = ("blackjack", 2.5)  # 3:2 payout
+            return self.result
+        
+        # Dealer blackjack
+        if self.dealer_hand.is_blackjack():
+            self.result = ("dealer_blackjack", 0)
+            return self.result
+        
+        # Dealer busted
+        if self.dealer_hand.is_busted():
+            self.result = ("dealer_bust", 2)
+            return self.result
+        
+        # Compare values
+        if player_value > dealer_value:
+            self.result = ("win", 2)
+        elif player_value < dealer_value:
+            self.result = ("lose", 0)
+        else:
+            self.result = ("push", 1)
+        
+        return self.result
+    
+    def get_display_embed(self, reveal_dealer: bool = False) -> discord.Embed:
+        """Create an embed showing the current game state."""
+        embed = discord.Embed(
+            title="🃏 Blackjack",
+            color=discord.Color.blue()
+        )
+        
+        # Player hand
+        player_value = self.player_hand.value()
+        embed.add_field(
+            name=f"Your Hand ({player_value})",
+            value=str(self.player_hand),
+            inline=False
+        )
+        
+        # Dealer hand
+        if reveal_dealer or self.finished:
+            dealer_value = self.dealer_hand.value()
+            embed.add_field(
+                name=f"Dealer's Hand ({dealer_value})",
+                value=str(self.dealer_hand),
+                inline=False
+            )
+        else:
+            # Hide second card with back of card emoji
+            hidden = f"{self.dealer_hand.cards[0]} :black_joker:"
+            embed.add_field(
+                name="Dealer's Hand (?)",
+                value=hidden,
+                inline=False
+            )
+        
+        embed.add_field(name="💰 Wager", value=f"{self.wager:,} coins", inline=True)
+        
+        if self.doubled:
+            embed.set_footer(text="Doubled Down!")
+        
+        return embed
+
+
+class BlackjackView(View):
+    """View for blackjack game buttons."""
+    def __init__(self, cog: 'SS14Currency', game: BlackjackGame, pool: asyncpg.Pool, guild_id: int):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.game = game
+        self.pool = pool
+        self.guild_id = guild_id
+        self.message = None
+    
+    async def on_timeout(self):
+        """Handle timeout - treat as forfeit."""
+        if not self.game.finished:
+            # Forfeit - player loses wager (already deducted)
+            for item in self.children:
+                item.disabled = True
+            
+            embed = discord.Embed(
+                title="⏱️ Blackjack - Timed Out",
+                description="You took too long to respond. Your wager has been forfeited.",
+                color=discord.Color.red()
+            )
+            embed.add_field(name="💸 Lost", value=f"{self.game.wager:,} coins")
+            
+            await self.message.edit(embed=embed, view=self)
+            
+            # Record loss
+            await self.cog.record_gambling_result(
+                self.guild_id, self.game.player_id, "blackjack",
+                self.game.wager, False, -self.game.wager
+            )
+    
+    @discord.ui.button(label="Hit", style=discord.ButtonStyle.primary, emoji="🎴")
+    async def hit_button(self, interaction: discord.Interaction, button: Button):
+        """Player hits."""
+        if interaction.user.id != (await self._get_discord_id()):
+            await interaction.response.send_message("❌ This is not your game.", ephemeral=True)
+            return
+        
+        await interaction.response.defer()
+        
+        # Draw card
+        card = self.game.hit()
+        
+        # Check if busted
+        if self.game.player_hand.is_busted():
+            self.game.finished = True
+            self.game.result = ("bust", 0)
+            await self._finish_game()
+        else:
+            # Update display
+            embed = self.game.get_display_embed()
+            await self.message.edit(embed=embed, view=self)
+    
+    @discord.ui.button(label="Stand", style=discord.ButtonStyle.success, emoji="✋")
+    async def stand_button(self, interaction: discord.Interaction, button: Button):
+        """Player stands."""
+        if interaction.user.id != (await self._get_discord_id()):
+            await interaction.response.send_message("❌ This is not your game.", ephemeral=True)
+            return
+        
+        await interaction.response.defer()
+        
+        # Dealer plays
+        self.game.stand()
+        await self._finish_game()
+    
+    @discord.ui.button(label="Double Down", style=discord.ButtonStyle.secondary, emoji="💰")
+    async def double_button(self, interaction: discord.Interaction, button: Button):
+        """Player doubles down (only available on first turn)."""
+        if interaction.user.id != (await self._get_discord_id()):
+            await interaction.response.send_message("❌ This is not your game.", ephemeral=True)
+            return
+        
+        # Only allow on first turn (2 cards)
+        if len(self.game.player_hand.cards) != 2:
+            await interaction.response.send_message("❌ You can only double down on your first turn.", ephemeral=True)
+            return
+        
+        await interaction.response.defer()
+        
+        # Check if player has enough for double
+        balance = await get_player_currency(self.pool, self.game.player_id)
+        if balance < self.game.wager:
+            await interaction.followup.send("❌ Insufficient funds to double down.", ephemeral=True)
+            return
+        
+        # Deduct additional wager
+        success, old_bal, new_bal = await add_player_currency(self.pool, self.game.player_id, -self.game.wager)
+        if not success:
+            await interaction.followup.send("❌ Failed to deduct coins.", ephemeral=True)
+            return
+        
+        # Double the wager
+        self.game.wager *= 2
+        self.game.doubled = True
+        
+        # Hit once then stand
+        self.game.hit()
+        self.game.stand()
+        
+        await self._finish_game()
+    
+    async def _get_discord_id(self) -> Optional[int]:
+        """Get Discord ID for the player."""
+        async with self.pool.acquire() as conn:
+            query = "SELECT discord_id FROM rmc_linked_accounts WHERE player_id = $1;"
+            return await conn.fetchval(query, self.game.player_id)
+    
+    async def _finish_game(self):
+        """Finish the game and process results."""
+        for item in self.children:
+            item.disabled = True
+        
+        result_type, multiplier = self.game.result
+        payout = int(self.game.wager * multiplier)
+        net_change = payout - self.game.wager
+        
+        # Add winnings (if any)
+        if payout > 0:
+            await add_player_currency(self.pool, self.game.player_id, payout)
+        
+        # Record tax on house winnings
+        if net_change < 0:
+            tax = abs(net_change)
+            await self.cog.record_tax(self.guild_id, "blackjack", tax)
+        
+        # Create result embed
+        embed = self.game.get_display_embed(reveal_dealer=True)
+        
+        # Determine color and message
+        if result_type == "blackjack":
+            embed.color = discord.Color.gold()
+            embed.title = "🃏 Blackjack! 🎉"
+            result_msg = f"**BLACKJACK!** You win {payout:,} coins! (3:2 payout)"
+        elif result_type == "win" or result_type == "dealer_bust":
+            embed.color = discord.Color.green()
+            embed.title = "🃏 You Win!"
+            if result_type == "dealer_bust":
+                result_msg = f"Dealer busted! You win {payout:,} coins!"
+            else:
+                result_msg = f"You win {payout:,} coins!"
+        elif result_type == "push":
+            embed.color = discord.Color.gold()
+            embed.title = "🃏 Push"
+            result_msg = f"It's a tie! Your {self.game.wager:,} coins have been returned."
+        else:  # bust, lose, dealer_blackjack
+            embed.color = discord.Color.red()
+            embed.title = "🃏 You Lose"
+            if result_type == "bust":
+                result_msg = f"Busted! You lose {self.game.wager:,} coins."
+            elif result_type == "dealer_blackjack":
+                result_msg = f"Dealer has blackjack! You lose {self.game.wager:,} coins."
+            else:
+                result_msg = f"You lose {self.game.wager:,} coins."
+        
+        embed.description = result_msg
+        embed.add_field(name="📊 Net Change", value=f"{net_change:+,} coins", inline=True)
+        
+        # Show current balance
+        new_balance = await get_player_currency(self.pool, self.game.player_id)
+        embed.add_field(name="💰 New Balance", value=f"{new_balance:,} coins", inline=True)
+        
+        await self.message.edit(embed=embed, view=self)
+        
+        # Record gambling stats
+        won = net_change > 0
+        await self.cog.record_gambling_result(
+            self.guild_id, self.game.player_id, "blackjack",
+            self.game.wager, won, net_change
+        )
+        
+        # Log transaction
+        await self.cog.log_transaction(
+            self.guild_id, "gambling", net_change,
+            from_player_id=self.game.player_id if net_change < 0 else None,
+            to_player_id=self.game.player_id if net_change > 0 else None,
+            balance_before=new_balance - net_change,
+            balance_after=new_balance,
+            notes=f"Blackjack: {result_type}"
+        )
+  
 class SS14Currency(commands.Cog):
     """Cog for managing SS14 server currency."""
     async def close_guild_pool(self, guild_id: int):
@@ -2465,7 +2853,116 @@ class SS14Currency(commands.Cog):
             )
         else:
             raise error
+        
+    @currency.command(name="blackjack")
+    @commands.cooldown(rate=1, per=10.0, type=commands.BucketType.user)
+    async def blackjack(self, ctx: commands.Context, wager: int):
+        """Play blackjack against the dealer.
+        
+        Rules:
+        - Beat the dealer by getting closer to 21 without going over
+        - Blackjack (Ace + 10-value card) pays 3:2
+        - Dealer hits until 17
+        - Double Down available on first turn (doubles wager, hit once, then stand)
+        - 5% house tax on losses
+        
+        Args:
+            wager: Amount of coins to bet
+        """
+        if wager <= 0:
+            await ctx.send("❌ You must wager a positive amount.", ephemeral=True)
+            return
+        
+        pool = await self.get_pool_for_guild(ctx.guild.id)
+        if not pool:
+            await ctx.send("❌ Database connection not configured.", ephemeral=True)
+            return
+        
+        # Get player
+        player_id = await get_player_id_from_discord(pool, ctx.author.id)
+        if not player_id:
+            await ctx.send("❌ Your Discord account is not linked to an SS14 account.", ephemeral=True)
+            return
+        
+        # Check balance
+        balance = await get_player_currency(pool, player_id)
+        if balance < wager:
+            await ctx.send(f"❌ Insufficient funds. You have {balance:,} coins.", ephemeral=True)
+            return
+        
+        # Deduct wager
+        success, old_bal, new_bal = await add_player_currency(pool, player_id, -wager)
+        if not success:
+            await ctx.send("❌ Failed to deduct wager.", ephemeral=True)
+            return
+        
+        # Create game
+        player_name = await get_user_name_from_id(self.session, player_id)
+        game = BlackjackGame(player_id, player_name, wager)
+        
+        # Check for instant blackjack
+        if game.player_hand.is_blackjack():
+            if game.dealer_hand.is_blackjack():
+                # Push - return wager
+                await add_player_currency(pool, player_id, wager)
+                embed = game.get_display_embed(reveal_dealer=True)
+                embed.title = "🃏 Push"
+                embed.description = "Both you and the dealer have blackjack! Your wager has been returned."
+                embed.color = discord.Color.gold()
+                
+                # Record stats
+                await self.record_gambling_result(ctx.guild.id, player_id, "blackjack", wager, False, 0)
+                await self.log_transaction(
+                    ctx.guild.id, "gambling", 0,
+                    from_player_id=player_id,
+                    balance_before=old_bal,
+                    balance_after=old_bal,
+                    notes="Blackjack: push (both blackjack)"
+                )
+            else:
+                # Player blackjack - 3:2 payout
+                payout = int(wager * 2.5)
+                await add_player_currency(pool, player_id, payout)
+                embed = game.get_display_embed(reveal_dealer=True)
+                embed.title = "🃏 Blackjack! 🎉"
+                embed.description = f"**BLACKJACK!** You win {payout:,} coins! (3:2 payout)"
+                embed.color = discord.Color.gold()
+                
+                net = payout - wager
+                embed.add_field(name="📊 Net Change", value=f"+{net:,} coins", inline=True)
+                
+                new_balance = await get_player_currency(pool, player_id)
+                embed.add_field(name="💰 New Balance", value=f"{new_balance:,} coins", inline=True)
+                
+                # Record stats
+                await self.record_gambling_result(ctx.guild.id, player_id, "blackjack", wager, True, net)
+                await self.log_transaction(
+                    ctx.guild.id, "gambling", net,
+                    to_player_id=player_id,
+                    balance_before=old_bal,
+                    balance_after=new_balance,
+                    notes="Blackjack: natural blackjack"
+                )
+            
+            await ctx.send(embed=embed)
+            return
+        
+        # Create view and send
+        view = BlackjackView(self, game, pool, ctx.guild.id)
+        embed = game.get_display_embed()
+        message = await ctx.send(embed=embed, view=view)
+        view.message = message
 
+    @blackjack.error
+    async def blackjack_error(self, ctx: commands.Context, error):
+        if isinstance(error, commands.CommandOnCooldown):
+            ready_timestamp = int(time.time() + error.retry_after)
+            await ctx.send(
+                f"🎰 Slow down! You can play blackjack again <t:{ready_timestamp}:R>.",
+                ephemeral=True
+            )
+        else:
+            raise error
 # End of SS14Currency class
 
 class MarketOptionsView(View):
