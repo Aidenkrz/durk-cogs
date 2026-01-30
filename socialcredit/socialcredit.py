@@ -288,22 +288,28 @@ class SocialCredit(commands.Cog):
                 pass
 
     async def _sync_nickname(self, member: discord.Member, score: int):
-        """Prepend [score] to the member's nickname if the guild has nickname_prefix enabled."""
+        """Prepend [rounded score] to the member's nickname if enabled, only on 50-point increments."""
         if not await self.config.guild(member.guild).nickname_prefix():
             return
         # Don't touch the guild owner's nickname (Discord doesn't allow it)
         if member.id == member.guild.owner_id:
             return
 
+        rounded_score = round(score / 50.0) * 50
+        current_nick = member.nick or ""
+        current_prefix = self._get_current_prefix_score(current_nick)
+        if current_prefix == rounded_score:
+            return  # No change needed
+
         base_name = self._strip_score_prefix(member.display_name)
-        new_nick = f"[{score}] {base_name}"
+        new_nick = f"[{rounded_score}] {base_name}"
         # Discord nickname limit is 32 chars
         if len(new_nick) > 32:
             new_nick = new_nick[:32]
-        # Only update if it actually changed
+        # Only update if it actually changed (safety check)
         if member.nick != new_nick:
             try:
-                await member.edit(nick=new_nick, reason="Social credit score update")
+                await member.edit(nick=new_nick, reason=f"Social credit score update ({rounded_score})")
             except discord.Forbidden:
                 pass
 
@@ -331,6 +337,12 @@ class SocialCredit(commands.Cog):
                     await member.ban(until=until, reason=reason, delete_message_days=0)
             except (discord.Forbidden, discord.HTTPException):
                 pass
+
+    @staticmethod
+    def _get_current_prefix_score(nick: str) -> Optional[int]:
+        """Extract current score prefix from nick, or None."""
+        match = re.match(r"^\[(\d+)\]\s*", nick)
+        return int(match.group(1)) if match else None
 
     @staticmethod
     def _strip_score_prefix(name: str) -> str:
