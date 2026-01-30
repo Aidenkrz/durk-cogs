@@ -1,6 +1,6 @@
 {
     "author": ["Durk"],
-    "install_msg": "Thank you for installing the MessageFilter cog!",
+    "install_msg": "Thank you for installing the MessageFilter cog, loser!",
     "name": "MessageFilter",
     "short": "Filter messages by required words and negative sentiment",
     "description": "Automatically delete messages that don't contain required words and filter negative sentiment using VADER/NLTK analysis. Supports per-channel configuration, timeout on violations, and logging.",
