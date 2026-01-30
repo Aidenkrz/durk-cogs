@@ -662,6 +662,14 @@ class MessageFilter(commands.Cog):
             or results["severe_toxicity"] > toxicity_threshold
         ):
             await self._handle_sentiment_violation(message, results, layer="Detoxify", detail=None)
+            return
+
+        # All sentiment checks passed — reward positive behavior
+        social_credit = self.bot.get_cog("SocialCredit")
+        if social_credit:
+            await social_credit.reward_positive_sentiment(
+                message.author.id, message.guild.id, message.channel.id
+            )
 
     async def _handle_sentiment_violation(self, message, scores, *, layer, detail):
         """Delete message, DM user, timeout, log — shared by both layers."""
@@ -712,6 +720,13 @@ class MessageFilter(commands.Cog):
                     )
                 except discord.Forbidden:
                     pass
+
+            # Deduct social credit for violation
+            social_credit = self.bot.get_cog("SocialCredit")
+            if social_credit:
+                await social_credit.penalize_negative_sentiment(
+                    message.author.id, message.guild.id, message.channel.id
+                )
         except discord.HTTPException:
             pass
 

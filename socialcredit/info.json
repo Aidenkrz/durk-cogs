@@ -1,0 +1,15 @@
+{
+    "author": ["Durk"],
+    "install_msg": "Thank you for installing the Social Credit cog! Use `[p]credit` to check your score.",
+    "name": "SocialCredit",
+    "short": "Track social credit scores based on behavior and interactions",
+    "description": "A social credit system that tracks user scores based on message sentiment and social interactions like hugging. Integrates with MessageFilter for automatic scoring.",
+    "tags": ["social", "credit", "score", "hug", "sentiment", "gamification"],
+    "requirements": ["aiosqlite"],
+    "required_cogs": {},
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "end_user_data_statement": "This cog stores Discord user IDs, social credit scores, credit change history, and hug cooldown timestamps globally across all servers."
+}
