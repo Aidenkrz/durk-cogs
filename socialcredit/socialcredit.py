@@ -18,13 +18,11 @@ CREDIT_HUG_RECEIVED = 5
 CREDIT_POSITIVE_SENTIMENT = 2
 CREDIT_NEGATIVE_SENTIMENT = -10
 
-# Placeholder hug GIF list — replace URLs as needed
 HUG_GIFS = [
-    "https://media.tenor.com/placeholder1.gif",
-    "https://media.tenor.com/placeholder2.gif",
-    "https://media.tenor.com/placeholder3.gif",
-    "https://media.tenor.com/placeholder4.gif",
-    "https://media.tenor.com/placeholder5.gif",
+    "https://static.klipy.com/ii/d7aec6f6f171607374b2065c836f92f4/3a/73/47Uxa6Nl.gif,
+    "https://static.klipy.com/ii/8ce8357c78ea940b9c2015daf05ce1a5/c0/c8/Gsu4wPlf.gif",
+    "https://static.klipy.com/ii/35ccce3d852f7995dd2da910f2abd795/4a/74/bdx8ZIaf.gif",
+    "https://static.klipy.com/ii/35ccce3d852f7995dd2da910f2abd795/f9/fd/lLT2zSIO.gif",
 ]
 
 
