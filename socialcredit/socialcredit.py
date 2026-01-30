@@ -304,24 +304,24 @@ class SocialCredit(commands.Cog):
                 await member.edit(nick=new_nick, reason="Social credit score update")
             except discord.Forbidden:
                 pass
-
+    
         async def _sync_punishments(self, member: discord.Member, score: int) -> None:
             """Apply punishments if score below thresholds."""
             if member.guild_permissions.administrator or member.id == member.guild.owner_id:
                 return
-
+    
             rules = await self.config.guild(member.guild).punishment_rules()
             if not rules:
                 return
-
+    
             for rule in rules:
                 if score > rule["threshold"]:
                     continue
-
+    
                 duration_td = self.parse_duration(rule["duration"])
                 until = discord.utils.utcnow() + duration_td
                 reason = f"Social credit {score} below {rule['threshold']} ({rule['action']} {rule['duration']})"
-
+    
                 try:
                     if rule["action"].lower() == "timeout":
                         await member.timeout(until, reason=reason)
@@ -329,30 +329,30 @@ class SocialCredit(commands.Cog):
                         await member.ban(until=until, reason=reason, delete_message_days=0)
                 except (discord.Forbidden, discord.HTTPException):
                     pass
-
-    @staticmethod
-    def _strip_score_prefix(name: str) -> str:
-        """Remove a leading [number] prefix from a name."""
-        return re.sub(r"^\[\d+\]\s*", "", name)
-
-    @staticmethod
-    def parse_duration(dur_str: str) -> timedelta:
-        """Parse duration string like '1h30m', '2d' to timedelta."""
-        total_secs = 0.0
-        for match in re.finditer(r"(\d+(?:\.\d+)?)([smhdwMy])", dur_str, re.I):
-            num = float(match.group(1))
-            unit = match.group(2).lower()
-            mult = {
-                "s": 1,
-                "m": 60,
-                "h": 3600,
-                "d": 86400,
-                "w": 604800,
-                "M": 2629746,  # ~30.44 days
-                "y": 31556952,  # ~365.25 days
-            }.get(unit, 0)
-            total_secs += num * mult
-        return timedelta(seconds=total_secs)
+    
+        @staticmethod
+        def _strip_score_prefix(name: str) -> str:
+            """Remove a leading [number] prefix from a name."""
+            return re.sub(r"^\[\d+\]\s*", "", name)
+    
+        @staticmethod
+        def parse_duration(dur_str: str) -> timedelta:
+            """Parse duration string like '1h30m', '2d' to timedelta."""
+            total_secs = 0.0
+            for match in re.finditer(r"(\d+(?:\.\d+)?)([smhdwMy])", dur_str, re.I):
+                num = float(match.group(1))
+                unit = match.group(2).lower()
+                mult = {
+                    "s": 1,
+                    "m": 60,
+                    "h": 3600,
+                    "d": 86400,
+                    "w": 604800,
+                    "M": 2629746,  # ~30.44 days
+                    "y": 31556952,  # ~365.25 days
+                }.get(unit, 0)
+                total_secs += num * mult
+            return timedelta(seconds=total_secs)
 
     # ── Hug command ────────────────────────────────────────────────────
 
@@ -892,7 +892,9 @@ class SocialCredit(commands.Cog):
             channel_id=channel.id,
         )
 
-        await self._sync_member(reactor_member, new_score)
+        await self._sync_roles(reactor_member, new_score)
+        await self._sync_punishments(reactor_member, new_score)
+        # Skip nickname sync on reactions to avoid rate limits
 
 
     @commands.Cog.listener()
