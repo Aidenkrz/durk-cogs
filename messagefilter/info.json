@@ -12,7 +12,9 @@
     ],
     "requirements": [
         "nltk",
-        "detoxify"
+        "detoxify==0.5.2",
+        "transformers>=4.30.0,<5.0",
+        "huggingface_hub>=0.34.0,<1.0"
     ],
     "required_cogs": {},
     "min_bot_version": "3.5.0",
