@@ -1,11 +1,15 @@
 from redbot.core import commands, Config, checks
+import asyncio
 import discord
 from datetime import datetime, timezone, timedelta
 import re
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from nltk.tokenize import sent_tokenize
+from detoxify import Detoxify
 
 nltk.download("vader_lexicon", quiet=True)
+nltk.download("punkt_tab", quiet=True)
 
 class MessageFilter(commands.Cog):
     """Automatically delete messages that don't contain required words and filter negative sentiment"""
@@ -14,12 +18,14 @@ class MessageFilter(commands.Cog):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=1234567890)
         self.analyzer = SentimentIntensityAnalyzer()
+        self.toxicity_model = Detoxify("original-small")
         default_guild = {
             "channels": {},
             "active": True,
             "sentiment_channels": {},
             "sentiment_threshold": -0.5,
             "sentiment_timeout": 30,
+            "toxicity_threshold": 0.7,
         }
         self.config.register_guild(**default_guild)
 
@@ -363,10 +369,30 @@ class MessageFilter(commands.Cog):
         )
         await ctx.send(embed=embed)
 
+    @sentiment.command(name="toxicitythreshold")
+    @commands.admin_or_permissions(administrator=True)
+    async def sentiment_toxicitythreshold(self, ctx, score: float):
+        """Set the Detoxify toxicity threshold (range: -1.0 to 1.0)
+
+        Messages with toxicity/threat/insult scores above this value are filtered.
+        Default is 0.7. Lower values are stricter. Negative values mean messages must
+        be toxic to stay (inverted mode).
+        """
+        if score < -1.0 or score > 1.0:
+            return await ctx.send("Toxicity threshold must be between -1.0 and 1.0")
+        await self.config.guild(ctx.guild).toxicity_threshold.set(score)
+        embed = discord.Embed(
+            title="Toxicity Threshold Updated",
+            description=f"Messages with toxicity scores above `{score}` will be filtered",
+            color=0x00ff00,
+        )
+        await ctx.send(embed=embed)
+
     @sentiment.command(name="settings")
     async def sentiment_settings(self, ctx):
         """Show current sentiment filter settings"""
         threshold = await self.config.guild(ctx.guild).sentiment_threshold()
+        tox_threshold = await self.config.guild(ctx.guild).toxicity_threshold()
         timeout_secs = await self.config.guild(ctx.guild).sentiment_timeout()
         channels = await self.config.guild(ctx.guild).sentiment_channels()
 
@@ -378,7 +404,8 @@ class MessageFilter(commands.Cog):
                 channel_list.append(f"{ch.mention} ({count} filtered)")
 
         embed = discord.Embed(title="Sentiment Filter Settings", color=0x00ff00)
-        embed.add_field(name="Threshold", value=f"`{threshold}`", inline=True)
+        embed.add_field(name="VADER Threshold", value=f"`{threshold}`", inline=True)
+        embed.add_field(name="Toxicity Threshold", value=f"`{tox_threshold}`", inline=True)
         embed.add_field(name="Timeout", value=f"`{timeout_secs}s`", inline=True)
         embed.add_field(
             name="Channels",
@@ -389,22 +416,66 @@ class MessageFilter(commands.Cog):
 
     @sentiment.command(name="test")
     async def sentiment_test(self, ctx, *, text: str):
-        """Test the sentiment score of a message"""
-        scores = self.analyzer.polarity_scores(text)
+        """Test the sentiment score of a message against both detection layers"""
         threshold = await self.config.guild(ctx.guild).sentiment_threshold()
-        would_filter = scores["compound"] < threshold
+        tox_threshold = await self.config.guild(ctx.guild).toxicity_threshold()
+
+        # Layer 1: Sentence-level VADER
+        sentences = sent_tokenize(text)
+        vader_triggered = False
+        sentence_lines = []
+        for sentence in sentences:
+            s = self.analyzer.polarity_scores(sentence)
+            flag = s["compound"] < threshold
+            if flag:
+                vader_triggered = True
+            marker = "X" if flag else "-"
+            sentence_lines.append(f"`[{marker}]` {s['compound']:+.4f} | {sentence}")
+
+        # Layer 2: Detoxify
+        loop = asyncio.get_event_loop()
+        tox = await loop.run_in_executor(None, self.toxicity_model.predict, text)
+        detox_triggered = (
+            tox["toxicity"] > tox_threshold
+            or tox["threat"] > tox_threshold
+            or tox["insult"] > tox_threshold
+            or tox["severe_toxicity"] > tox_threshold
+        )
+
+        would_filter = vader_triggered or detox_triggered
 
         embed = discord.Embed(
             title="Sentiment Analysis",
             description=f"**Text:** {text}",
             color=0xff0000 if would_filter else 0x00ff00,
         )
-        embed.add_field(name="Compound", value=f"`{scores['compound']:.4f}`", inline=True)
-        embed.add_field(name="Positive", value=f"`{scores['pos']:.4f}`", inline=True)
-        embed.add_field(name="Neutral", value=f"`{scores['neu']:.4f}`", inline=True)
-        embed.add_field(name="Negative", value=f"`{scores['neg']:.4f}`", inline=True)
-        embed.add_field(name="Threshold", value=f"`{threshold}`", inline=True)
-        embed.add_field(name="Would Filter", value="Yes" if would_filter else "No", inline=True)
+
+        embed.add_field(
+            name=f"VADER (per-sentence, threshold: {threshold})",
+            value="\n".join(sentence_lines) or "No sentences",
+            inline=False,
+        )
+        embed.add_field(
+            name=f"Detoxify (threshold: {tox_threshold})",
+            value=(
+                f"Toxicity: `{tox['toxicity']:.4f}` | "
+                f"Threat: `{tox['threat']:.4f}` | "
+                f"Insult: `{tox['insult']:.4f}` | "
+                f"Severe: `{tox['severe_toxicity']:.4f}`"
+            ),
+            inline=False,
+        )
+        triggered_by = []
+        if vader_triggered:
+            triggered_by.append("VADER")
+        if detox_triggered:
+            triggered_by.append("Detoxify")
+        embed.add_field(
+            name="Would Filter",
+            value=f"{'Yes' if would_filter else 'No'}"
+            + (f" (triggered by: {', '.join(triggered_by)})" if triggered_by else ""),
+            inline=False,
+        )
         await ctx.send(embed=embed)
 
     @commands.command()
@@ -520,7 +591,7 @@ class MessageFilter(commands.Cog):
                 return False
 
     async def _check_sentiment(self, message):
-        """Run the sentiment-based filter independently of the word filter."""
+        """Run layered sentiment filtering: sentence-level VADER then Detoxify."""
         channel_id = str(message.channel.id)
         sentiment_channels = await self.config.guild(message.guild).sentiment_channels()
 
@@ -531,36 +602,75 @@ class MessageFilter(commands.Cog):
         if not cleaned:
             return
 
-        scores = self.analyzer.polarity_scores(cleaned)
         threshold = await self.config.guild(message.guild).sentiment_threshold()
 
-        if scores["compound"] >= threshold:
-            return
+        # Layer 1: Sentence-level VADER — check each sentence independently
+        sentences = sent_tokenize(cleaned)
+        for sentence in sentences:
+            scores = self.analyzer.polarity_scores(sentence)
+            if scores["compound"] < threshold:
+                await self._handle_sentiment_violation(
+                    message, scores, layer="VADER", detail=f"Sentence: {sentence}"
+                )
+                return
 
+        # Layer 2: Detoxify — run transformer toxicity check in executor
+        toxicity_threshold = await self.config.guild(message.guild).toxicity_threshold()
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(None, self.toxicity_model.predict, cleaned)
+
+        if (results["toxicity"] > toxicity_threshold
+                or results["threat"] > toxicity_threshold
+                or results["insult"] > toxicity_threshold
+                or results["severe_toxicity"] > toxicity_threshold):
+            await self._handle_sentiment_violation(
+                message, results, layer="Detoxify", detail=None
+            )
+
+    async def _handle_sentiment_violation(self, message, scores, *, layer, detail):
+        """Delete message, DM user, timeout, log — shared by both layers."""
         timeout_secs = await self.config.guild(message.guild).sentiment_timeout()
+        channel_id = str(message.channel.id)
 
         try:
             await message.delete()
-            await self.log_sentiment_message(message, scores)
+            await self.log_sentiment_message(message, scores, layer=layer, detail=detail)
 
             async with self.config.guild(message.guild).sentiment_channels() as channels:
                 if channel_id in channels:
                     channels[channel_id]["filtered_count"] = channels[channel_id].get("filtered_count", 0) + 1
 
-            try:
-                await message.author.send(
-                    f"Your message in {message.channel.mention} was removed because it was "
-                    f"detected as negative (score: {scores['compound']:.2f}, threshold: {threshold})",
-                    delete_after=120,
+            if layer == "VADER":
+                reason_text = (
+                    f"Your message in {message.channel.mention} was removed for negative "
+                    f"sentiment (score: {scores['compound']:.2f})"
                 )
+                timeout_reason = (
+                    f"Negative sentiment in #{message.channel.name} "
+                    f"(VADER: {scores['compound']:.2f})"
+                )
+            else:
+                top_score = max(
+                    (scores[k], k) for k in ("toxicity", "threat", "insult", "severe_toxicity")
+                )
+                reason_text = (
+                    f"Your message in {message.channel.mention} was removed for toxic "
+                    f"content ({top_score[1]}: {top_score[0]:.2f})"
+                )
+                timeout_reason = (
+                    f"Toxic content in #{message.channel.name} "
+                    f"({top_score[1]}: {top_score[0]:.2f})"
+                )
+
+            try:
+                await message.author.send(reason_text, delete_after=120)
             except discord.Forbidden:
                 pass
 
             if timeout_secs > 0:
                 try:
                     await message.author.timeout(
-                        timedelta(seconds=timeout_secs),
-                        reason=f"Negative sentiment in #{message.channel.name} (score: {scores['compound']:.2f})",
+                        timedelta(seconds=timeout_secs), reason=timeout_reason
                     )
                 except discord.Forbidden:
                     pass
@@ -634,7 +744,7 @@ class MessageFilter(commands.Cog):
         except discord.HTTPException:
             pass
 
-    async def log_sentiment_message(self, message, scores):
+    async def log_sentiment_message(self, message, scores, *, layer="VADER", detail=None):
         log_channel_id = await self.config.guild(message.guild).log_channel()
         if not log_channel_id:
             return
@@ -647,11 +757,25 @@ class MessageFilter(commands.Cog):
             color=0xff0000,
             description=(
                 f"**Message sent by {message.author.mention} removed for negative sentiment "
-                f"in {message.channel.mention}**\n{message.content}"
+                f"in {message.channel.mention}** [{layer}]\n{message.content}"
             ),
         )
-        embed.add_field(name="Compound", value=f"{scores['compound']:.4f}", inline=True)
-        embed.add_field(name="Pos / Neu / Neg", value=f"{scores['pos']:.2f} / {scores['neu']:.2f} / {scores['neg']:.2f}", inline=True)
+
+        if layer == "VADER":
+            embed.add_field(name="Compound", value=f"{scores['compound']:.4f}", inline=True)
+            embed.add_field(
+                name="Pos / Neu / Neg",
+                value=f"{scores['pos']:.2f} / {scores['neu']:.2f} / {scores['neg']:.2f}",
+                inline=True,
+            )
+            if detail:
+                embed.add_field(name="Flagged Sentence", value=detail, inline=False)
+        else:
+            embed.add_field(name="Toxicity", value=f"{scores['toxicity']:.4f}", inline=True)
+            embed.add_field(name="Threat", value=f"{scores['threat']:.4f}", inline=True)
+            embed.add_field(name="Insult", value=f"{scores['insult']:.4f}", inline=True)
+            embed.add_field(name="Severe", value=f"{scores['severe_toxicity']:.4f}", inline=True)
+
         embed.set_author(
             name=f"{message.author.name} ({message.author.id})",
             icon_url=message.author.display_avatar.url,

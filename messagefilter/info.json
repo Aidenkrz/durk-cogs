@@ -11,7 +11,8 @@
         "automod"
     ],
     "requirements": [
-        "nltk"
+        "nltk",
+        "detoxify"
     ],
     "required_cogs": {},
     "min_bot_version": "3.5.0",
