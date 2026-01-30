@@ -63,6 +63,11 @@ class SocialCreditDatabase:
                 last_hug_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (user_id, target_user_id)
             );
+
+            CREATE TABLE IF NOT EXISTS pill_cooldowns (
+                user_id INTEGER PRIMARY KEY,
+                last_pill_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         await self.db.commit()
 
@@ -221,6 +226,12 @@ class SocialCreditDatabase:
             (user_id, user_id),
         )
         counts["cooldowns"] = cursor.rowcount
+
+        cursor = await self.db.execute(
+            "DELETE FROM pill_cooldowns WHERE user_id = ?",
+            (user_id,),
+        )
+        counts["pill_cooldowns"] = cursor.rowcount
 
         cursor = await self.db.execute(
             "DELETE FROM user_credits WHERE user_id = ?", (user_id,)

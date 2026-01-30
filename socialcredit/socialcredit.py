@@ -40,6 +40,17 @@ HUG_GIFS = [
 
 ]
 
+PILL_GIFS = [
+    "https://static.klipy.com/ii/4e7bea9f7a3371424e6c16ebc93252fe/60/61/i4HwAV98a43Y7I6x.gif",
+    "https://static.klipy.com/ii/4e7bea9f7a3371424e6c16ebc93252fe/7c/36/c2o3pC8HacN1uIO4Deh.gif",
+    "https://static.klipy.com/ii/d7aec6f6f171607374b2065c836f92f4/7f/70/bty9591L.gif",
+    "https://static.klipy.com/ii/c3a19a0b747a76e98651f2b9a3cca5ff/72/de/NcUaMaVV.gif",
+    "https://static.klipy.com/ii/35ccce3d852f7995dd2da910f2abd795/07/65/gRFZybj7.gif",
+    "https://static.klipy.com/ii/4e7bea9f7a3371424e6c16ebc93252fe/2a/cb/hPIxV11Q9kLuHP.gif",
+    "https://flipanim.com/gif/w/c/WcBuCNmp.gif",
+    "https://media.tenor.com/QHbRuht9SswAAAAM/pills-bilelaca.gif",
+]
+
 
 class SocialCredit(commands.Cog):
     """Track social credit scores based on behavior and interactions."""
@@ -314,6 +325,53 @@ class SocialCredit(commands.Cog):
             inline=True,
         )
         embed.set_footer(text="Spread the love! Hugs available once per person every 24 hours.")
+
+        await ctx.send(embed=embed)
+
+    # ── Pill command ───────────────────────────────────────────────────
+
+    @commands.command()
+    @commands.guild_only()
+    async def takepills(self, ctx: commands.Context):
+        """Take your happy pills! +50 credit, 4 hour cooldown."""
+        cooldown = await self.db.check_pill_cooldown(ctx.author.id)
+        if cooldown is not None:
+            last_pill = datetime.fromisoformat(cooldown)
+            next_pill = last_pill + timedelta(hours=4)
+            remaining = next_pill - datetime.utcnow()
+            hours, remainder = divmod(int(remaining.total_seconds()), 3600)
+            minutes = remainder // 60
+            return await ctx.send(
+                f"You already took your pills recently! "
+                f"Try again in {hours}h {minutes}m."
+            )
+
+        await self.db.record_pill(ctx.author.id)
+
+        new_score = await self.db.adjust_score(
+            user_id=ctx.author.id,
+            amount=50,
+            reason="took_pills",
+            guild_id=ctx.guild.id,
+            channel_id=ctx.channel.id,
+        )
+
+        # Sync roles and nickname
+        await self._sync_member(ctx.author, new_score)
+
+        gif = random.choice(PILL_GIFS)
+        embed = discord.Embed(
+            title=f"{ctx.author.display_name} took their happy pills!",
+            description="You took your happy pills!",
+            color=discord.Color.blue(),
+        )
+        embed.set_image(url=gif)
+        embed.add_field(
+            name="Score",
+            value=f"{new_score} (+50)",
+            inline=True,
+        )
+        embed.set_footer(text="Stay happy! Pills available once every 4 hours.")
 
         await ctx.send(embed=embed)
 
