@@ -28,6 +28,7 @@ HUG_GIFS = [
     "https://static.klipy.com/ii/8ce8357c78ea940b9c2015daf05ce1a5/c0/c8/Gsu4wPlf.gif",
     "https://static.klipy.com/ii/35ccce3d852f7995dd2da910f2abd795/4a/74/bdx8ZIaf.gif",
     "https://static.klipy.com/ii/35ccce3d852f7995dd2da910f2abd795/f9/fd/lLT2zSIO.gif",
+    "https://c.tenor.com/SW_VmrncNb0AAAAd/tenor.gif",
 ]
 
 
@@ -249,7 +250,7 @@ class SocialCredit(commands.Cog):
         if target.bot:
             return await ctx.send("You can't hug a bot!")
 
-        cooldown = await self.db.check_hug_cooldown(ctx.author.id, target.id)
+        cooldown = await self.db.check_hug_cooldown(ctx.author.id)
         if cooldown is not None:
             last_hug = datetime.fromisoformat(cooldown)
             next_hug = last_hug + timedelta(hours=24)
@@ -257,7 +258,7 @@ class SocialCredit(commands.Cog):
             hours, remainder = divmod(int(remaining.total_seconds()), 3600)
             minutes = remainder // 60
             return await ctx.send(
-                f"You already hugged {target.display_name} recently! "
+                f"You already hugged someone recently! "
                 f"Try again in {hours}h {minutes}m."
             )
 

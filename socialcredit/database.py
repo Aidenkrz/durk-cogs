@@ -184,9 +184,11 @@ class SocialCreditDatabase:
         Returns ISO timestamp string of last_hug_at if still on cooldown."""
         async with self.db.execute(
             """SELECT last_hug_at FROM hug_cooldowns
-               WHERE user_id = ? AND target_user_id = ?
-               AND last_hug_at > datetime('now', '-24 hours')""",
-            (user_id, target_user_id),
+            WHERE user_id = ?
+            AND last_hug_at > datetime('now', '-24 hours')
+            ORDER BY last_hug_at DESC
+            LIMIT 1""",
+            (user_id,),
         ) as cursor:
             row = await cursor.fetchone()
             if row:
