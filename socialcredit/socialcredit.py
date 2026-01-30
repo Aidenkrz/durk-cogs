@@ -29,6 +29,15 @@ HUG_GIFS = [
     "https://static.klipy.com/ii/35ccce3d852f7995dd2da910f2abd795/4a/74/bdx8ZIaf.gif",
     "https://static.klipy.com/ii/35ccce3d852f7995dd2da910f2abd795/f9/fd/lLT2zSIO.gif",
     "https://c.tenor.com/SW_VmrncNb0AAAAd/tenor.gif",
+    "https://c.tenor.com/SYsRdiK-T7gAAAAd/tenor.gif",
+    "https://i.pinimg.com/originals/d9/50/3a/d9503a7d49153bec0910daa5001c2491.gif",
+    "https://images-wixmp-ed30a86b8c4ca887773594c2.wixmp.com/f/d193fc60-75d9-4ab1-81b8-7a3eddefef08/dh8ann7-68f0e8d6-7aa1-455b-915f-ee9f48c9bac4.gif?token=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1cm46YXBwOjdlMGQxODg5ODIyNjQzNzNhNWYwZDQxNWVhMGQyNmUwIiwiaXNzIjoidXJuOmFwcDo3ZTBkMTg4OTgyMjY0MzczYTVmMGQ0MTVlYTBkMjZlMCIsIm9iaiI6W1t7InBhdGgiOiIvZi9kMTkzZmM2MC03NWQ5LTRhYjEtODFiOC03YTNlZGRlZmVmMDgvZGg4YW5uNy02OGYwZThkNi03YWExLTQ1NWItOTE1Zi1lZTlmNDhjOWJhYzQuZ2lmIn1dXSwiYXVkIjpbInVybjpzZXJ2aWNlOmZpbGUuZG93bmxvYWQiXX0.fNzxobIah_69it-xirUVgx6p00WV0ybzR7XGoe3BcDU",
+    "https://d.furaffinity.net/art/s0kz0/1740049376/1740049376.s0kz0_img_1417.gif",
+    "https://c.tenor.com/EtBSbdnsA3YAAAAd/tenor.gif",
+    "https://c.tenor.com/Y38iX9xrC6oAAAAd/tenor.gif",
+    "https://c.tenor.com/HisAEulVSJoAAAAd/tenor.gif",
+    "https://cdn.discordapp.com/attachments/1327397242633457747/1466751858835062896/z7rl4enf8czc1.gif?ex=697de29e&is=697c911e&hm=48bea8ecaa0dc865dc3df4d7eb7dcfe30613fa341ee4a1d3569684e2f9005a19&",
+
 ]
 
 
