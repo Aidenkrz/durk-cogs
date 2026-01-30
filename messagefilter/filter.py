@@ -1,5 +1,6 @@
 from redbot.core import commands, Config, checks
 import asyncio
+from collections import Counter
 import discord
 from datetime import datetime, timezone, timedelta
 import re
@@ -10,6 +11,9 @@ from detoxify import Detoxify
 
 nltk.download("vader_lexicon", quiet=True)
 nltk.download("punkt_tab", quiet=True)
+
+NEG_PROPORTION_THRESHOLD = 0.45
+
 
 class MessageFilter(commands.Cog):
     """Automatically delete messages that don't contain required words and filter negative sentiment"""
@@ -29,11 +33,13 @@ class MessageFilter(commands.Cog):
         }
         self.config.register_guild(**default_guild)
 
+    # ── Word-filter channel management ─────────────────────────────────
+
     @commands.group()
     async def filter(self, ctx):
         """Manage message filtering"""
         pass
-        
+
     @filter.command()
     @commands.admin_or_permissions(administrator=True)
     async def addchannel(self, ctx, channel: discord.TextChannel):
@@ -42,22 +48,21 @@ class MessageFilter(commands.Cog):
                 channels[str(channel.id)] = {
                     "words": [],
                     "filtered_count": 0,
-                    "word_usage": {}
+                    "word_usage": {},
                 }
                 embed = discord.Embed(
                     title="✅ Channel Added",
                     description=f"{channel.mention} will now filter messages",
-                    color=0x00ff00
+                    color=0x00FF00,
                 )
-                await ctx.send(embed=embed)
             else:
                 embed = discord.Embed(
                     title="⚠️ Already Filtered",
                     description=f"{channel.mention} is already being monitored",
-                    color=0xffd700
+                    color=0xFFD700,
                 )
-                await ctx.send(embed=embed)
-                
+            await ctx.send(embed=embed)
+
     @filter.command()
     @commands.admin_or_permissions(administrator=True)
     async def removechannel(self, ctx, channel: discord.TextChannel):
@@ -68,16 +73,15 @@ class MessageFilter(commands.Cog):
                 embed = discord.Embed(
                     title="✅ Channel Removed",
                     description=f"Stopped filtering {channel.mention}",
-                    color=0x00ff00
+                    color=0x00FF00,
                 )
             else:
                 embed = discord.Embed(
                     title="⚠️ Not Filtered",
                     description=f"{channel.mention} wasn't being monitored",
-                    color=0xffd700
+                    color=0xFFD700,
                 )
             await ctx.send(embed=embed)
-                
 
     @filter.command()
     @commands.admin_or_permissions(administrator=True)
@@ -85,59 +89,48 @@ class MessageFilter(commands.Cog):
         """Add required words to a channel's filter"""
         try:
             converter = commands.TextChannelConverter()
-            channel, _, words_part = args.partition(' ')
+            channel, _, words_part = args.partition(" ")
             channel = await converter.convert(ctx, channel)
-            words = [w.strip().lower() for w in words_part.split(',') if w.strip()]
+            words = [w.strip().lower() for w in words_part.split(",") if w.strip()]
         except commands.BadArgument:
             channel = ctx.channel
-            words = [w.strip().lower() for w in args.split(',') if w.strip()]
-        
+            words = [w.strip().lower() for w in args.split(",") if w.strip()]
+
         async with self.config.guild(ctx.guild).channels() as channels:
             channel_id = str(channel.id)
-            
-            if channel_id in channels and isinstance(channels[channel_id], list):
-                channels[channel_id] = {
-                    "words": channels[channel_id],
-                    "filtered_count": 0,
-                    "word_usage": {}
-                }
-            
+            self._migrate_channel(channels, channel_id)
+
             if channel_id not in channels:
                 channels[channel_id] = {
                     "words": [],
                     "filtered_count": 0,
-                    "word_usage": {}
+                    "word_usage": {},
                 }
-            
+
             channel_data = channels[channel_id]
             existing_words = channel_data["words"]
-            added = []
-            
-            for word in words:
-                if word not in existing_words:
-                    existing_words.append(word)
-                    added.append(word)
-            
-            embed = discord.Embed(color=0x00ff00)
+            added = [w for w in words if w not in existing_words]
+            existing_words.extend(added)
+
+            embed = discord.Embed(color=0x00FF00)
             if added:
                 embed.title = f"✅ Added {len(added)} Words"
                 embed.description = f"To {channel.mention}'s filter"
                 embed.add_field(
                     name="New Words",
-                    value=', '.join(f'`{word}`' for word in added) or "None",
-                    inline=False
+                    value=", ".join(f"`{w}`" for w in added) or "None",
+                    inline=False,
                 )
-                current_words = ', '.join(f'`{w}`' for w in existing_words) or "None"
                 embed.add_field(
                     name="Current Filter Words",
-                    value=current_words,
-                    inline=False
+                    value=", ".join(f"`{w}`" for w in existing_words) or "None",
+                    inline=False,
                 )
             else:
                 embed.title = "⏩ No Changes"
                 embed.description = "All specified words were already in the filter"
-                embed.color = 0xffd700
-            
+                embed.color = 0xFFD700
+
             await ctx.send(embed=embed)
 
     @filter.command()
@@ -146,148 +139,134 @@ class MessageFilter(commands.Cog):
         """Remove words from a channel's filter"""
         try:
             converter = commands.TextChannelConverter()
-            channel, _, words_part = args.partition(' ')
+            channel, _, words_part = args.partition(" ")
             channel = await converter.convert(ctx, channel)
-            words = [w.strip().lower() for w in words_part.split(',') if w.strip()]
+            words = [w.strip().lower() for w in words_part.split(",") if w.strip()]
         except commands.BadArgument:
             channel = ctx.channel
-            words = [w.strip().lower() for w in args.split(',') if w.strip()]
-        
+            words = [w.strip().lower() for w in args.split(",") if w.strip()]
+
         async with self.config.guild(ctx.guild).channels() as channels:
             channel_id = str(channel.id)
-            
-            # Migrate legacy format if needed
-            if channel_id in channels and isinstance(channels[channel_id], list):
-                channels[channel_id] = {
-                    "words": channels[channel_id],
-                    "filtered_count": 0,
-                    "word_usage": {}
-                }
-                await self.config.guild(ctx.guild).channels.set(channels)
-            
+            self._migrate_channel(channels, channel_id)
+
             if channel_id not in channels:
                 return await ctx.send(f"{channel.mention} is not being filtered")
-            
+
             channel_data = channels[channel_id]
             required_words = channel_data["words"]
             removed = []
-            
+
             for word in words:
                 if word in required_words:
                     required_words.remove(word)
                     removed.append(word)
-                    # Remove from word usage stats
-                    if word in channel_data["word_usage"]:
-                        del channel_data["word_usage"][word]
-            
-            embed = discord.Embed(color=0x00ff00)
+                    channel_data["word_usage"].pop(word, None)
+
+            embed = discord.Embed(color=0x00FF00)
             if removed:
                 embed.title = f"❌ Removed {len(removed)} Words"
                 embed.description = f"From {channel.mention}'s filter"
                 embed.add_field(
                     name="Removed Words",
-                    value=', '.join(f'`{word}`' for word in removed) or "None",
-                    inline=False
+                    value=", ".join(f"`{w}`" for w in removed) or "None",
+                    inline=False,
                 )
-                
                 if required_words:
                     embed.add_field(
                         name="Remaining Words",
-                        value=', '.join(f'`{w}`' for w in required_words) or "None",
-                        inline=False
+                        value=", ".join(f"`{w}`" for w in required_words) or "None",
+                        inline=False,
                     )
-                    # Update the channel data
-                    channels[channel_id] = channel_data
                 else:
                     del channels[channel_id]
                     embed.add_field(
                         name="Channel Removed",
                         value="No words remaining in filter",
-                        inline=False
+                        inline=False,
                     )
-                
-                await self.config.guild(ctx.guild).channels.set(channels)
             else:
                 embed.title = "⏩ No Changes"
                 embed.description = "None of these words were in the filter"
-                embed.color = 0xffd700
-            
+                embed.color = 0xFFD700
+
             await ctx.send(embed=embed)
-                
+
     @filter.command()
     @commands.admin_or_permissions(administrator=True)
     async def logchannel(self, ctx, channel: discord.TextChannel):
         """Set the channel for logging filtered messages"""
         await self.config.guild(ctx.guild).log_channel.set(channel.id)
         await ctx.send(f"Filter logs will now be sent to {channel.mention}")
-        
+
     @filter.command()
     async def list(self, ctx):
         """Show currently filtered channels and their required words"""
         channels = await self.config.guild(ctx.guild).channels()
-        embed = discord.Embed(title="Filtered Channels", color=0x00ff00)
-        
+        embed = discord.Embed(title="Filtered Channels", color=0x00FF00)
+
         for channel_id, channel_data in channels.items():
             if isinstance(channel_data, list):
                 channel_data = {
                     "words": channel_data,
                     "filtered_count": 0,
-                    "word_usage": {}
+                    "word_usage": {},
                 }
-            
-            channel = ctx.guild.get_channel(int(channel_id))
-            if channel and channel_data.get("words"):
-                word_list = ', '.join(f'`{word}`' for word in channel_data["words"]) or "No words set"
+            ch = ctx.guild.get_channel(int(channel_id))
+            if ch and channel_data.get("words"):
+                word_list = ", ".join(f"`{w}`" for w in channel_data["words"]) or "No words set"
                 embed.add_field(
-                    name=f"#{channel.name}",
+                    name=f"#{ch.name}",
                     value=f"Required words: {word_list}",
-                    inline=False
+                    inline=False,
                 )
-        
+
         if not embed.fields:
             embed.description = "No channels being filtered"
-        
+
         await ctx.send(embed=embed)
-        
+
     @filter.command()
     async def stats(self, ctx, channel: discord.TextChannel = None):
         """Show filtering statistics for a channel"""
         channel = channel or ctx.channel
         channel_id = str(channel.id)
-        
+
         channels = await self.config.guild(ctx.guild).channels()
-        
+
         if channel_id in channels and isinstance(channels[channel_id], list):
             channels[channel_id] = {
                 "words": channels[channel_id],
                 "filtered_count": 0,
-                "word_usage": {}
+                "word_usage": {},
             }
             await self.config.guild(ctx.guild).channels.set(channels)
-        
+
         channel_data = channels.get(channel_id, {})
-        
+
         if not channel_data.get("words"):
             return await ctx.send(f"{channel.mention} is not being filtered")
-        
+
         embed = discord.Embed(
             title=f"Filter Statistics for #{channel.name}",
-            color=0x00ff00
+            color=0x00FF00,
         )
-        
+
         filtered_count = channel_data.get("filtered_count", 0)
         embed.add_field(name="🚫 Messages Filtered", value=str(filtered_count), inline=False)
 
         word_usage = channel_data.get("word_usage", {})
         if word_usage:
             sorted_words = sorted(word_usage.items(), key=lambda x: x[1], reverse=True)
-            top_words = "\n".join([f"• `{word}`: {count} uses" for word, count in sorted_words[:5]])
+            top_words = "\n".join(f"• `{word}`: {count} uses" for word, count in sorted_words[:5])
             embed.add_field(name="🏆 Top Filter Words", value=top_words, inline=False)
         else:
             embed.add_field(name="📊 Word Usage", value="No usage data collected yet", inline=False)
-            
+
         await ctx.send(embed=embed)
-        
+
+    # ── Sentiment filter management ────────────────────────────────────
+
     @filter.group(name="sentiment")
     @commands.admin_or_permissions(administrator=True)
     async def sentiment(self, ctx):
@@ -305,16 +284,15 @@ class MessageFilter(commands.Cog):
                 embed = discord.Embed(
                     title="Sentiment Channel Added",
                     description=f"{channel.mention} will now filter negative messages",
-                    color=0x00ff00,
+                    color=0x00FF00,
                 )
-                await ctx.send(embed=embed)
             else:
                 embed = discord.Embed(
                     title="Already Enabled",
                     description=f"{channel.mention} already has sentiment filtering",
-                    color=0xffd700,
+                    color=0xFFD700,
                 )
-                await ctx.send(embed=embed)
+            await ctx.send(embed=embed)
 
     @sentiment.command(name="removechannel")
     @commands.admin_or_permissions(administrator=True)
@@ -327,13 +305,13 @@ class MessageFilter(commands.Cog):
                 embed = discord.Embed(
                     title="Sentiment Channel Removed",
                     description=f"Stopped sentiment filtering on {channel.mention}",
-                    color=0x00ff00,
+                    color=0x00FF00,
                 )
             else:
                 embed = discord.Embed(
                     title="Not Enabled",
                     description=f"{channel.mention} didn't have sentiment filtering",
-                    color=0xffd700,
+                    color=0xFFD700,
                 )
             await ctx.send(embed=embed)
 
@@ -351,7 +329,7 @@ class MessageFilter(commands.Cog):
         embed = discord.Embed(
             title="Sentiment Threshold Updated",
             description=f"Messages with compound score below `{score}` will be filtered",
-            color=0x00ff00,
+            color=0x00FF00,
         )
         await ctx.send(embed=embed)
 
@@ -365,7 +343,7 @@ class MessageFilter(commands.Cog):
         embed = discord.Embed(
             title="Sentiment Timeout Updated",
             description=f"Users will be timed out for `{seconds}` seconds",
-            color=0x00ff00,
+            color=0x00FF00,
         )
         await ctx.send(embed=embed)
 
@@ -384,7 +362,7 @@ class MessageFilter(commands.Cog):
         embed = discord.Embed(
             title="Toxicity Threshold Updated",
             description=f"Messages with toxicity scores above `{score}` will be filtered",
-            color=0x00ff00,
+            color=0x00FF00,
         )
         await ctx.send(embed=embed)
 
@@ -403,10 +381,15 @@ class MessageFilter(commands.Cog):
                 count = data.get("filtered_count", 0)
                 channel_list.append(f"{ch.mention} ({count} filtered)")
 
-        embed = discord.Embed(title="Sentiment Filter Settings", color=0x00ff00)
+        embed = discord.Embed(title="Sentiment Filter Settings", color=0x00FF00)
         embed.add_field(name="VADER Threshold", value=f"`{threshold}`", inline=True)
         embed.add_field(name="Toxicity Threshold", value=f"`{tox_threshold}`", inline=True)
         embed.add_field(name="Timeout", value=f"`{timeout_secs}s`", inline=True)
+        embed.add_field(
+            name="Neg-proportion Threshold",
+            value=f"`{NEG_PROPORTION_THRESHOLD}`",
+            inline=True,
+        )
         embed.add_field(
             name="Channels",
             value="\n".join(channel_list) if channel_list else "None",
@@ -416,95 +399,135 @@ class MessageFilter(commands.Cog):
 
     @sentiment.command(name="test")
     async def sentiment_test(self, ctx, *, text: str):
-        """Test the sentiment score of a message against both detection layers"""
+        """Test the sentiment score of a message against all detection layers
+
+        Mirrors the runtime pipeline: VADER (clauses + dedup + neg-proportion)
+        runs first. Detoxify only runs if VADER did not trigger.
+        """
         threshold = await self.config.guild(ctx.guild).sentiment_threshold()
         tox_threshold = await self.config.guild(ctx.guild).toxicity_threshold()
 
-        # Layer 1: Sentence-level VADER
-        sentences = sent_tokenize(text)
+        deduped = self._deduplicate_text(text)
+        clauses = self._split_clauses(text)
+
+        # ── Layer 1: VADER ────────────────────────────────────────────
         vader_triggered = False
         sentence_lines = []
-        for sentence in sentences:
-            s = self.analyzer.polarity_scores(sentence)
+
+        # Per-clause scoring
+        for clause in clauses:
+            s = self.analyzer.polarity_scores(clause)
             flag = s["compound"] < threshold
             if flag:
                 vader_triggered = True
             marker = "X" if flag else "-"
-            sentence_lines.append(f"`[{marker}]` {s['compound']:+.4f} | {sentence}")
+            sentence_lines.append(f"`[{marker}]` {s['compound']:+.4f} | {clause}")
 
-        # Layer 2: Detoxify
-        loop = asyncio.get_event_loop()
-        tox = await loop.run_in_executor(None, self.toxicity_model.predict, text)
-        detox_triggered = (
-            tox["toxicity"] > tox_threshold
-            or tox["threat"] > tox_threshold
-            or tox["insult"] > tox_threshold
-            or tox["severe_toxicity"] > tox_threshold
+        # Deduped full-text scoring
+        deduped_scores = self.analyzer.polarity_scores(deduped)
+        deduped_flag = deduped_scores["compound"] < threshold
+        if deduped_flag:
+            vader_triggered = True
+        deduped_marker = "X" if deduped_flag else "-"
+        sentence_lines.append(
+            f"`[{deduped_marker}]` {deduped_scores['compound']:+.4f} | (deduped) {deduped}"
         )
+
+        # Neg-proportion check on deduped text
+        neg_prop = deduped_scores["neg"]
+        neg_flag = neg_prop >= NEG_PROPORTION_THRESHOLD
+        if neg_flag:
+            vader_triggered = True
+        neg_marker = "X" if neg_flag else "-"
+        sentence_lines.append(
+            f"`[{neg_marker}]` neg={neg_prop:.4f} (threshold {NEG_PROPORTION_THRESHOLD}) | neg-proportion check"
+        )
+
+        # ── Layer 2: Detoxify (only if VADER passed) ─────────────────
+        detox_triggered = False
+        tox = None
+        if not vader_triggered:
+            loop = asyncio.get_event_loop()
+            tox = await loop.run_in_executor(None, self.toxicity_model.predict, text)
+            detox_triggered = (
+                tox["toxicity"] > tox_threshold
+                or tox["threat"] > tox_threshold
+                or tox["insult"] > tox_threshold
+                or tox["severe_toxicity"] > tox_threshold
+            )
 
         would_filter = vader_triggered or detox_triggered
 
         embed = discord.Embed(
             title="Sentiment Analysis",
             description=f"**Text:** {text}",
-            color=0xff0000 if would_filter else 0x00ff00,
+            color=0xFF0000 if would_filter else 0x00FF00,
         )
 
         embed.add_field(
-            name=f"VADER (per-sentence, threshold: {threshold})",
-            value="\n".join(sentence_lines) or "No sentences",
+            name=f"VADER (per-clause + deduped + neg-prop, threshold: {threshold})",
+            value="\n".join(sentence_lines) or "No clauses",
             inline=False,
         )
-        embed.add_field(
-            name=f"Detoxify (threshold: {tox_threshold})",
-            value=(
-                f"Toxicity: `{tox['toxicity']:.4f}` | "
-                f"Threat: `{tox['threat']:.4f}` | "
-                f"Insult: `{tox['insult']:.4f}` | "
-                f"Severe: `{tox['severe_toxicity']:.4f}`"
-            ),
-            inline=False,
-        )
+
+        if tox is not None:
+            embed.add_field(
+                name=f"Detoxify (threshold: {tox_threshold})",
+                value=(
+                    f"Toxicity: `{tox['toxicity']:.4f}` | "
+                    f"Threat: `{tox['threat']:.4f}` | "
+                    f"Insult: `{tox['insult']:.4f}` | "
+                    f"Severe: `{tox['severe_toxicity']:.4f}`"
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name=f"Detoxify (threshold: {tox_threshold})",
+                value="Skipped — VADER already triggered",
+                inline=False,
+            )
+
         triggered_by = []
         if vader_triggered:
             triggered_by.append("VADER")
         if detox_triggered:
             triggered_by.append("Detoxify")
-        embed.add_field(
-            name="Would Filter",
-            value=f"{'Yes' if would_filter else 'No'}"
-            + (f" (triggered by: {', '.join(triggered_by)})" if triggered_by else ""),
-            inline=False,
-        )
+        verdict = "Yes" if would_filter else "No"
+        if triggered_by:
+            verdict += f" (triggered by: {', '.join(triggered_by)})"
+        embed.add_field(name="Would Filter", value=verdict, inline=False)
+
         await ctx.send(embed=embed)
+
+    # ── Misc commands ──────────────────────────────────────────────────
 
     @commands.command()
     async def ILOVEWARRIORS(self, ctx):
         """Grants the Warrior role"""
         role_id = 1351752263793774683
         role = ctx.guild.get_role(role_id)
-        
+
         if not role:
             return await ctx.send("❌ Warrior role not found")
-            
+
         if role in ctx.author.roles:
             return await ctx.send("Youre already a warrior!")
-            
+
         try:
             await ctx.author.add_roles(role)
             await ctx.send("You've become a warrior! Welcome to the clan.")
         except discord.Forbidden:
             await ctx.send("❌ I don't have permissions to assign roles")
-                
+
+    # ── Event listener ─────────────────────────────────────────────────
+
     @commands.Cog.listener()
     async def on_message(self, message):
-        await self.check_message(message)
+        await self._check_message(message)
 
-    async def check_message(self, message):
-        if message.author.bot:
-            return
-
-        if not message.guild:
+    async def _check_message(self, message):
+        if message.author.bot or not message.guild:
             return
 
         if message.channel.permissions_for(message.author).manage_messages:
@@ -514,118 +537,131 @@ class MessageFilter(commands.Cog):
         content = message.content.lower().strip()
         for prefix in prefixes:
             if content.startswith(prefix.lower()):
-                cmd = content[len(prefix):].strip()
-                if cmd.startswith("filter") or cmd.startswith("ILOVEWARRIORS"):
+                cmd = content[len(prefix) :].strip()
+                if cmd.startswith("filter") or cmd.startswith("ilovewarriors"):
                     return
 
-        deleted_by_word_filter = await self._check_word_filter(message)
-
-        if not deleted_by_word_filter:
+        deleted = await self._check_word_filter(message)
+        if not deleted:
             await self._check_sentiment(message)
+
+    # ── Word filter runtime ────────────────────────────────────────────
 
     async def _check_word_filter(self, message):
         """Run the word-based filter. Returns True if the message was deleted."""
         async with self.config.guild(message.guild).channels() as channels:
             channel_id = str(message.channel.id)
-
             if channel_id not in channels:
                 return False
 
-            if isinstance(channels[channel_id], list):
-                channels[channel_id] = {
-                    "words": channels[channel_id],
-                    "filtered_count": 0,
-                    "word_usage": {}
-                }
-                await self.config.guild(message.guild).channels.set(channels)
-
+            self._migrate_channel(channels, channel_id)
             channel_data = channels[channel_id]
             required_words = channel_data.get("words", [])
 
             if not required_words:
                 return False
 
-            cleaned = self.strip_markdown(message.content)
-            regexes = [self.wildcard_to_regex(word) for word in required_words]
+            cleaned = self._strip_markdown(message.content)
             match_found = False
 
-            for word, regex in zip(required_words, regexes):
-                if regex.search(cleaned):
+            for word in required_words:
+                if self._wildcard_to_regex(word).search(cleaned):
                     channel_data["word_usage"][word] = channel_data["word_usage"].get(word, 0) + 1
                     match_found = True
                     break
 
-            if not match_found:
-                try:
-                    await message.delete()
-                    await self.log_filtered_message(message)
-                    channel_data["filtered_count"] = channel_data.get("filtered_count", 0) + 1
-
-                    try:
-                        word_list = ', '.join(f'`{word}`' for word in required_words)
-                        await message.author.send(
-                            f"Your message in {message.channel.mention} was filtered because "
-                            f"it did not contain one of the following words: {word_list}",
-                            delete_after=120
-                        )
-                    except discord.Forbidden:
-                        pass
-
-                    try:
-                        await message.author.timeout(
-                            timedelta(seconds=20),
-                            reason=f"Filter violation in #{message.channel.name}"
-                        )
-                    except discord.Forbidden:
-                        pass
-
-                except discord.HTTPException:
-                    pass
-                finally:
-                    channels[channel_id] = channel_data
-                    await self.config.guild(message.guild).channels.set(channels)
-                return True
-            else:
-                channels[channel_id] = channel_data
-                await self.config.guild(message.guild).channels.set(channels)
+            if match_found:
                 return False
 
+            try:
+                await message.delete()
+                await self._log_filtered_message(message)
+                channel_data["filtered_count"] = channel_data.get("filtered_count", 0) + 1
+
+                try:
+                    word_list = ", ".join(f"`{w}`" for w in required_words)
+                    await message.author.send(
+                        f"Your message in {message.channel.mention} was filtered because "
+                        f"it did not contain one of the following words: {word_list}",
+                        delete_after=120,
+                    )
+                except discord.Forbidden:
+                    pass
+
+                try:
+                    await message.author.timeout(
+                        timedelta(seconds=20),
+                        reason=f"Filter violation in #{message.channel.name}",
+                    )
+                except discord.Forbidden:
+                    pass
+            except discord.HTTPException:
+                pass
+
+            return True
+
+    # ── Sentiment filter runtime ───────────────────────────────────────
+
     async def _check_sentiment(self, message):
-        """Run layered sentiment filtering: sentence-level VADER then Detoxify."""
+        """Run layered sentiment filtering.
+
+        Order:
+        1. VADER — clause-level scoring, deduped full-text scoring, neg-proportion.
+        2. Detoxify — only reached when VADER does not trigger.
+        """
         channel_id = str(message.channel.id)
         sentiment_channels = await self.config.guild(message.guild).sentiment_channels()
 
         if channel_id not in sentiment_channels:
             return
 
-        cleaned = self.strip_markdown(message.content)
+        cleaned = self._strip_markdown(message.content)
         if not cleaned:
             return
 
         threshold = await self.config.guild(message.guild).sentiment_threshold()
 
-        # Layer 1: Sentence-level VADER — check each sentence independently
-        sentences = sent_tokenize(cleaned)
-        for sentence in sentences:
-            scores = self.analyzer.polarity_scores(sentence)
+        # Layer 1a: clause-level VADER
+        clauses = self._split_clauses(cleaned)
+        for clause in clauses:
+            scores = self.analyzer.polarity_scores(clause)
             if scores["compound"] < threshold:
                 await self._handle_sentiment_violation(
-                    message, scores, layer="VADER", detail=f"Sentence: {sentence}"
+                    message, scores, layer="VADER", detail=f"Clause: {clause}"
                 )
                 return
 
-        # Layer 2: Detoxify — run transformer toxicity check in executor
+        # Layer 1b: deduped full-text VADER
+        deduped = self._deduplicate_text(cleaned)
+        deduped_scores = self.analyzer.polarity_scores(deduped)
+        if deduped_scores["compound"] < threshold:
+            await self._handle_sentiment_violation(
+                message, deduped_scores, layer="VADER", detail=f"Deduped: {deduped}"
+            )
+            return
+
+        # Layer 1c: neg-proportion check on deduped text
+        if deduped_scores["neg"] >= NEG_PROPORTION_THRESHOLD:
+            await self._handle_sentiment_violation(
+                message,
+                deduped_scores,
+                layer="VADER",
+                detail=f"Neg-proportion {deduped_scores['neg']:.2f} >= {NEG_PROPORTION_THRESHOLD}",
+            )
+            return
+
+        # Layer 2: Detoxify (only if all VADER checks passed)
         toxicity_threshold = await self.config.guild(message.guild).toxicity_threshold()
         loop = asyncio.get_event_loop()
         results = await loop.run_in_executor(None, self.toxicity_model.predict, cleaned)
 
-        if (results["toxicity"] > toxicity_threshold
-                or results["threat"] > toxicity_threshold
-                or results["insult"] > toxicity_threshold
-                or results["severe_toxicity"] > toxicity_threshold):
-            await self._handle_sentiment_violation(
-                message, results, layer="Detoxify", detail=None
-            )
+        if (
+            results["toxicity"] > toxicity_threshold
+            or results["threat"] > toxicity_threshold
+            or results["insult"] > toxicity_threshold
+            or results["severe_toxicity"] > toxicity_threshold
+        ):
+            await self._handle_sentiment_violation(message, results, layer="Detoxify", detail=None)
 
     async def _handle_sentiment_violation(self, message, scores, *, layer, detail):
         """Delete message, DM user, timeout, log — shared by both layers."""
@@ -634,11 +670,13 @@ class MessageFilter(commands.Cog):
 
         try:
             await message.delete()
-            await self.log_sentiment_message(message, scores, layer=layer, detail=detail)
+            await self._log_sentiment_message(message, scores, layer=layer, detail=detail)
 
             async with self.config.guild(message.guild).sentiment_channels() as channels:
                 if channel_id in channels:
-                    channels[channel_id]["filtered_count"] = channels[channel_id].get("filtered_count", 0) + 1
+                    channels[channel_id]["filtered_count"] = (
+                        channels[channel_id].get("filtered_count", 0) + 1
+                    )
 
             if layer == "VADER":
                 reason_text = (
@@ -674,69 +712,128 @@ class MessageFilter(commands.Cog):
                     )
                 except discord.Forbidden:
                     pass
-
         except discord.HTTPException:
             pass
-                        
-    def wildcard_to_regex(self, word):
-        parts = word.split('*')
+
+    # ── Text processing helpers ────────────────────────────────────────
+
+    def _split_clauses(self, text):
+        """Split text into clauses using punctuation, newlines, and conjunctions.
+
+        Discord messages rarely use proper sentence punctuation, so sent_tokenize
+        alone won't split "KILL DURK WITH HAMMERS Love Love Love".  This splits on
+        commas, semicolons, newlines, pipes, dashes surrounded by spaces, and common
+        conjunctions (but, and, or, then, so, yet) when surrounded by spaces.
+        The result is merged with sent_tokenize output and deduplicated while
+        preserving order.
+        """
+        sentences = sent_tokenize(text)
+        clause_parts = re.split(
+            r"[,;\n|]|\s+(?:but|and|or|then|so|yet)\s+|\s-\s", text
+        )
+
+        seen = set()
+        clauses = []
+        for part in sentences + clause_parts:
+            stripped = part.strip()
+            if stripped and stripped not in seen:
+                seen.add(stripped)
+                clauses.append(stripped)
+
+        return clauses
+
+    def _deduplicate_text(self, text):
+        """Collapse repeated words so padding like "Love Love Love Love" becomes "Love Love".
+
+        Each word is allowed at most 2 occurrences to preserve natural emphasis
+        while killing spam-padding that dilutes VADER's compound score.
+        """
+        words = text.split()
+        counts = Counter()
+        result = []
+        for word in words:
+            key = word.lower()
+            counts[key] += 1
+            if counts[key] <= 2:
+                result.append(word)
+        return " ".join(result)
+
+    @staticmethod
+    def _wildcard_to_regex(word):
+        parts = word.split("*")
         escaped = [re.escape(part) for part in parts]
-        pattern = '.*'.join(escaped)
-        if '*' not in word:
-            pattern = rf'\b{pattern}\b'
-    
+        pattern = ".*".join(escaped)
+        if "*" not in word:
+            pattern = rf"\b{pattern}\b"
         return re.compile(pattern)
-        
-    def strip_markdown(self, content):
-        invisible_chars_pattern = r'[\u200B-\u200D\uFEFF\u2060-\u206F\u180E\u00AD\u200E\u200F\u202A-\u202E\u206A-\u206F]'
-        content = re.sub(invisible_chars_pattern, '', content)
 
-        content = re.sub(r'```.*?```', ' ', content, flags=re.DOTALL | re.MULTILINE)  # Multi-line code blocks
-        content = re.sub(r'`[^`]+?`', ' ', content)  # Inline code
-        content = re.sub(r'\|\|(.*?)\|\|', ' ', content, flags=re.DOTALL)  # Spoilers
-        content = re.sub(r':[a-zA-Z0-9_+-]+:', ' ', content)  # Emoji tags
+    @staticmethod
+    def _strip_markdown(content):
+        invisible = r"[\u200B-\u200D\uFEFF\u2060-\u206F\u180E\u00AD\u200E\u200F\u202A-\u202E\u206A-\u206F]"
+        content = re.sub(invisible, "", content)
 
-        content = re.sub(r'~~(.*?)~~', r'\1', content, flags=re.DOTALL) # Strikethrough
-        content = re.sub(r'\[([^\]\n]+)\]\([^\)]+\)', r'\1', content)  # Hyperlinks (keep link text)
+        content = re.sub(r"```.*?```", " ", content, flags=re.DOTALL | re.MULTILINE)
+        content = re.sub(r"`[^`]+?`", " ", content)
+        content = re.sub(r"\|\|(.*?)\|\|", " ", content, flags=re.DOTALL)
+        content = re.sub(r":[a-zA-Z0-9_+-]+:", " ", content)
 
-        content = re.sub(r'\*\*\*(.*?)\*\*\*', r'\1', content, flags=re.DOTALL)  # Bold Italic
-        content = re.sub(r'\*\*(.*?)\*\*', r'\1', content, flags=re.DOTALL)      # Bold
-        content = re.sub(r'__(.*?)__', r'\1', content, flags=re.DOTALL)          # Underline (Discord uses this for underline)
-        content = re.sub(r'\*([^\s\*](?:.*?[^\s\*])?)\*', r'\1', content, flags=re.DOTALL) # Italic *text* (ensure not empty and not just spaces)
-        content = re.sub(r'_([^\s_](?:.*?[^\s_])?)_', r'\1', content, flags=re.DOTALL) # Italic _text_ (ensure not empty and not just spaces)
+        content = re.sub(r"~~(.*?)~~", r"\1", content, flags=re.DOTALL)
+        content = re.sub(r"\[([^\]\n]+)\]\([^\)]+\)", r"\1", content)
 
-        content = re.sub(r'^(>>> ?|>> ?|> ?)(.*)', r'\2', content, flags=re.MULTILINE) # Block quotes, keep content
-        content = re.sub(r'^#+\s*(.+)', r'\1', content, flags=re.MULTILINE)     # Headers, keep content
+        content = re.sub(r"\*\*\*(.*?)\*\*\*", r"\1", content, flags=re.DOTALL)
+        content = re.sub(r"\*\*(.*?)\*\*", r"\1", content, flags=re.DOTALL)
+        content = re.sub(r"__(.*?)__", r"\1", content, flags=re.DOTALL)
+        content = re.sub(r"\*([^\s\*](?:.*?[^\s\*])?)\*", r"\1", content, flags=re.DOTALL)
+        content = re.sub(r"_([^\s_](?:.*?[^\s_])?)_", r"\1", content, flags=re.DOTALL)
 
-        lines = content.split('\n')
-        lines = [line for line in lines if '#-' not in line]
-        content = '\n'.join(lines)
+        content = re.sub(r"^(>>> ?|>> ?|> ?)(.*)", r"\2", content, flags=re.MULTILINE)
+        content = re.sub(r"^#+\s*(.+)", r"\1", content, flags=re.MULTILINE)
 
-        content = re.sub(r'[~|*_`#-]', ' ', content)
-        content = re.sub(r'\s+', ' ', content).strip()
-        
+        lines = content.split("\n")
+        lines = [line for line in lines if "#-" not in line]
+        content = "\n".join(lines)
+
+        content = re.sub(r"[~|*_`#-]", " ", content)
+        content = re.sub(r"\s+", " ", content).strip()
+
         return content.lower()
 
-    async def log_filtered_message(self, message):
+    @staticmethod
+    def _migrate_channel(channels, channel_id):
+        """Convert legacy list-format channel data to the current dict format."""
+        if channel_id in channels and isinstance(channels[channel_id], list):
+            channels[channel_id] = {
+                "words": channels[channel_id],
+                "filtered_count": 0,
+                "word_usage": {},
+            }
+
+    # ── Logging ────────────────────────────────────────────────────────
+
+    async def _log_filtered_message(self, message):
         log_channel_id = await self.config.guild(message.guild).log_channel()
         if not log_channel_id:
             return
-
         log_channel = message.guild.get_channel(log_channel_id)
         if not log_channel:
             return
 
         embed = discord.Embed(
-            color=0xff0000,
-            description=f"**Message sent by {message.author.mention} filtered in {message.channel.mention}**\n"
-                       f"{message.content}"
+            color=0xFF0000,
+            description=(
+                f"**Message sent by {message.author.mention} filtered in "
+                f"{message.channel.mention}**\n{message.content}"
+            ),
         )
         embed.set_author(
             name=f"{message.author.name} ({message.author.id})",
-            icon_url=message.author.display_avatar.url
+            icon_url=message.author.display_avatar.url,
         )
         embed.set_footer(
-            text=f"Author: {message.author.id} | Message ID: {message.id} • {datetime.now().strftime('%b %d, %Y %I:%M %p')}"
+            text=(
+                f"Author: {message.author.id} | Message ID: {message.id} • "
+                f"{datetime.now().strftime('%b %d, %Y %I:%M %p')}"
+            )
         )
 
         try:
@@ -744,17 +841,16 @@ class MessageFilter(commands.Cog):
         except discord.HTTPException:
             pass
 
-    async def log_sentiment_message(self, message, scores, *, layer="VADER", detail=None):
+    async def _log_sentiment_message(self, message, scores, *, layer="VADER", detail=None):
         log_channel_id = await self.config.guild(message.guild).log_channel()
         if not log_channel_id:
             return
-
         log_channel = message.guild.get_channel(log_channel_id)
         if not log_channel:
             return
 
         embed = discord.Embed(
-            color=0xff0000,
+            color=0xFF0000,
             description=(
                 f"**Message sent by {message.author.mention} removed for negative sentiment "
                 f"in {message.channel.mention}** [{layer}]\n{message.content}"
@@ -769,7 +865,7 @@ class MessageFilter(commands.Cog):
                 inline=True,
             )
             if detail:
-                embed.add_field(name="Flagged Sentence", value=detail, inline=False)
+                embed.add_field(name="Flagged", value=detail, inline=False)
         else:
             embed.add_field(name="Toxicity", value=f"{scores['toxicity']:.4f}", inline=True)
             embed.add_field(name="Threat", value=f"{scores['threat']:.4f}", inline=True)
@@ -781,7 +877,10 @@ class MessageFilter(commands.Cog):
             icon_url=message.author.display_avatar.url,
         )
         embed.set_footer(
-            text=f"Author: {message.author.id} | Message ID: {message.id} • {datetime.now().strftime('%b %d, %Y %I:%M %p')}"
+            text=(
+                f"Author: {message.author.id} | Message ID: {message.id} • "
+                f"{datetime.now().strftime('%b %d, %Y %I:%M %p')}"
+            )
         )
 
         try:
