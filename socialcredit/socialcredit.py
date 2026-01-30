@@ -155,7 +155,7 @@ class SocialCredit(commands.Cog):
         if guild:
             member = guild.get_member(user_id)
             if member:
-                await self._sync_member(member, new_score)
+                await self._sync_member(member, new_score, nick=True, punish=True)
         return new_score
 
     async def get_user_credit(self, user_id: int) -> Optional[int]:
@@ -197,7 +197,7 @@ class SocialCredit(commands.Cog):
         if guild:
             member = guild.get_member(user_id)
             if member:
-                await self._sync_member(member, new_score)
+                await self._sync_member(member, new_score, nick=True, punish=False)
         return new_score
 
     async def penalize_negative_sentiment(
@@ -233,7 +233,7 @@ class SocialCredit(commands.Cog):
         if guild:
             member = guild.get_member(user_id)
             if member:
-                await self._sync_member(member, new_score)
+                await self._sync_member(member, new_score, nick=True, punish=True)
         return new_score
 
     async def get_timeout_multiplier(self, user_id: int) -> float:
@@ -252,11 +252,13 @@ class SocialCredit(commands.Cog):
 
     # ── Role & nickname sync ──────────────────────────────────────────
 
-    async def _sync_member(self, member: discord.Member, score: int):
-        """Sync roles, nickname, and punishments for a member after a score change."""
+    async def _sync_member(self, member: discord.Member, score: int, *, nick: bool = True, punish: bool = True):
+        """Sync roles, nickname (optional), and punishments (optional) for a member after a score change."""
         await self._sync_roles(member, score)
-        await self._sync_nickname(member, score)
-        await self._sync_punishments(member, score)
+        if nick:
+            await self._sync_nickname(member, score)
+        if punish:
+            await self._sync_punishments(member, score)
 
     async def _sync_roles(self, member: discord.Member, score: int):
         """Add/remove roles based on score thresholds for this guild."""
@@ -399,9 +401,9 @@ class SocialCredit(commands.Cog):
             channel_id=ctx.channel.id,
         )
 
-        # Sync roles and nickname for both users
-        await self._sync_member(ctx.author, new_author)
-        await self._sync_member(target, new_target)
+        # Sync roles and nickname for both users (no punish on positive hug)
+        await self._sync_member(ctx.author, new_author, nick=True, punish=False)
+        await self._sync_member(target, new_target, nick=True, punish=False)
 
         gif = random.choice(HUG_GIFS)
         embed = discord.Embed(
@@ -451,8 +453,8 @@ class SocialCredit(commands.Cog):
             channel_id=ctx.channel.id,
         )
 
-        # Sync roles and nickname
-        await self._sync_member(ctx.author, new_score)
+        # Sync roles and nickname (no punish on positive pills)
+        await self._sync_member(ctx.author, new_score, nick=True, punish=False)
 
         gif = random.choice(PILL_GIFS)
         embed = discord.Embed(
@@ -587,7 +589,7 @@ class SocialCredit(commands.Cog):
             guild_id=ctx.guild.id,
             channel_id=ctx.channel.id,
         )
-        await self._sync_member(user, score)
+        await self._sync_member(user, score, nick=True, punish=True)
         await ctx.send(
             f"Set {user.display_name}'s score to **{score}** (was {old_score}, delta {score - old_score:+d})."
         )
@@ -605,7 +607,7 @@ class SocialCredit(commands.Cog):
             guild_id=ctx.guild.id,
             channel_id=ctx.channel.id,
         )
-        await self._sync_member(user, new_score)
+        await self._sync_member(user, new_score, nick=True, punish=True)
         await ctx.send(
             f"Adjusted {user.display_name}'s score by **{amount:+d}**. New score: **{new_score}**"
         )
@@ -892,9 +894,8 @@ class SocialCredit(commands.Cog):
             channel_id=channel.id,
         )
 
-        await self._sync_roles(reactor_member, new_score)
-        await self._sync_punishments(reactor_member, new_score)
-        # Skip nickname sync on reactions to avoid rate limits
+        await self._sync_member(reactor_member, new_score, nick=False, punish=amount < 0)
+        # Unified sync: no nick on reacts, punish only on retract (-1)
 
 
     @commands.Cog.listener()
