@@ -1,0 +1,22 @@
+{
+    "author": ["Durk"],
+    "install_msg": "Thank you for installing the MessageFilter cog!",
+    "name": "MessageFilter",
+    "short": "Filter messages by required words and negative sentiment",
+    "description": "Automatically delete messages that don't contain required words and filter negative sentiment using VADER/NLTK analysis. Supports per-channel configuration, timeout on violations, and logging.",
+    "tags": [
+        "filter",
+        "moderation",
+        "sentiment",
+        "automod"
+    ],
+    "requirements": [
+        "nltk"
+    ],
+    "required_cogs": {},
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "end_user_data_statement": "This cog does not store user data."
+}
