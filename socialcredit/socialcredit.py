@@ -761,7 +761,7 @@ class SocialCredit(commands.Cog):
             return
 
         emoji_str = str(payload.emoji)
-        if emoji_str not in self.POSITIVE_REACTIONS:
+        if emoji_str not in POSITIVE_REACTIONS:
             return
 
         new_score = await self.db.adjust_score(
