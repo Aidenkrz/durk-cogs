@@ -2,16 +2,24 @@ from redbot.core import commands, Config, checks
 import discord
 from datetime import datetime, timezone, timedelta
 import re
+import nltk
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+
+nltk.download("vader_lexicon", quiet=True)
 
 class MessageFilter(commands.Cog):
-    """Automatically delete messages that don't contain required words"""
-    
+    """Automatically delete messages that don't contain required words and filter negative sentiment"""
+
     def __init__(self, bot):
         self.bot = bot
         self.config = Config.get_conf(self, identifier=1234567890)
+        self.analyzer = SentimentIntensityAnalyzer()
         default_guild = {
             "channels": {},
-            "active": True
+            "active": True,
+            "sentiment_channels": {},
+            "sentiment_threshold": -0.5,
+            "sentiment_timeout": 30,
         }
         self.config.register_guild(**default_guild)
 
@@ -274,6 +282,131 @@ class MessageFilter(commands.Cog):
             
         await ctx.send(embed=embed)
         
+    @filter.group(name="sentiment")
+    @commands.admin_or_permissions(administrator=True)
+    async def sentiment(self, ctx):
+        """Manage sentiment-based filtering"""
+        pass
+
+    @sentiment.command(name="addchannel")
+    @commands.admin_or_permissions(administrator=True)
+    async def sentiment_addchannel(self, ctx, channel: discord.TextChannel):
+        """Enable sentiment filtering on a channel"""
+        async with self.config.guild(ctx.guild).sentiment_channels() as channels:
+            channel_id = str(channel.id)
+            if channel_id not in channels:
+                channels[channel_id] = {"filtered_count": 0}
+                embed = discord.Embed(
+                    title="Sentiment Channel Added",
+                    description=f"{channel.mention} will now filter negative messages",
+                    color=0x00ff00,
+                )
+                await ctx.send(embed=embed)
+            else:
+                embed = discord.Embed(
+                    title="Already Enabled",
+                    description=f"{channel.mention} already has sentiment filtering",
+                    color=0xffd700,
+                )
+                await ctx.send(embed=embed)
+
+    @sentiment.command(name="removechannel")
+    @commands.admin_or_permissions(administrator=True)
+    async def sentiment_removechannel(self, ctx, channel: discord.TextChannel):
+        """Disable sentiment filtering on a channel"""
+        async with self.config.guild(ctx.guild).sentiment_channels() as channels:
+            channel_id = str(channel.id)
+            if channel_id in channels:
+                del channels[channel_id]
+                embed = discord.Embed(
+                    title="Sentiment Channel Removed",
+                    description=f"Stopped sentiment filtering on {channel.mention}",
+                    color=0x00ff00,
+                )
+            else:
+                embed = discord.Embed(
+                    title="Not Enabled",
+                    description=f"{channel.mention} didn't have sentiment filtering",
+                    color=0xffd700,
+                )
+            await ctx.send(embed=embed)
+
+    @sentiment.command(name="threshold")
+    @commands.admin_or_permissions(administrator=True)
+    async def sentiment_threshold(self, ctx, score: float):
+        """Set the minimum sentiment compound score (range: -1.0 to 0.0)
+
+        Messages scoring below this value are considered negative and will be filtered.
+        Default is -0.5. Lower values (e.g. -0.8) are more lenient, higher values (e.g. -0.2) are stricter.
+        """
+        if score < -1.0 or score > 0.0:
+            return await ctx.send("Threshold must be between -1.0 and 0.0")
+        await self.config.guild(ctx.guild).sentiment_threshold.set(score)
+        embed = discord.Embed(
+            title="Sentiment Threshold Updated",
+            description=f"Messages with compound score below `{score}` will be filtered",
+            color=0x00ff00,
+        )
+        await ctx.send(embed=embed)
+
+    @sentiment.command(name="timeout")
+    @commands.admin_or_permissions(administrator=True)
+    async def sentiment_timeout(self, ctx, seconds: int):
+        """Set how long (in seconds) to timeout users who send negative messages"""
+        if seconds < 0 or seconds > 2419200:
+            return await ctx.send("Timeout must be between 0 and 2419200 seconds (28 days)")
+        await self.config.guild(ctx.guild).sentiment_timeout.set(seconds)
+        embed = discord.Embed(
+            title="Sentiment Timeout Updated",
+            description=f"Users will be timed out for `{seconds}` seconds",
+            color=0x00ff00,
+        )
+        await ctx.send(embed=embed)
+
+    @sentiment.command(name="settings")
+    async def sentiment_settings(self, ctx):
+        """Show current sentiment filter settings"""
+        threshold = await self.config.guild(ctx.guild).sentiment_threshold()
+        timeout_secs = await self.config.guild(ctx.guild).sentiment_timeout()
+        channels = await self.config.guild(ctx.guild).sentiment_channels()
+
+        channel_list = []
+        for cid, data in channels.items():
+            ch = ctx.guild.get_channel(int(cid))
+            if ch:
+                count = data.get("filtered_count", 0)
+                channel_list.append(f"{ch.mention} ({count} filtered)")
+
+        embed = discord.Embed(title="Sentiment Filter Settings", color=0x00ff00)
+        embed.add_field(name="Threshold", value=f"`{threshold}`", inline=True)
+        embed.add_field(name="Timeout", value=f"`{timeout_secs}s`", inline=True)
+        embed.add_field(
+            name="Channels",
+            value="\n".join(channel_list) if channel_list else "None",
+            inline=False,
+        )
+        await ctx.send(embed=embed)
+
+    @sentiment.command(name="test")
+    async def sentiment_test(self, ctx, *, text: str):
+        """Test the sentiment score of a message"""
+        scores = self.analyzer.polarity_scores(text)
+        threshold = await self.config.guild(ctx.guild).sentiment_threshold()
+        would_filter = scores["compound"] < threshold
+
+        embed = discord.Embed(
+            title="Sentiment Analysis",
+            description=f"**Text:** {text}",
+            color=0xff0000 if would_filter else 0x00ff00,
+        )
+        embed.add_field(name="Compound", value=f"`{scores['compound']:.4f}`", inline=True)
+        embed.add_field(name="Positive", value=f"`{scores['pos']:.4f}`", inline=True)
+        embed.add_field(name="Neutral", value=f"`{scores['neu']:.4f}`", inline=True)
+        embed.add_field(name="Negative", value=f"`{scores['neg']:.4f}`", inline=True)
+        embed.add_field(name="Threshold", value=f"`{threshold}`", inline=True)
+        embed.add_field(name="Would Filter", value="Yes" if would_filter else "No", inline=True)
+        await ctx.send(embed=embed)
+
     @commands.command()
     async def ILOVEWARRIORS(self, ctx):
         """Grants the Warrior role"""
@@ -299,13 +432,13 @@ class MessageFilter(commands.Cog):
     async def check_message(self, message):
         if message.author.bot:
             return
-            
+
         if not message.guild:
             return
-    
+
         if message.channel.permissions_for(message.author).manage_messages:
             return
-    
+
         prefixes = await self.bot.get_valid_prefixes(message.guild)
         content = message.content.lower().strip()
         for prefix in prefixes:
@@ -313,65 +446,127 @@ class MessageFilter(commands.Cog):
                 cmd = content[len(prefix):].strip()
                 if cmd.startswith("filter") or cmd.startswith("ILOVEWARRIORS"):
                     return
-    
+
+        deleted_by_word_filter = await self._check_word_filter(message)
+
+        if not deleted_by_word_filter:
+            await self._check_sentiment(message)
+
+    async def _check_word_filter(self, message):
+        """Run the word-based filter. Returns True if the message was deleted."""
         async with self.config.guild(message.guild).channels() as channels:
             channel_id = str(message.channel.id)
-            
-            if channel_id in channels:
-                if isinstance(channels[channel_id], list):
-                    channels[channel_id] = {
-                        "words": channels[channel_id],
-                        "filtered_count": 0,
-                        "word_usage": {}
-                    }
+
+            if channel_id not in channels:
+                return False
+
+            if isinstance(channels[channel_id], list):
+                channels[channel_id] = {
+                    "words": channels[channel_id],
+                    "filtered_count": 0,
+                    "word_usage": {}
+                }
+                await self.config.guild(message.guild).channels.set(channels)
+
+            channel_data = channels[channel_id]
+            required_words = channel_data.get("words", [])
+
+            if not required_words:
+                return False
+
+            cleaned = self.strip_markdown(message.content)
+            regexes = [self.wildcard_to_regex(word) for word in required_words]
+            match_found = False
+
+            for word, regex in zip(required_words, regexes):
+                if regex.search(cleaned):
+                    channel_data["word_usage"][word] = channel_data["word_usage"].get(word, 0) + 1
+                    match_found = True
+                    break
+
+            if not match_found:
+                try:
+                    await message.delete()
+                    await self.log_filtered_message(message)
+                    channel_data["filtered_count"] = channel_data.get("filtered_count", 0) + 1
+
+                    try:
+                        word_list = ', '.join(f'`{word}`' for word in required_words)
+                        await message.author.send(
+                            f"Your message in {message.channel.mention} was filtered because "
+                            f"it did not contain one of the following words: {word_list}",
+                            delete_after=120
+                        )
+                    except discord.Forbidden:
+                        pass
+
+                    try:
+                        await message.author.timeout(
+                            timedelta(seconds=20),
+                            reason=f"Filter violation in #{message.channel.name}"
+                        )
+                    except discord.Forbidden:
+                        pass
+
+                except discord.HTTPException:
+                    pass
+                finally:
+                    channels[channel_id] = channel_data
                     await self.config.guild(message.guild).channels.set(channels)
-                
-                channel_data = channels[channel_id]
-                required_words = channel_data.get("words", [])
-                
-                if required_words:
-                    cleaned = self.strip_markdown(message.content)
-                    regexes = [self.wildcard_to_regex(word) for word in required_words]
-                    match_found = False
-                    
-                    for word, regex in zip(required_words, regexes):
-                        if regex.search(cleaned):
-                            channel_data["word_usage"][word] = channel_data["word_usage"].get(word, 0) + 1
-                            match_found = True
-                            break
-                    
-                    if not match_found:
-                        try:
-                            await message.delete()
-                            await self.log_filtered_message(message)
-                            channel_data["filtered_count"] = channel_data.get("filtered_count", 0) + 1
-                            
-                            try:
-                                word_list = ', '.join(f'`{word}`' for word in required_words)
-                                await message.author.send(
-                                    f"Your message in {message.channel.mention} was filtered because "
-                                    f"it did not contain one of the following words: {word_list}",
-                                    delete_after=120
-                                )
-                            except discord.Forbidden:
-                                pass
-    
-                            try:
-                                await message.author.timeout(
-                                    timedelta(seconds=20), 
-                                    reason=f"Filter violation in #{message.channel.name}"
-                                )
-                            except discord.Forbidden:
-                                pass
-    
-                        except discord.HTTPException:
-                            pass
-                        finally:
-                            channels[channel_id] = channel_data
-                            await self.config.guild(message.guild).channels.set(channels)
-                    else:
-                        channels[channel_id] = channel_data
-                        await self.config.guild(message.guild).channels.set(channels)
+                return True
+            else:
+                channels[channel_id] = channel_data
+                await self.config.guild(message.guild).channels.set(channels)
+                return False
+
+    async def _check_sentiment(self, message):
+        """Run the sentiment-based filter independently of the word filter."""
+        channel_id = str(message.channel.id)
+        sentiment_channels = await self.config.guild(message.guild).sentiment_channels()
+
+        if channel_id not in sentiment_channels:
+            return
+
+        cleaned = self.strip_markdown(message.content)
+        if not cleaned:
+            return
+
+        scores = self.analyzer.polarity_scores(cleaned)
+        threshold = await self.config.guild(message.guild).sentiment_threshold()
+
+        if scores["compound"] >= threshold:
+            return
+
+        timeout_secs = await self.config.guild(message.guild).sentiment_timeout()
+
+        try:
+            await message.delete()
+            await self.log_sentiment_message(message, scores)
+
+            async with self.config.guild(message.guild).sentiment_channels() as channels:
+                if channel_id in channels:
+                    channels[channel_id]["filtered_count"] = channels[channel_id].get("filtered_count", 0) + 1
+
+            try:
+                await message.author.send(
+                    f"Your message in {message.channel.mention} was removed because it was "
+                    f"detected as negative (score: {scores['compound']:.2f}, threshold: {threshold})",
+                    delete_after=120,
+                )
+            except discord.Forbidden:
+                pass
+
+            if timeout_secs > 0:
+                try:
+                    await message.author.timeout(
+                        timedelta(seconds=timeout_secs),
+                        reason=f"Negative sentiment in #{message.channel.name} (score: {scores['compound']:.2f})",
+                    )
+                except discord.Forbidden:
+                    pass
+
+        except discord.HTTPException:
+            pass
                         
     def wildcard_to_regex(self, word):
         parts = word.split('*')
@@ -416,11 +611,11 @@ class MessageFilter(commands.Cog):
         log_channel_id = await self.config.guild(message.guild).log_channel()
         if not log_channel_id:
             return
-        
+
         log_channel = message.guild.get_channel(log_channel_id)
         if not log_channel:
             return
-        
+
         embed = discord.Embed(
             color=0xff0000,
             description=f"**Message sent by {message.author.mention} filtered in {message.channel.mention}**\n"
@@ -433,7 +628,38 @@ class MessageFilter(commands.Cog):
         embed.set_footer(
             text=f"Author: {message.author.id} | Message ID: {message.id} • {datetime.now().strftime('%b %d, %Y %I:%M %p')}"
         )
-        
+
+        try:
+            await log_channel.send(embed=embed)
+        except discord.HTTPException:
+            pass
+
+    async def log_sentiment_message(self, message, scores):
+        log_channel_id = await self.config.guild(message.guild).log_channel()
+        if not log_channel_id:
+            return
+
+        log_channel = message.guild.get_channel(log_channel_id)
+        if not log_channel:
+            return
+
+        embed = discord.Embed(
+            color=0xff0000,
+            description=(
+                f"**Message sent by {message.author.mention} removed for negative sentiment "
+                f"in {message.channel.mention}**\n{message.content}"
+            ),
+        )
+        embed.add_field(name="Compound", value=f"{scores['compound']:.4f}", inline=True)
+        embed.add_field(name="Pos / Neu / Neg", value=f"{scores['pos']:.2f} / {scores['neu']:.2f} / {scores['neg']:.2f}", inline=True)
+        embed.set_author(
+            name=f"{message.author.name} ({message.author.id})",
+            icon_url=message.author.display_avatar.url,
+        )
+        embed.set_footer(
+            text=f"Author: {message.author.id} | Message ID: {message.id} • {datetime.now().strftime('%b %d, %Y %I:%M %p')}"
+        )
+
         try:
             await log_channel.send(embed=embed)
         except discord.HTTPException:
