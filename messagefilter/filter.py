@@ -696,19 +696,21 @@ class MessageFilter(commands.Cog):
             )
 
     async def _handle_sentiment_violation(self, message, scores, *, layer, detail):
-        """Delete message, DM user, timeout, log — shared by both layers."""
+        """Delete message, DM user, timeout, log — shared by both layers. In silent mode, skip delete/DM/timeout but still adjust credit."""
         timeout_secs = await self.config.guild(message.guild).sentiment_timeout()
         channel_id = str(message.channel.id)
+        silent = await self.config.guild(message.guild).sentiment_silent()
 
         try:
-            await message.delete()
-            await self._log_sentiment_message(message, scores, layer=layer, detail=detail)
+            if not silent:
+                await message.delete()
+                await self._log_sentiment_message(message, scores, layer=layer, detail=detail)
 
-            async with self.config.guild(message.guild).sentiment_channels() as channels:
-                if channel_id in channels:
-                    channels[channel_id]["filtered_count"] = (
-                        channels[channel_id].get("filtered_count", 0) + 1
-                    )
+                async with self.config.guild(message.guild).sentiment_channels() as channels:
+                    if channel_id in channels:
+                        channels[channel_id]["filtered_count"] = (
+                            channels[channel_id].get("filtered_count", 0) + 1
+                        )
 
             if layer == "VADER":
                 compound = scores["compound"]
@@ -734,14 +736,15 @@ class MessageFilter(commands.Cog):
                     f"({top_score[1]}: {top_score[0]:.2f})"
                 )
 
-            try:
-                await message.author.send(reason_text, delete_after=120)
-            except discord.Forbidden:
-                pass
+            if not silent:
+                try:
+                    await message.author.send(reason_text, delete_after=120)
+                except discord.Forbidden:
+                    pass
 
             # Scale timeout by social credit score
             social_credit = self.bot.get_cog("SocialCredit")
-            if timeout_secs > 0:
+            if timeout_secs > 0 and not silent:
                 multiplier = 1.0
                 if social_credit:
                     multiplier = await social_credit.get_timeout_multiplier(message.author.id)
@@ -754,7 +757,7 @@ class MessageFilter(commands.Cog):
                 except discord.Forbidden:
                     pass
 
-            # Deduct social credit for violation
+            # Deduct social credit for violation (always, even in silent mode)
             if social_credit:
                 await social_credit.penalize_negative_sentiment(
                     message.author.id,
