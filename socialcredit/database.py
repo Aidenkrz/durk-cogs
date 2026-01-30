@@ -209,6 +209,34 @@ class SocialCreditDatabase:
         )
         await self.db.commit()
 
+    # ── Pill cooldowns ─────────────────────────────────────────────────
+
+    async def check_pill_cooldown(self, user_id: int) -> Optional[str]:
+        """Returns None if pill is allowed.
+        Returns ISO timestamp string of last_pill_at if still on cooldown."""
+        async with self.db.execute(
+            """SELECT last_pill_at FROM pill_cooldowns
+            WHERE user_id = ?
+            AND last_pill_at > datetime('now', '-4 hours')
+            LIMIT 1""",
+            (user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return row["last_pill_at"]
+        return None
+
+    async def record_pill(self, user_id: int) -> None:
+        """Upsert the pill cooldown record."""
+        await self.db.execute(
+            """INSERT INTO pill_cooldowns (user_id, last_pill_at)
+               VALUES (?, CURRENT_TIMESTAMP)
+               ON CONFLICT(user_id)
+               DO UPDATE SET last_pill_at = CURRENT_TIMESTAMP""",
+            (user_id,),
+        )
+        await self.db.commit()
+
     # ── Cleanup ────────────────────────────────────────────────────────
 
     async def delete_user_data(self, user_id: int) -> Dict[str, int]:
