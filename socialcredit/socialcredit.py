@@ -19,7 +19,7 @@ CREDIT_POSITIVE_SENTIMENT = 2
 CREDIT_NEGATIVE_SENTIMENT = -10
 
 HUG_GIFS = [
-    "https://static.klipy.com/ii/d7aec6f6f171607374b2065c836f92f4/3a/73/47Uxa6Nl.gif,
+    "https://static.klipy.com/ii/d7aec6f6f171607374b2065c836f92f4/3a/73/47Uxa6Nl.gif",
     "https://static.klipy.com/ii/8ce8357c78ea940b9c2015daf05ce1a5/c0/c8/Gsu4wPlf.gif",
     "https://static.klipy.com/ii/35ccce3d852f7995dd2da910f2abd795/4a/74/bdx8ZIaf.gif",
     "https://static.klipy.com/ii/35ccce3d852f7995dd2da910f2abd795/f9/fd/lLT2zSIO.gif",
