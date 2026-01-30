@@ -117,6 +117,8 @@ class SocialCredit(commands.Cog):
             punishment_rules=[],
         )
         self.db: Optional[SocialCreditDatabase] = None
+        self.reaction_cooldowns = {}  # guild_id_user_id: last_process_time
+        self.message_cache = {}  # message_id: {'msg': message, 'time': timestamp}
 
     async def cog_load(self):
         db_path = Path(__file__).parent / "socialcredit.db"
@@ -860,15 +862,31 @@ class SocialCredit(commands.Cog):
 
     async def _handle_reaction_credit(self, payload, amount: int, action: str) -> None:
         """Handle credit adjustment for positive reaction add/remove in filtered channels."""
+        import time
+
+        key = f"{payload.guild_id}_{payload.user_id}"
+        now = time.time()
+        if now - self.reaction_cooldowns.get(key, 0) < 5.0:  # 5s cooldown per user/guild
+            return
+        self.reaction_cooldowns[key] = now
+
         channel = self.bot.get_channel(payload.channel_id)
         if not channel or not isinstance(channel, discord.TextChannel):
+            return
+
+        emoji_str = str(payload.emoji)
+        if emoji_str not in POSITIVE_REACTIONS:
+            return  # Early exit: non-positive emoji
+
+        guild = channel.guild
+        reactor_member = guild.get_member(payload.user_id)
+        if not reactor_member or reactor_member.bot:
             return
 
         msg_filter = self.bot.get_cog("MessageFilter")
         if not msg_filter or not self.db:
             return
 
-        guild = channel.guild
         try:
             channels_cfg = await msg_filter.config.guild(guild).channels()
         except:
@@ -881,20 +899,27 @@ class SocialCredit(commands.Cog):
         if str(channel.id) not in filtered_ids:
             return
 
-        try:
-            message = await channel.fetch_message(payload.message_id)
-        except (discord.NotFound, discord.HTTPException):
-            return
-
-        reactor_member = guild.get_member(payload.user_id)
-        if not reactor_member or reactor_member.bot:
-            return
+        # Cache message to avoid rate limits
+        cache_key = payload.message_id
+        if cache_key in self.message_cache:
+            cached = self.message_cache[cache_key]
+            if time.time() - cached['time'] < 3600:  # 1 hour cache
+                message = cached['msg']
+            else:
+                del self.message_cache[cache_key]
+        if cache_key not in self.message_cache:
+            try:
+                message = await channel.fetch_message(payload.message_id)
+                self.message_cache[cache_key] = {'msg': message, 'time': time.time()}
+                if len(self.message_cache) > 500:  # Limit cache size
+                    oldest_key = min(self.message_cache, key=lambda k: self.message_cache[k]['time'])
+                    del self.message_cache[oldest_key]
+            except (discord.NotFound, discord.HTTPException):
+                return
+        else:
+            message = self.message_cache[cache_key]['msg']
 
         if message.author.id == payload.user_id or message.author.bot:
-            return
-
-        emoji_str = str(payload.emoji)
-        if emoji_str not in POSITIVE_REACTIONS:
             return
 
         new_score = await self.db.adjust_score(
