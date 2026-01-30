@@ -114,6 +114,7 @@ class SocialCredit(commands.Cog):
             negative_sentiment_base=CREDIT_NEGATIVE_BASE,
             role_thresholds={},  # {"role_id": {"threshold": int, "direction": "above"|"below"}}
             nickname_prefix=False,  # whether to prepend [score] to nicknames
+            punishment_rules=[],
         )
         self.db: Optional[SocialCreditDatabase] = None
 
@@ -252,9 +253,10 @@ class SocialCredit(commands.Cog):
     # ── Role & nickname sync ──────────────────────────────────────────
 
     async def _sync_member(self, member: discord.Member, score: int):
-        """Sync roles and nickname for a member after a score change."""
+        """Sync roles, nickname, and punishments for a member after a score change."""
         await self._sync_roles(member, score)
         await self._sync_nickname(member, score)
+        await self._sync_punishments(member, score)
 
     async def _sync_roles(self, member: discord.Member, score: int):
         """Add/remove roles based on score thresholds for this guild."""
@@ -303,10 +305,54 @@ class SocialCredit(commands.Cog):
             except discord.Forbidden:
                 pass
 
+        async def _sync_punishments(self, member: discord.Member, score: int) -> None:
+            """Apply punishments if score below thresholds."""
+            if member.guild_permissions.administrator or member.id == member.guild.owner_id:
+                return
+
+            rules = await self.config.guild(member.guild).punishment_rules()
+            if not rules:
+                return
+
+            for rule in rules:
+                if score > rule["threshold"]:
+                    continue
+
+                duration_td = self.parse_duration(rule["duration"])
+                until = discord.utils.utcnow() + duration_td
+                reason = f"Social credit {score} below {rule['threshold']} ({rule['action']} {rule['duration']})"
+
+                try:
+                    if rule["action"].lower() == "timeout":
+                        await member.timeout(until, reason=reason)
+                    elif rule["action"].lower() == "ban":
+                        await member.ban(until=until, reason=reason, delete_message_days=0)
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+
     @staticmethod
     def _strip_score_prefix(name: str) -> str:
         """Remove a leading [number] prefix from a name."""
         return re.sub(r"^\[\d+\]\s*", "", name)
+
+    @staticmethod
+    def parse_duration(dur_str: str) -> timedelta:
+        """Parse duration string like '1h30m', '2d' to timedelta."""
+        total_secs = 0.0
+        for match in re.finditer(r"(\d+(?:\.\d+)?)([smhdwMy])", dur_str, re.I):
+            num = float(match.group(1))
+            unit = match.group(2).lower()
+            mult = {
+                "s": 1,
+                "m": 60,
+                "h": 3600,
+                "d": 86400,
+                "w": 604800,
+                "M": 2629746,  # ~30.44 days
+                "y": 31556952,  # ~365.25 days
+            }.get(unit, 0)
+            total_secs += num * mult
+        return timedelta(seconds=total_secs)
 
     # ── Hug command ────────────────────────────────────────────────────
 
@@ -631,6 +677,69 @@ class SocialCredit(commands.Cog):
 
         await ctx.send(embed=embed)
 
+    @credit.group(name="punish", invoke_without_command=True)
+    @commands.guild_only()
+    async def punish(self, ctx: commands.Context):
+        """Manage punishment rules for low social credit scores."""
+        rules = await self.config.guild(ctx.guild).punishment_rules()
+        if not rules:
+            await ctx.send("No punishment rules set.")
+            return
+
+        embed = discord.Embed(title="Social Credit Punishment Rules", color=discord.Color.red())
+        lines = []
+        for i, rule in enumerate(rules, 1):
+            lines.append(f"`{i}.` **{rule['action']}** `{rule['duration']}` **under** `{rule['threshold']}`")
+        embed.description = "\n".join(lines)
+        await ctx.send(embed=embed)
+
+    @punish.command(name="add")
+    @commands.admin_or_permissions(administrator=True)
+    async def punish_add(self, ctx: commands.Context, *, args: str):
+        """Add a punishment rule. Format: timeout 1h under 800"""
+        match = re.match(r"^(\w+)\s+(\S+)\s+under\s+(\d+)$", args.lower().strip())
+        if not match:
+            await ctx.send("**Usage:** `[p]credit punish add timeout 1h under 800` or `ban 1d under 600`")
+            return
+
+        action, duration, thresh_str = match.groups()
+        try:
+            threshold = int(thresh_str)
+        except ValueError:
+            await ctx.send("Threshold must be a number.")
+            return
+
+        if action not in ("timeout", "ban"):
+            await ctx.send("Action must be `timeout` or `ban`.")
+            return
+
+        async with self.config.guild(ctx.guild).punishment_rules() as rules:
+            rules.append({
+                "action": action,
+                "duration": duration,
+                "threshold": threshold
+            })
+
+        await ctx.send(f"✅ Added punishment: `{action}` `{duration}` **under** `{threshold}`")
+
+    @punish.command(name="remove")
+    @commands.admin_or_permissions(administrator=True)
+    async def punish_remove(self, ctx: commands.Context, index: int):
+        """Remove a punishment rule by index."""
+        async with self.config.guild(ctx.guild).punishment_rules() as rules:
+            if 1 <= index <= len(rules):
+                removed = rules.pop(index - 1)
+                await ctx.send(f"✅ Removed: `{removed['action']}` `{removed['duration']}` under `{removed['threshold']}`")
+            else:
+                await ctx.send("❌ Invalid index.")
+
+    @punish.command(name="clear")
+    @commands.admin_or_permissions(administrator=True)
+    async def punish_clear(self, ctx: commands.Context):
+        """Clear all punishment rules."""
+        await self.config.guild(ctx.guild).punishment_rules.set([])
+        await ctx.send("✅ Cleared all punishment rules.")
+
     # ── Nickname prefix commands ──────────────────────────────────────
 
     @credit.command(name="nickname")
@@ -696,6 +805,16 @@ class SocialCredit(commands.Cog):
             value="Score 1000 = 1.0x, 800 = 2.0x, 600 = 3.0x (min 0.25x, max 5.0x)",
             inline=False,
         )
+
+        punish_rules = await self.config.guild(ctx.guild).punishment_rules()
+        if punish_rules:
+            lines = [f"{r['action']} {r['duration']} under {r['threshold']}" for r in punish_rules]
+            embed.add_field(
+                name="Punishment Rules",
+                value="\n".join(lines),
+                inline=False,
+            )
+
         await ctx.send(embed=embed)
 
     @credit.command(name="setconfig")
