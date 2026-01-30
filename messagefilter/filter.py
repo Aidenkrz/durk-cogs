@@ -668,7 +668,10 @@ class MessageFilter(commands.Cog):
         social_credit = self.bot.get_cog("SocialCredit")
         if social_credit:
             await social_credit.reward_positive_sentiment(
-                message.author.id, message.guild.id, message.channel.id
+                message.author.id,
+                message.guild.id,
+                message.channel.id,
+                compound_score=deduped_scores["compound"],
             )
 
     async def _handle_sentiment_violation(self, message, scores, *, layer, detail):
@@ -687,15 +690,17 @@ class MessageFilter(commands.Cog):
                     )
 
             if layer == "VADER":
+                compound = scores["compound"]
                 reason_text = (
                     f"Your message in {message.channel.mention} was removed for negative "
-                    f"sentiment (score: {scores['compound']:.2f})"
+                    f"sentiment (score: {compound:.2f})"
                 )
                 timeout_reason = (
                     f"Negative sentiment in #{message.channel.name} "
-                    f"(VADER: {scores['compound']:.2f})"
+                    f"(VADER: {compound:.2f})"
                 )
             else:
+                compound = -0.5  # default severity for Detoxify triggers
                 top_score = max(
                     (scores[k], k) for k in ("toxicity", "threat", "insult", "severe_toxicity")
                 )
@@ -713,19 +718,28 @@ class MessageFilter(commands.Cog):
             except discord.Forbidden:
                 pass
 
+            # Scale timeout by social credit score
+            social_credit = self.bot.get_cog("SocialCredit")
             if timeout_secs > 0:
+                multiplier = 1.0
+                if social_credit:
+                    multiplier = await social_credit.get_timeout_multiplier(message.author.id)
+                scaled_secs = int(timeout_secs * multiplier)
                 try:
                     await message.author.timeout(
-                        timedelta(seconds=timeout_secs), reason=timeout_reason
+                        timedelta(seconds=scaled_secs),
+                        reason=f"{timeout_reason} [x{multiplier:.1f}]",
                     )
                 except discord.Forbidden:
                     pass
 
             # Deduct social credit for violation
-            social_credit = self.bot.get_cog("SocialCredit")
             if social_credit:
                 await social_credit.penalize_negative_sentiment(
-                    message.author.id, message.guild.id, message.channel.id
+                    message.author.id,
+                    message.guild.id,
+                    message.channel.id,
+                    compound_score=compound,
                 )
         except discord.HTTPException:
             pass

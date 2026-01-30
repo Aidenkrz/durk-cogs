@@ -15,9 +15,13 @@ log = logging.getLogger("red.DurkCogs.SocialCredit")
 # Default credit adjustment values
 CREDIT_HUG_GIVEN = 5
 CREDIT_HUG_RECEIVED = 5
-CREDIT_POSITIVE_SENTIMENT = 2
-CREDIT_NEGATIVE_SENTIMENT = -10
+CREDIT_POSITIVE_BASE = 2
+CREDIT_NEGATIVE_BASE = -10
 
+# Default score for timeout scaling (1000 = no multiplier)
+DEFAULT_SCORE = 1000
+
+# Placeholder hug GIF list — replace URLs as needed
 HUG_GIFS = [
     "https://static.klipy.com/ii/d7aec6f6f171607374b2065c836f92f4/3a/73/47Uxa6Nl.gif",
     "https://static.klipy.com/ii/8ce8357c78ea940b9c2015daf05ce1a5/c0/c8/Gsu4wPlf.gif",
@@ -35,8 +39,9 @@ class SocialCredit(commands.Cog):
         self.config.register_guild(
             hug_credit_given=CREDIT_HUG_GIVEN,
             hug_credit_received=CREDIT_HUG_RECEIVED,
-            positive_sentiment_credit=CREDIT_POSITIVE_SENTIMENT,
-            negative_sentiment_credit=CREDIT_NEGATIVE_SENTIMENT,
+            positive_sentiment_base=CREDIT_POSITIVE_BASE,
+            negative_sentiment_base=CREDIT_NEGATIVE_BASE,
+            role_thresholds={},  # {"role_id": {"threshold": int, "direction": "above"|"below"}}
         )
         self.db: Optional[SocialCreditDatabase] = None
 
@@ -65,7 +70,7 @@ class SocialCredit(commands.Cog):
         """Adjust a user's credit. Returns new score, or None if DB unavailable."""
         if not self.db:
             return None
-        return await self.db.adjust_score(
+        new_score = await self.db.adjust_score(
             user_id=user_id,
             amount=amount,
             reason=reason,
@@ -73,6 +78,12 @@ class SocialCredit(commands.Cog):
             guild_id=guild_id,
             channel_id=channel_id,
         )
+        guild = self.bot.get_guild(guild_id) if guild_id else None
+        if guild:
+            member = guild.get_member(user_id)
+            if member:
+                await self._sync_roles(member, new_score)
+        return new_score
 
     async def get_user_credit(self, user_id: int) -> Optional[int]:
         """Get a user's credit score. Returns None if DB unavailable."""
@@ -81,44 +92,119 @@ class SocialCredit(commands.Cog):
         return await self.db.get_score(user_id)
 
     async def reward_positive_sentiment(
-        self, user_id: int, guild_id: int, channel_id: int
+        self,
+        user_id: int,
+        guild_id: int,
+        channel_id: int,
+        compound_score: float = 0.0,
     ) -> Optional[int]:
-        """Called by messagefilter when a message passes sentiment checks."""
+        """Called by messagefilter when a message passes sentiment checks.
+
+        The credit amount scales with how positive the compound score is.
+        compound_score ranges 0.0 to 1.0 for positive messages.
+        """
         if not self.db:
             return None
         guild = self.bot.get_guild(guild_id)
-        amount = (
-            await self.config.guild(guild).positive_sentiment_credit()
+        base = (
+            await self.config.guild(guild).positive_sentiment_base()
             if guild
-            else CREDIT_POSITIVE_SENTIMENT
+            else CREDIT_POSITIVE_BASE
         )
-        return await self.db.adjust_score(
+        # Scale: compound 0.0 -> 1x base, compound 1.0 -> 3x base
+        multiplier = 1.0 + 2.0 * max(0.0, min(1.0, compound_score))
+        amount = max(1, int(base * multiplier))
+        new_score = await self.db.adjust_score(
             user_id=user_id,
             amount=amount,
             reason="positive_sentiment",
             guild_id=guild_id,
             channel_id=channel_id,
         )
+        if guild:
+            member = guild.get_member(user_id)
+            if member:
+                await self._sync_roles(member, new_score)
+        return new_score
 
     async def penalize_negative_sentiment(
-        self, user_id: int, guild_id: int, channel_id: int
+        self,
+        user_id: int,
+        guild_id: int,
+        channel_id: int,
+        compound_score: float = 0.0,
     ) -> Optional[int]:
-        """Called by messagefilter when a message triggers a sentiment violation."""
+        """Called by messagefilter when a message triggers a sentiment violation.
+
+        The credit penalty scales with how negative the compound score is.
+        compound_score ranges -1.0 to 0.0 for negative messages.
+        """
         if not self.db:
             return None
         guild = self.bot.get_guild(guild_id)
-        amount = (
-            await self.config.guild(guild).negative_sentiment_credit()
+        base = (
+            await self.config.guild(guild).negative_sentiment_base()
             if guild
-            else CREDIT_NEGATIVE_SENTIMENT
+            else CREDIT_NEGATIVE_BASE
         )
-        return await self.db.adjust_score(
+        # Scale: compound 0.0 -> 1x base, compound -1.0 -> 3x base
+        multiplier = 1.0 + 2.0 * max(0.0, min(1.0, abs(compound_score)))
+        amount = min(-1, int(base * multiplier))
+        new_score = await self.db.adjust_score(
             user_id=user_id,
             amount=amount,
             reason="negative_sentiment",
             guild_id=guild_id,
             channel_id=channel_id,
         )
+        if guild:
+            member = guild.get_member(user_id)
+            if member:
+                await self._sync_roles(member, new_score)
+        return new_score
+
+    async def get_timeout_multiplier(self, user_id: int) -> float:
+        """Return a timeout multiplier based on user's score.
+
+        1000 (default) = 1.0x, 800 = 2.0x (scaled linearly: each 200 below
+        default doubles the timeout).  Minimum multiplier is 0.25x (score >= 1300),
+        maximum is 5.0x (score <= 0).
+        """
+        if not self.db:
+            return 1.0
+        score = await self.db.get_score(user_id)
+        # Every 200 points below default adds 1.0x
+        raw = 1.0 + (DEFAULT_SCORE - score) / 200.0
+        return max(0.25, min(5.0, raw))
+
+    # ── Role threshold management ──────────────────────────────────────
+
+    async def _sync_roles(self, member: discord.Member, score: int):
+        """Add/remove roles based on score thresholds for this guild."""
+        thresholds = await self.config.guild(member.guild).role_thresholds()
+        if not thresholds:
+            return
+
+        for role_id_str, cfg in thresholds.items():
+            role = member.guild.get_role(int(role_id_str))
+            if not role:
+                continue
+
+            threshold = cfg["threshold"]
+            direction = cfg["direction"]
+
+            should_have = (
+                (score >= threshold) if direction == "above"
+                else (score <= threshold)
+            )
+
+            try:
+                if should_have and role not in member.roles:
+                    await member.add_roles(role, reason=f"Social credit score {score} meets threshold")
+                elif not should_have and role in member.roles:
+                    await member.remove_roles(role, reason=f"Social credit score {score} no longer meets threshold")
+            except discord.Forbidden:
+                pass
 
     # ── Hug command ────────────────────────────────────────────────────
 
@@ -165,6 +251,10 @@ class SocialCredit(commands.Cog):
             channel_id=ctx.channel.id,
         )
 
+        # Sync roles for both users
+        await self._sync_roles(ctx.author, new_author)
+        await self._sync_roles(target, new_target)
+
         gif = random.choice(HUG_GIFS)
         embed = discord.Embed(
             title=f"{ctx.author.display_name} hugged {target.display_name}!",
@@ -194,6 +284,7 @@ class SocialCredit(commands.Cog):
         user = user or ctx.author
         score = await self.db.get_score(user.id)
         rank = await self.db.get_rank(user.id)
+        multiplier = await self.get_timeout_multiplier(user.id)
 
         embed = discord.Embed(
             title=f"Social Credit: {user.display_name}",
@@ -201,6 +292,7 @@ class SocialCredit(commands.Cog):
         )
         embed.add_field(name="Score", value=str(score), inline=True)
         embed.add_field(name="Rank", value=f"#{rank}", inline=True)
+        embed.add_field(name="Timeout Multiplier", value=f"{multiplier:.2f}x", inline=True)
         embed.set_thumbnail(url=user.display_avatar.url)
 
         await ctx.send(embed=embed)
@@ -293,7 +385,6 @@ class SocialCredit(commands.Cog):
         """[Admin] Set a user's credit score to an exact value."""
         old_score = await self.db.get_score(user.id)
         await self.db.set_score(user.id, score)
-        delta = score - old_score
         await self.db.adjust_score(
             user_id=user.id,
             amount=0,
@@ -301,8 +392,9 @@ class SocialCredit(commands.Cog):
             guild_id=ctx.guild.id,
             channel_id=ctx.channel.id,
         )
+        await self._sync_roles(user, score)
         await ctx.send(
-            f"Set {user.display_name}'s score to **{score}** (was {old_score}, delta {delta:+d})."
+            f"Set {user.display_name}'s score to **{score}** (was {old_score}, delta {score - old_score:+d})."
         )
 
     @credit.command(name="adjust")
@@ -318,9 +410,77 @@ class SocialCredit(commands.Cog):
             guild_id=ctx.guild.id,
             channel_id=ctx.channel.id,
         )
+        await self._sync_roles(user, new_score)
         await ctx.send(
             f"Adjusted {user.display_name}'s score by **{amount:+d}**. New score: **{new_score}**"
         )
+
+    # ── Role threshold commands ────────────────────────────────────────
+
+    @credit.command(name="addrole")
+    @commands.admin_or_permissions(administrator=True)
+    async def credit_addrole(
+        self,
+        ctx: commands.Context,
+        role: discord.Role,
+        direction: str,
+        threshold: int,
+    ):
+        """[Admin] Assign a role when a user's score is above or below a threshold.
+
+        direction: "above" or "below"
+        Example: .credit addrole @GoodCitizen above 1200
+        Example: .credit addrole @Shamed below 500
+        """
+        direction = direction.lower()
+        if direction not in ("above", "below"):
+            return await ctx.send("Direction must be `above` or `below`.")
+
+        async with self.config.guild(ctx.guild).role_thresholds() as thresholds:
+            thresholds[str(role.id)] = {
+                "threshold": threshold,
+                "direction": direction,
+            }
+
+        await ctx.send(
+            f"Role {role.mention} will be assigned when score is **{direction}** **{threshold}**."
+        )
+
+    @credit.command(name="removerole")
+    @commands.admin_or_permissions(administrator=True)
+    async def credit_removerole(self, ctx: commands.Context, role: discord.Role):
+        """[Admin] Remove a role threshold."""
+        async with self.config.guild(ctx.guild).role_thresholds() as thresholds:
+            if str(role.id) in thresholds:
+                del thresholds[str(role.id)]
+                await ctx.send(f"Removed threshold for {role.mention}.")
+            else:
+                await ctx.send(f"{role.mention} doesn't have a threshold set.")
+
+    @credit.command(name="roles")
+    @commands.guild_only()
+    async def credit_roles(self, ctx: commands.Context):
+        """Show all configured role thresholds."""
+        thresholds = await self.config.guild(ctx.guild).role_thresholds()
+
+        embed = discord.Embed(
+            title="Social Credit Role Thresholds",
+            color=discord.Color.gold(),
+        )
+
+        if not thresholds:
+            embed.description = "No role thresholds configured."
+        else:
+            lines = []
+            for role_id_str, cfg in thresholds.items():
+                role = ctx.guild.get_role(int(role_id_str))
+                name = role.mention if role else f"Unknown ({role_id_str})"
+                lines.append(
+                    f"{name} — **{cfg['direction']}** **{cfg['threshold']}**"
+                )
+            embed.description = "\n".join(lines)
+
+        await ctx.send(embed=embed)
 
     @credit.command(name="config")
     @commands.admin_or_permissions(administrator=True)
@@ -328,16 +488,29 @@ class SocialCredit(commands.Cog):
         """[Admin] Show current credit configuration for this server."""
         hug_given = await self.config.guild(ctx.guild).hug_credit_given()
         hug_received = await self.config.guild(ctx.guild).hug_credit_received()
-        pos = await self.config.guild(ctx.guild).positive_sentiment_credit()
-        neg = await self.config.guild(ctx.guild).negative_sentiment_credit()
+        pos = await self.config.guild(ctx.guild).positive_sentiment_base()
+        neg = await self.config.guild(ctx.guild).negative_sentiment_base()
 
         embed = discord.Embed(
             title="Social Credit Configuration", color=discord.Color.gold()
         )
         embed.add_field(name="Hug Given", value=f"`+{hug_given}`", inline=True)
         embed.add_field(name="Hug Received", value=f"`+{hug_received}`", inline=True)
-        embed.add_field(name="Positive Sentiment", value=f"`+{pos}`", inline=True)
-        embed.add_field(name="Negative Sentiment", value=f"`{neg}`", inline=True)
+        embed.add_field(
+            name="Positive Sentiment Base",
+            value=f"`+{pos}` (scales 1x-3x with positivity)",
+            inline=False,
+        )
+        embed.add_field(
+            name="Negative Sentiment Base",
+            value=f"`{neg}` (scales 1x-3x with negativity)",
+            inline=False,
+        )
+        embed.add_field(
+            name="Timeout Scaling",
+            value="Score 1000 = 1.0x, 800 = 2.0x, 600 = 3.0x (min 0.25x, max 5.0x)",
+            inline=False,
+        )
         await ctx.send(embed=embed)
 
     @credit.command(name="setconfig")
@@ -350,13 +523,13 @@ class SocialCredit(commands.Cog):
     ):
         """[Admin] Set a credit config value.
 
-        Keys: hug_given, hug_received, positive_sentiment, negative_sentiment
+        Keys: hug_given, hug_received, positive_base, negative_base
         """
         key_map = {
             "hug_given": "hug_credit_given",
             "hug_received": "hug_credit_received",
-            "positive_sentiment": "positive_sentiment_credit",
-            "negative_sentiment": "negative_sentiment_credit",
+            "positive_base": "positive_sentiment_base",
+            "negative_base": "negative_sentiment_base",
         }
         config_key = key_map.get(key)
         if not config_key:
