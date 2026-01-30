@@ -1,6 +1,7 @@
 import discord
 import logging
 import random
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -42,6 +43,7 @@ class SocialCredit(commands.Cog):
             positive_sentiment_base=CREDIT_POSITIVE_BASE,
             negative_sentiment_base=CREDIT_NEGATIVE_BASE,
             role_thresholds={},  # {"role_id": {"threshold": int, "direction": "above"|"below"}}
+            nickname_prefix=False,  # whether to prepend [score] to nicknames
         )
         self.db: Optional[SocialCreditDatabase] = None
 
@@ -82,7 +84,7 @@ class SocialCredit(commands.Cog):
         if guild:
             member = guild.get_member(user_id)
             if member:
-                await self._sync_roles(member, new_score)
+                await self._sync_member(member, new_score)
         return new_score
 
     async def get_user_credit(self, user_id: int) -> Optional[int]:
@@ -124,7 +126,7 @@ class SocialCredit(commands.Cog):
         if guild:
             member = guild.get_member(user_id)
             if member:
-                await self._sync_roles(member, new_score)
+                await self._sync_member(member, new_score)
         return new_score
 
     async def penalize_negative_sentiment(
@@ -160,7 +162,7 @@ class SocialCredit(commands.Cog):
         if guild:
             member = guild.get_member(user_id)
             if member:
-                await self._sync_roles(member, new_score)
+                await self._sync_member(member, new_score)
         return new_score
 
     async def get_timeout_multiplier(self, user_id: int) -> float:
@@ -177,7 +179,12 @@ class SocialCredit(commands.Cog):
         raw = 1.0 + (DEFAULT_SCORE - score) / 200.0
         return max(0.25, min(5.0, raw))
 
-    # ── Role threshold management ──────────────────────────────────────
+    # ── Role & nickname sync ──────────────────────────────────────────
+
+    async def _sync_member(self, member: discord.Member, score: int):
+        """Sync roles and nickname for a member after a score change."""
+        await self._sync_roles(member, score)
+        await self._sync_nickname(member, score)
 
     async def _sync_roles(self, member: discord.Member, score: int):
         """Add/remove roles based on score thresholds for this guild."""
@@ -205,6 +212,31 @@ class SocialCredit(commands.Cog):
                     await member.remove_roles(role, reason=f"Social credit score {score} no longer meets threshold")
             except discord.Forbidden:
                 pass
+
+    async def _sync_nickname(self, member: discord.Member, score: int):
+        """Prepend [score] to the member's nickname if the guild has nickname_prefix enabled."""
+        if not await self.config.guild(member.guild).nickname_prefix():
+            return
+        # Don't touch the guild owner's nickname (Discord doesn't allow it)
+        if member.id == member.guild.owner_id:
+            return
+
+        base_name = self._strip_score_prefix(member.display_name)
+        new_nick = f"[{score}] {base_name}"
+        # Discord nickname limit is 32 chars
+        if len(new_nick) > 32:
+            new_nick = new_nick[:32]
+        # Only update if it actually changed
+        if member.nick != new_nick:
+            try:
+                await member.edit(nick=new_nick, reason="Social credit score update")
+            except discord.Forbidden:
+                pass
+
+    @staticmethod
+    def _strip_score_prefix(name: str) -> str:
+        """Remove a leading [number] prefix from a name."""
+        return re.sub(r"^\[\d+\]\s*", "", name)
 
     # ── Hug command ────────────────────────────────────────────────────
 
@@ -251,9 +283,9 @@ class SocialCredit(commands.Cog):
             channel_id=ctx.channel.id,
         )
 
-        # Sync roles for both users
-        await self._sync_roles(ctx.author, new_author)
-        await self._sync_roles(target, new_target)
+        # Sync roles and nickname for both users
+        await self._sync_member(ctx.author, new_author)
+        await self._sync_member(target, new_target)
 
         gif = random.choice(HUG_GIFS)
         embed = discord.Embed(
@@ -392,7 +424,7 @@ class SocialCredit(commands.Cog):
             guild_id=ctx.guild.id,
             channel_id=ctx.channel.id,
         )
-        await self._sync_roles(user, score)
+        await self._sync_member(user, score)
         await ctx.send(
             f"Set {user.display_name}'s score to **{score}** (was {old_score}, delta {score - old_score:+d})."
         )
@@ -410,7 +442,7 @@ class SocialCredit(commands.Cog):
             guild_id=ctx.guild.id,
             channel_id=ctx.channel.id,
         )
-        await self._sync_roles(user, new_score)
+        await self._sync_member(user, new_score)
         await ctx.send(
             f"Adjusted {user.display_name}'s score by **{amount:+d}**. New score: **{new_score}**"
         )
@@ -482,6 +514,40 @@ class SocialCredit(commands.Cog):
 
         await ctx.send(embed=embed)
 
+    # ── Nickname prefix commands ──────────────────────────────────────
+
+    @credit.command(name="nickname")
+    @commands.admin_or_permissions(administrator=True)
+    async def credit_nickname(self, ctx: commands.Context):
+        """[Admin] Toggle showing [score] in nicknames."""
+        current = await self.config.guild(ctx.guild).nickname_prefix()
+        new_val = not current
+        await self.config.guild(ctx.guild).nickname_prefix.set(new_val)
+        state = "enabled" if new_val else "disabled"
+        await ctx.send(f"Nickname score prefix **{state}**.")
+
+    @credit.command(name="stripnicks")
+    @commands.admin_or_permissions(administrator=True)
+    async def credit_stripnicks(self, ctx: commands.Context):
+        """[Admin] Remove [score] prefix from all member nicknames in this server."""
+        count = 0
+        for member in ctx.guild.members:
+            if member.bot or member.id == ctx.guild.owner_id:
+                continue
+            if member.nick and re.match(r"^\[\d+\]\s*", member.nick):
+                new_nick = self._strip_score_prefix(member.nick)
+                try:
+                    await member.edit(
+                        nick=new_nick or None,
+                        reason="Social credit nickname prefix removal",
+                    )
+                    count += 1
+                except discord.Forbidden:
+                    pass
+        await ctx.send(f"Stripped score prefix from **{count}** nickname(s).")
+
+    # ── Config commands ────────────────────────────────────────────────
+
     @credit.command(name="config")
     @commands.admin_or_permissions(administrator=True)
     async def credit_config(self, ctx: commands.Context):
@@ -490,12 +556,14 @@ class SocialCredit(commands.Cog):
         hug_received = await self.config.guild(ctx.guild).hug_credit_received()
         pos = await self.config.guild(ctx.guild).positive_sentiment_base()
         neg = await self.config.guild(ctx.guild).negative_sentiment_base()
+        nick = await self.config.guild(ctx.guild).nickname_prefix()
 
         embed = discord.Embed(
             title="Social Credit Configuration", color=discord.Color.gold()
         )
         embed.add_field(name="Hug Given", value=f"`+{hug_given}`", inline=True)
         embed.add_field(name="Hug Received", value=f"`+{hug_received}`", inline=True)
+        embed.add_field(name="Nickname Prefix", value=f"`{'On' if nick else 'Off'}`", inline=True)
         embed.add_field(
             name="Positive Sentiment Base",
             value=f"`+{pos}` (scales 1x-3x with positivity)",

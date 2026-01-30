@@ -30,6 +30,7 @@ class MessageFilter(commands.Cog):
             "sentiment_threshold": -0.5,
             "sentiment_timeout": 30,
             "toxicity_threshold": 0.7,
+            "sentiment_silent": False,
         }
         self.config.register_guild(**default_guild)
 
@@ -362,6 +363,26 @@ class MessageFilter(commands.Cog):
         embed = discord.Embed(
             title="Toxicity Threshold Updated",
             description=f"Messages with toxicity scores above `{score}` will be filtered",
+            color=0x00FF00,
+        )
+        await ctx.send(embed=embed)
+
+    @sentiment.command(name="silent")
+    @commands.admin_or_permissions(administrator=True)
+    async def sentiment_silent(self, ctx):
+        """Toggle silent mode — only adjust social credit, don't delete messages or timeout users"""
+        current = await self.config.guild(ctx.guild).sentiment_silent()
+        new_val = not current
+        await self.config.guild(ctx.guild).sentiment_silent.set(new_val)
+        state = "enabled" if new_val else "disabled"
+        desc = (
+            "Messages will **not** be deleted or timed out. Social credit will still be adjusted."
+            if new_val
+            else "Messages will be deleted and users timed out as normal."
+        )
+        embed = discord.Embed(
+            title=f"Silent Mode {state.title()}",
+            description=desc,
             color=0x00FF00,
         )
         await ctx.send(embed=embed)
