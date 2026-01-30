@@ -177,9 +177,7 @@ class SocialCreditDatabase:
 
     # ── Hug cooldowns ──────────────────────────────────────────────────
 
-    async def check_hug_cooldown(
-        self, user_id: int, target_user_id: int
-    ) -> Optional[str]:
+    async def check_hug_cooldown(self, user_id: int) -> Optional[str]:
         """Returns None if hug is allowed.
         Returns ISO timestamp string of last_hug_at if still on cooldown."""
         async with self.db.execute(
