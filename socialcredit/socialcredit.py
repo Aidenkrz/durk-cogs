@@ -51,6 +51,55 @@ PILL_GIFS = [
     "https://media.tenor.com/QHbRuht9SswAAAAM/pills-bilelaca.gif",
 ]
 
+POSITIVE_REACTIONS = {
+    "😀",
+    "😃",
+    "😄",
+    "😁",
+    "😊",
+    "😇",
+    "🙃",
+    "😉",
+    "😌",
+    "😍",
+    "🥰",
+    "😘",
+    "😗",
+    "😙",
+    "😚",
+    "🤗",
+    "😻",
+    "👍",
+    "👍🏻",
+    "👍🏼",
+    "👍🏽",
+    "👍🏾",
+    "👍🏿",
+    "🫶",
+    "🫶🏻",
+    "🫶🏼",
+    "🫶🏽",
+    "🫶🏾",
+    "🫶🏿",
+    "❤️",
+    "🧡",
+    "💛",
+    "💚",
+    "💙",
+    "💜",
+    "🤎",
+    "🖤",
+    "🤍",
+    "💖",
+    "💗",
+    "💓",
+    "💕",
+    "💞",
+    "💘",
+    "💝",
+    "💟",
+}
+
 
 class SocialCredit(commands.Cog):
     """Track social credit scores based on behavior and interactions."""
@@ -674,3 +723,70 @@ class SocialCredit(commands.Cog):
 
         await self.config.guild(ctx.guild).get_attr(config_key).set(value)
         await ctx.send(f"Set `{key}` to `{value}`.")
+
+
+    async def _handle_reaction_credit(self, payload, amount: int, action: str) -> None:
+        """Handle credit adjustment for positive reaction add/remove in filtered channels."""
+        channel = self.bot.get_channel(payload.channel_id)
+        if not channel or not isinstance(channel, discord.TextChannel):
+            return
+
+        msg_filter = self.bot.get_cog("MessageFilter")
+        if not msg_filter or not self.db:
+            return
+
+        guild = channel.guild
+        try:
+            channels_cfg = await msg_filter.config.guild(guild).channels()
+        except:
+            channels_cfg = {}
+        try:
+            sentiment_cfg = await msg_filter.config.guild(guild).sentiment_channels()
+        except:
+            sentiment_cfg = {}
+        filtered_ids = set(channels_cfg.keys()) | set(sentiment_cfg.keys())
+        if str(channel.id) not in filtered_ids:
+            return
+
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except (discord.NotFound, discord.HTTPException):
+            return
+
+        reactor_member = guild.get_member(payload.user_id)
+        if not reactor_member or reactor_member.bot:
+            return
+
+        if message.author.id == payload.user_id or message.author.bot:
+            return
+
+        emoji_str = str(payload.emoji)
+        if emoji_str not in self.POSITIVE_REACTIONS:
+            return
+
+        new_score = await self.db.adjust_score(
+            user_id=payload.user_id,
+            amount=amount,
+            reason=f"{action}_reaction",
+            target_user_id=message.author.id,
+            guild_id=guild.id,
+            channel_id=channel.id,
+        )
+
+        await self._sync_member(reactor_member, new_score)
+
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload):
+        """Award 1 credit for adding a positive reaction to another user's message in a filtered channel."""
+        if payload.user_id == self.bot.user.id:
+            return
+        await self._handle_reaction_credit(payload, 1, "positive")
+
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_remove(self, payload):
+        """Remove 1 credit when a positive reaction is removed from a message in a filtered channel."""
+        if payload.user_id == self.bot.user.id:
+            return
+        await self._handle_reaction_credit(payload, -1, "retracted")
