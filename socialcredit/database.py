@@ -180,6 +180,18 @@ class SocialCreditDatabase:
             rows = await cursor.fetchall()
             return {row["reason"]: row["total"] for row in rows}
 
+    async def get_reason_counts(self, user_id: int) -> Dict[str, int]:
+        """Count of credit log entries per reason for a user."""
+        async with self.db.execute(
+            """SELECT reason, COUNT(*) AS cnt
+               FROM credit_log
+               WHERE user_id = ?
+               GROUP BY reason""",
+            (user_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return {row["reason"]: row["cnt"] for row in rows}
+
     # ── Hug cooldowns ──────────────────────────────────────────────────
 
     async def check_hug_cooldown(self, user_id: int) -> Optional[str]:

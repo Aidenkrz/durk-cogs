@@ -10,6 +10,7 @@ from redbot.core import commands, Config
 from redbot.core.bot import Red
 
 from .database import SocialCreditDatabase
+from .idcard import generate_id_card, PILLOW_AVAILABLE
 
 log = logging.getLogger("red.DurkCogs.SocialCredit")
 
@@ -495,18 +496,39 @@ class SocialCredit(commands.Cog):
         user = user or ctx.author
         score = await self.db.get_score(user.id)
         rank = await self.db.get_rank(user.id)
-        multiplier = await self.get_timeout_multiplier(user.id)
 
-        embed = discord.Embed(
-            title=f"Social Credit: {user.display_name}",
-            color=discord.Color.gold(),
+        if not PILLOW_AVAILABLE:
+            embed = discord.Embed(
+                title=f"Social Credit: {user.display_name}",
+                color=discord.Color.gold(),
+            )
+            embed.add_field(name="Score", value=str(score), inline=True)
+            embed.add_field(name="Rank", value=f"#{rank}", inline=True)
+            embed.set_thumbnail(url=user.display_avatar.url)
+            await ctx.send(embed=embed)
+            return
+
+        counts = await self.db.get_reason_counts(user.id)
+        member_since = (
+            user.joined_at.strftime("%b %Y") if user.joined_at else None
         )
-        embed.add_field(name="Score", value=str(score), inline=True)
-        embed.add_field(name="Rank", value=f"#{rank}", inline=True)
-        embed.add_field(name="Timeout Multiplier", value=f"{multiplier:.2f}x", inline=True)
-        embed.set_thumbnail(url=user.display_avatar.url)
 
-        await ctx.send(embed=embed)
+        buf = await generate_id_card(
+            display_name=user.display_name,
+            user_id=user.id,
+            avatar_url=user.display_avatar.with_size(128).url,
+            score=score,
+            rank=rank,
+            hugs_given=counts.get("hug_given", 0),
+            hugs_received=counts.get("hug_received", 0),
+            pills_taken=counts.get("took_pills", 0),
+            member_since=member_since,
+        )
+
+        file = discord.File(buf, filename="credit_id.png")
+        embed = discord.Embed(color=discord.Color.dark_red())
+        embed.set_image(url="attachment://credit_id.png")
+        await ctx.send(embed=embed, file=file)
 
     @credit.command(name="log")
     @commands.guild_only()

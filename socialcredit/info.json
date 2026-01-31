@@ -5,7 +5,7 @@
     "short": "Track social credit scores based on behavior and interactions",
     "description": "A social credit system that tracks user scores based on message sentiment and social interactions like hugging. Integrates with MessageFilter for automatic scoring.",
     "tags": ["social", "credit", "score", "hug", "sentiment", "gamification"],
-    "requirements": ["aiosqlite"],
+    "requirements": ["aiosqlite", "Pillow"],
     "required_cogs": {},
     "min_bot_version": "3.5.0",
     "hidden": false,
