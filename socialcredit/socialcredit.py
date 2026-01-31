@@ -343,13 +343,13 @@ class SocialCredit(commands.Cog):
     @staticmethod
     def _get_current_prefix_score(nick: str) -> Optional[int]:
         """Extract current score prefix from nick, or None."""
-        match = re.match(r"^\[(\d+)\]\s*", nick)
+        match = re.match(r"^\[(-?\d+)\]\s*", nick)
         return int(match.group(1)) if match else None
 
     @staticmethod
     def _strip_score_prefix(name: str) -> str:
         """Remove a leading [number] prefix from a name."""
-        return re.sub(r"^\[\d+\]\s*", "", name)
+        return re.sub(r"^\[-?\d+\]\s*", "", name)
 
     @staticmethod
     def parse_duration(dur_str: str) -> timedelta:
@@ -776,7 +776,7 @@ class SocialCredit(commands.Cog):
         for member in ctx.guild.members:
             if member.bot or member.id == ctx.guild.owner_id:
                 continue
-            if member.nick and re.match(r"^\[\d+\]\s*", member.nick):
+            if member.nick and re.match(r"^\[-?\d+\]\s*", member.nick):
                 new_nick = self._strip_score_prefix(member.nick)
                 try:
                     await member.edit(
