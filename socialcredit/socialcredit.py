@@ -514,7 +514,7 @@ class SocialCredit(commands.Cog):
         )
 
         buf = await generate_id_card(
-            display_name=user.display_name,
+            display_name=self._strip_score_prefix(user.display_name),
             user_id=user.id,
             avatar_url=user.display_avatar.with_size(128).url,
             score=score,
