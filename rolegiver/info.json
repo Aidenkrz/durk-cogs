@@ -1,0 +1,18 @@
+{
+    "author": [
+        "Durk"
+    ],
+    "install_msg": "Thank you for installing RoleGiver! Use `[p]help RoleGiver` for commands.",
+    "name": "RoleGiver",
+    "short": "Let specific roles grant other roles via custom commands.",
+    "description": "Allows admins to delegate role-giving permissions to specific roles through custom commands.",
+    "tags": [
+        "roles",
+        "utility",
+        "moderation"
+    ],
+    "requirements": [],
+    "required_cogs": {},
+    "min_bot_version": "3.5.0",
+    "end_user_data_statement": "This cog does not store user data."
+}
