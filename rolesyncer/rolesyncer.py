@@ -21,9 +21,9 @@ class RoleSyncer(commands.Cog):
         self.config.register_global(**default_global)
 
     @commands.group()
-    @checks.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def rolesync(self, ctx: commands.Context):
-        """Manage master-slave role synchronization settings."""
+        """Manage master-slave role synchronization settings. (Bot owner only)"""
         pass
 
     @rolesync.command(name="create")
@@ -218,7 +218,6 @@ class RoleSyncer(commands.Cog):
         await ctx.send(embed=embed)
 
     @rolesync.command(name="forcesync")
-    @checks.admin_or_permissions(administrator=True)
     async def rolesync_forcesync(self, ctx: commands.Context, group_name: Optional[str] = None):
         """Forces sync from master to slaves for configured roles.
 

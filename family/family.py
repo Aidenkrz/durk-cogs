@@ -730,9 +730,9 @@ class Family(commands.Cog):
 
     @commands.command()
     @commands.guild_only()
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def servertree(self, ctx: commands.Context):
-        """Display a visual family tree for everyone in the server with relations."""
+        """Display a visual family tree for everyone in the server with relations. (Bot owner only)"""
         if not self.visualizer.available:
             await ctx.send(
                 "Family tree visualization is not available. "
@@ -1272,9 +1272,9 @@ class Family(commands.Cog):
         await ctx.send(f"You are now the owner of your family profile! Use `.familyprofile propagate` to share it with your descendants.")
 
     @familyprofile.command(name="setowner")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def familyprofile_setowner(self, ctx: commands.Context, user: discord.Member, new_owner: discord.Member):
-        """[Admin] Set the owner of a user's family profile."""
+        """[Owner] Set the owner of a user's family profile."""
         profile = await self.db.get_family_profile(user.id)
         if not profile:
             await ctx.send(f"{user.display_name} doesn't have a family profile!")
@@ -1717,9 +1717,9 @@ class Family(commands.Cog):
 
     @commands.group()
     @commands.guild_only()
-    @checks.admin_or_permissions(manage_guild=True)
+    @commands.is_owner()
     async def familyset(self, ctx: commands.Context):
-        """Configure family cog settings for this server."""
+        """Configure family cog settings for this server. (Bot owner only)"""
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
 
@@ -1877,9 +1877,9 @@ class Family(commands.Cog):
 
     @commands.group()
     @commands.guild_only()
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def familyadmin(self, ctx: commands.Context):
-        """Administrative commands for managing the family system."""
+        """Administrative commands for managing the family system. (Bot owner only)"""
         if ctx.invoked_subcommand is None:
             await ctx.send_help(ctx.command)
 

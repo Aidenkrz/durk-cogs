@@ -612,9 +612,9 @@ class SocialCredit(commands.Cog):
     # ── Admin commands ─────────────────────────────────────────────────
 
     @credit.command(name="set")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def credit_set(self, ctx: commands.Context, user: discord.Member, score: int):
-        """[Admin] Set a user's credit score to an exact value."""
+        """[Owner] Set a user's credit score to an exact value."""
         old_score = await self.db.get_score(user.id)
         await self.db.set_score(user.id, score)
         await self.db.adjust_score(
@@ -630,11 +630,11 @@ class SocialCredit(commands.Cog):
         )
 
     @credit.command(name="adjust")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def credit_adjust(
         self, ctx: commands.Context, user: discord.Member, amount: int
     ):
-        """[Admin] Adjust a user's credit score by an amount."""
+        """[Owner] Adjust a user's credit score by an amount."""
         new_score = await self.db.adjust_score(
             user_id=user.id,
             amount=amount,
@@ -650,7 +650,7 @@ class SocialCredit(commands.Cog):
     # ── Role threshold commands ────────────────────────────────────────
 
     @credit.command(name="addrole")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def credit_addrole(
         self,
         ctx: commands.Context,
@@ -658,7 +658,7 @@ class SocialCredit(commands.Cog):
         direction: str,
         threshold: int,
     ):
-        """[Admin] Assign a role when a user's score is above or below a threshold.
+        """[Owner] Assign a role when a user's score is above or below a threshold.
 
         direction: "above" or "below"
         Example: .credit addrole @GoodCitizen above 1200
@@ -679,9 +679,9 @@ class SocialCredit(commands.Cog):
         )
 
     @credit.command(name="removerole")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def credit_removerole(self, ctx: commands.Context, role: discord.Role):
-        """[Admin] Remove a role threshold."""
+        """[Owner] Remove a role threshold."""
         async with self.config.guild(ctx.guild).role_thresholds() as thresholds:
             if str(role.id) in thresholds:
                 del thresholds[str(role.id)]
@@ -731,9 +731,9 @@ class SocialCredit(commands.Cog):
         await ctx.send(embed=embed)
 
     @punish.command(name="add")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def punish_add(self, ctx: commands.Context, *, args: str):
-        """Add a punishment rule. Format: timeout 1h under 800"""
+        """[Owner] Add a punishment rule. Format: timeout 1h under 800"""
         match = re.match(r"^(\w+)\s+(\S+)\s+under\s+(\d+)$", args.lower().strip())
         if not match:
             await ctx.send("**Usage:** `[p]credit punish add timeout 1h under 800` or `ban 1d under 600`")
@@ -760,9 +760,9 @@ class SocialCredit(commands.Cog):
         await ctx.send(f"✅ Added punishment: `{action}` `{duration}` **under** `{threshold}`")
 
     @punish.command(name="remove")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def punish_remove(self, ctx: commands.Context, index: int):
-        """Remove a punishment rule by index."""
+        """[Owner] Remove a punishment rule by index."""
         async with self.config.guild(ctx.guild).punishment_rules() as rules:
             if 1 <= index <= len(rules):
                 removed = rules.pop(index - 1)
@@ -771,18 +771,18 @@ class SocialCredit(commands.Cog):
                 await ctx.send("❌ Invalid index.")
 
     @punish.command(name="clear")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def punish_clear(self, ctx: commands.Context):
-        """Clear all punishment rules."""
+        """[Owner] Clear all punishment rules."""
         await self.config.guild(ctx.guild).punishment_rules.set([])
         await ctx.send("✅ Cleared all punishment rules.")
 
     # ── Nickname prefix commands ──────────────────────────────────────
 
     @credit.command(name="nickname")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def credit_nickname(self, ctx: commands.Context):
-        """[Admin] Toggle showing [score] in nicknames."""
+        """[Owner] Toggle showing [score] in nicknames."""
         current = await self.config.guild(ctx.guild).nickname_prefix()
         new_val = not current
         await self.config.guild(ctx.guild).nickname_prefix.set(new_val)
@@ -790,9 +790,9 @@ class SocialCredit(commands.Cog):
         await ctx.send(f"Nickname score prefix **{state}**.")
 
     @credit.command(name="stripnicks")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def credit_stripnicks(self, ctx: commands.Context):
-        """[Admin] Remove [score] prefix from all member nicknames in this server."""
+        """[Owner] Remove [score] prefix from all member nicknames in this server."""
         count = 0
         for member in ctx.guild.members:
             if member.bot or member.id == ctx.guild.owner_id:
@@ -812,9 +812,9 @@ class SocialCredit(commands.Cog):
     # ── Config commands ────────────────────────────────────────────────
 
     @credit.command(name="config")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def credit_config(self, ctx: commands.Context):
-        """[Admin] Show current credit configuration for this server."""
+        """[Owner] Show current credit configuration for this server."""
         hug_given = await self.config.guild(ctx.guild).hug_credit_given()
         hug_received = await self.config.guild(ctx.guild).hug_credit_received()
         pos = await self.config.guild(ctx.guild).positive_sentiment_base()
@@ -855,14 +855,14 @@ class SocialCredit(commands.Cog):
         await ctx.send(embed=embed)
 
     @credit.command(name="setconfig")
-    @commands.admin_or_permissions(administrator=True)
+    @commands.is_owner()
     async def credit_setconfig(
         self,
         ctx: commands.Context,
         key: str,
         value: int,
     ):
-        """[Admin] Set a credit config value.
+        """[Owner] Set a credit config value.
 
         Keys: hug_given, hug_received, positive_base, negative_base
         """
