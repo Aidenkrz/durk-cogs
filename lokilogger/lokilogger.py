@@ -389,6 +389,20 @@ class LokiLogger(commands.Cog):
         else:
             await ctx.send("Log fetching disabled.")
 
+    @lokiset.command(name="purge")
+    async def lokiset_purge(self, ctx: commands.Context):
+        """Purge all active interactive log sessions for this server."""
+        guild_id = ctx.guild.id
+        purged = 0
+        for message_id in list(self.interactive_logs.keys()):
+            session = self.interactive_logs[message_id]
+            if session.get("guild_id") == guild_id:
+                if "cleanup_task" in session and session["cleanup_task"]:
+                    session["cleanup_task"].cancel()
+                del self.interactive_logs[message_id]
+                purged += 1
+        await ctx.send(f"Purged {purged} interactive log session{'s' if purged != 1 else ''}.")
+
     @lokiset.command(name="settings")
     async def lokiset_settings(self, ctx: commands.Context):
         settings = await self.config.guild(ctx.guild).all()
