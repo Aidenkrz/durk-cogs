@@ -1,0 +1,12 @@
+{
+    "author": ["Durk"],
+    "install_msg": "Thanks for installing AppealFeeder! Use `[p]help AppealFeeder` for a list of commands. Requires the `Polls` cog to be loaded.",
+    "name": "AppealFeeder",
+    "short": "Mirrors Discourse ban appeals into a Discord forum channel and runs role-restricted votes on them.",
+    "description": "Watches a Discourse category for new ban appeal topics, mirrors each one into a Discord forum channel as its own thread, kicks off a role-restricted poll (Accept/Reduce/Deny) using the Polls cog, and reminds the role if turnout is low. Optionally comments back on the Discourse thread when an API key is configured.",
+    "tags": ["discourse", "appeals", "forum", "polls", "moderation"],
+    "requirements": ["aiohttp", "beautifulsoup4"],
+    "required_cogs": {},
+    "min_bot_version": "3.5.0",
+    "end_user_data_statement": "This cog stores Discourse topic IDs alongside the Discord thread ID, poll ID, and creation timestamp for each tracked appeal. No personally identifying information is persisted beyond what Discourse itself exposes publicly."
+}
