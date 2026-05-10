@@ -704,6 +704,17 @@ class AppealFeeder(commands.Cog):
             log.warning("Polls cog gone, skipping reminder for topic %s", topic_id)
             return
 
+        # Don't ping if the poll has been closed, cancelled, or deleted between
+        # the time this reminder was scheduled and now.
+        try:
+            current_poll = await polls_cog.api.get_poll(poll_id)
+        except Exception:
+            log.exception("Failed to fetch poll %s for reminder check", poll_id)
+            return
+        if current_poll is None or getattr(current_poll, "status", None) != "open":
+            await self._mark_reminded(guild_id, topic_id)
+            return
+
         try:
             votes_map = await polls_cog.api.get_votes(poll_id)
         except Exception:
@@ -762,6 +773,32 @@ class AppealFeeder(commands.Cog):
     async def on_poll_cancelled(self, poll: Any) -> None:
         await self._handle_poll_terminal(poll)
 
+    @commands.Cog.listener()
+    async def on_poll_deleted(self, poll: Any) -> None:
+        """Silent cleanup: a moderator deleted the poll outright. We drop our
+        tracking and reminder, but don't archive the thread, swap tags, or
+        post a closing Discourse comment, staff is presumably handling
+        whatever follow-up is needed manually."""
+        guild_id = getattr(poll, "guild_id", None)
+        poll_id = getattr(poll, "id", None)
+        if guild_id is None or poll_id is None:
+            return
+        tracked = await self.config.guild_from_id(guild_id).tracked_appeals()
+        topic_id: Optional[str] = None
+        for tid, rec in (tracked or {}).items():
+            if rec.get("poll_id") == poll_id:
+                topic_id = tid
+                break
+        if topic_id is None:
+            return
+        self._cancel_reminder(int(guild_id), topic_id)
+        async with self.config.guild_from_id(guild_id).tracked_appeals() as tracked_:
+            tracked_.pop(topic_id, None)
+        log.info(
+            "AppealFeeder: poll %s deleted, dropped tracking for topic %s",
+            poll_id, topic_id,
+        )
+
     async def _handle_poll_terminal(self, poll: Any) -> None:
         guild_id = getattr(poll, "guild_id", None)
         poll_id = getattr(poll, "id", None)
@@ -799,8 +836,22 @@ class AppealFeeder(commands.Cog):
         forum = guild.get_channel(forum_id) if guild and forum_id else None
         thread_id = int(info.get("discord_thread_id", 0))
 
+        # Resolve the thread once for reuse across tag swap + close.
+        thread: Optional[discord.Thread] = None
+        if guild and thread_id:
+            cached = guild.get_thread(thread_id)
+            if isinstance(cached, discord.Thread):
+                thread = cached
+            else:
+                try:
+                    fetched = await self.bot.fetch_channel(thread_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    fetched = None
+                if isinstance(fetched, discord.Thread):
+                    thread = fetched
+
         # Swap forum tag based on outcome
-        if isinstance(forum, discord.ForumChannel) and thread_id:
+        if isinstance(forum, discord.ForumChannel) and thread is not None:
             tag_name = {
                 "Accept": settings.get("tag_accepted") or DEFAULT_TAG_ACCEPTED,
                 "Reduce": settings.get("tag_reduced") or DEFAULT_TAG_REDUCED,
@@ -808,21 +859,17 @@ class AppealFeeder(commands.Cog):
             }.get(outcome or "")
             new_tag = self._find_tag(forum, tag_name) if tag_name else None
             if new_tag is not None:
-                thread = guild.get_thread(thread_id) if guild else None
-                if thread is None:
-                    try:
-                        thread = await self.bot.fetch_channel(thread_id)
-                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                        thread = None
-                if isinstance(thread, discord.Thread):
-                    open_tag = self._find_tag(forum, settings.get("tag_open") or DEFAULT_TAG_OPEN)
-                    new_tags = [t for t in thread.applied_tags if not (open_tag and t.id == open_tag.id)]
-                    if all(t.id != new_tag.id for t in new_tags):
-                        new_tags.append(new_tag)
-                    try:
-                        await thread.edit(applied_tags=new_tags)
-                    except (discord.Forbidden, discord.HTTPException):
-                        log.exception("Failed to update forum tags on thread %s", thread_id)
+                open_tag = self._find_tag(forum, settings.get("tag_open") or DEFAULT_TAG_OPEN)
+                new_tags = [
+                    t for t in thread.applied_tags
+                    if not (open_tag and t.id == open_tag.id)
+                ]
+                if all(t.id != new_tag.id for t in new_tags):
+                    new_tags.append(new_tag)
+                try:
+                    await thread.edit(applied_tags=new_tags)
+                except (discord.Forbidden, discord.HTTPException):
+                    log.exception("Failed to update forum tags on thread %s", thread_id)
 
         # Post closing comment back to Discourse if creds are set
         base = settings.get("discourse_base_url")
@@ -855,6 +902,18 @@ class AppealFeeder(commands.Cog):
                         "Failed to post closing Discourse comment for topic %s: %s",
                         topic_id, e,
                     )
+
+        # Close (archive + lock) the Discord forum thread so it's no longer
+        # an active discussion. Lock first, then archive — archived threads
+        # can be edited by their owner without the lock.
+        if thread is not None:
+            try:
+                await thread.edit(
+                    locked=True, archived=True,
+                    reason="Appeal poll closed",
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                log.exception("Failed to close forum thread %s", thread_id)
 
         # Archive
         async with self.config.guild_from_id(guild_id).tracked_appeals() as tracked_:
