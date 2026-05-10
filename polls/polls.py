@@ -570,7 +570,7 @@ def render_poll_embed(
     if not show_tally and total_unique_voters is not None:
         desc_lines.append("")
         desc_lines.append(
-            f"*{total_unique_voters} vote(s) so far — results hidden until close.*"
+            f"*{total_unique_voters} vote(s) so far, results hidden until close.*"
         )
 
     embed.description = "\n".join(desc_lines)
@@ -630,7 +630,7 @@ def render_results_message(poll: Poll, counts: List[int]) -> str:
         names = ", ".join(f"**{poll.options[i]}**" for i in winners)
         winner_text = f"Tie between {names} ({top_count} vote(s) each)"
     return (
-        f"📊 Poll **{poll.id}** has closed — {winner_text}. "
+        f"📊 Poll **{poll.id}** has closed, {winner_text}. "
         f"Total votes cast: {total}."
     )
 
@@ -1101,7 +1101,7 @@ class Polls(commands.Cog):
         if max_choices == 1:
             old = list(current)
             if option_index in current:
-                # Toggle off — they're un-voting their single choice.
+                # Toggle off, they're un-voting their single choice.
                 await self.db.delete_user_votes(poll_id, member.id)
                 feedback = "🗳️ Vote removed."
                 self.bot.dispatch("poll_vote_removed", poll, member, option_index)
@@ -1220,7 +1220,7 @@ class Polls(commands.Cog):
         await self.db.mark_closed(poll_id, status=status, closed_at=closed_at)
         poll = replace(poll, status=status, closed_at=closed_at)
 
-        # Cancel scheduled tasks (but never self-cancel — that would abort
+        # Cancel scheduled tasks (but never self-cancel, that would abort
         # the rest of this method when _close_poll is invoked from the
         # scheduled close task itself).
         current = asyncio.current_task()
@@ -1560,7 +1560,7 @@ class Polls(commands.Cog):
                 when = poll.closed_at or poll.closes_at
                 state = f"{poll.status} {discord.utils.format_dt(when, 'R')}"
             embed.add_field(
-                name=f"`{poll.id}` — {poll.question[:60]}",
+                name=f"`{poll.id}`, {poll.question[:60]}",
                 value=f"by <@{poll.author_id}> · {state}",
                 inline=False,
             )
