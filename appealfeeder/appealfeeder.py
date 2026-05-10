@@ -418,11 +418,25 @@ class AppealFeeder(commands.Cog):
             log.warning("Discourse listing failed for guild %s: %s", guild_id, e)
             return
 
-        last_topic_id = settings.get("last_topic_id") or 0
+        last_topic_id = settings.get("last_topic_id")
+        if last_topic_id is None:
+            # First run for this guild: initialize the cursor to the newest
+            # topic we can see and process nothing. To backfill explicitly,
+            # an admin can run `appealset resetcursor 0`.
+            if topics:
+                max_id = max(int(t.get("id", 0)) for t in topics)
+                await self.config.guild_from_id(guild_id).last_topic_id.set(max_id)
+                log.info(
+                    "AppealFeeder first run for guild %s: cursor initialized to %s, "
+                    "no backfill.", guild_id, max_id,
+                )
+            return
+
+        last_topic_id = int(last_topic_id)
         # Filter out topics we've already seen, sort oldest -> newest so we
         # process them in chronological order.
         new_topics = sorted(
-            (t for t in topics if int(t.get("id", 0)) > int(last_topic_id)),
+            (t for t in topics if int(t.get("id", 0)) > last_topic_id),
             key=lambda t: int(t.get("id", 0)),
         )
 
@@ -483,18 +497,27 @@ class AppealFeeder(commands.Cog):
         extract_patterns = settings.get("extract_fields") or DEFAULT_EXTRACT_FIELDS
         fields = extract_fields(body_text, extract_patterns)
 
-        created_at_iso = op.get("created_at") or topic_data.get("created_at") or ""
+        # Discourse OP timestamp drives only the embed's relative-time display.
+        discourse_created_at_iso = (
+            op.get("created_at") or topic_data.get("created_at") or ""
+        )
         try:
-            created_at = datetime.fromisoformat(created_at_iso.replace("Z", "+00:00"))
+            discourse_created_at = datetime.fromisoformat(
+                discourse_created_at_iso.replace("Z", "+00:00")
+            )
         except ValueError:
-            created_at = utcnow()
+            discourse_created_at = utcnow()
+
+        # Reminder timing anchors to when *we* picked up the appeal, so a
+        # late-arriving or backfilled topic doesn't fire a reminder immediately.
+        processed_at = utcnow()
 
         # Build embed
         embed = discord.Embed(
             title=truncate(title, 256),
             url=topic_url,
             color=discord.Color.orange(),
-            timestamp=created_at,
+            timestamp=discourse_created_at,
         )
         author_kwargs: Dict[str, Any] = {
             "name": f"@{op_username}",
@@ -579,14 +602,15 @@ class AppealFeeder(commands.Cog):
             "poll_id": poll.id,
             "topic_url": topic_url,
             "title": title,
-            "created_ts": int(created_at.timestamp()),
+            "created_ts": int(processed_at.timestamp()),
+            "discourse_created_ts": int(discourse_created_at.timestamp()),
             "reminded": False,
         }
         async with self.config.guild(guild).tracked_appeals() as tracked:
             tracked[str(topic_id)] = appeal_record
 
         # Schedule reminder
-        remind_at = created_at + timedelta(seconds=REMINDER_AFTER_SECONDS)
+        remind_at = processed_at + timedelta(seconds=REMINDER_AFTER_SECONDS)
         self._schedule_reminder(guild.id, str(topic_id), remind_at)
 
         # Optional: post initial comment back to Discourse
@@ -688,7 +712,7 @@ class AppealFeeder(commands.Cog):
 
         unique_voters = len(votes_map)
         if unique_voters >= threshold:
-            # Threshold met — record as reminded so we don't keep checking.
+            # Threshold met, record as reminded so we don't keep checking.
             await self._mark_reminded(guild_id, topic_id)
             return
 
@@ -711,7 +735,7 @@ class AppealFeeder(commands.Cog):
         role_mention = f"<@&{role_id}>" if role_id else ""
         msg = (
             f"{role_mention} only **{unique_voters}**/{threshold} votes have "
-            f"been cast on this appeal — please review."
+            f"been cast on this appeal, please review."
         ).strip()
         try:
             await thread.send(
@@ -867,7 +891,7 @@ class AppealFeeder(commands.Cog):
             missing.append("`role`")
         if missing:
             await ctx.send(
-                "Cannot enable — missing required settings: " + ", ".join(missing)
+                "Cannot enable, missing required settings: " + ", ".join(missing)
                 + f". Use `{ctx.clean_prefix}appealset settings` to review."
             )
             return
@@ -961,7 +985,7 @@ class AppealFeeder(commands.Cog):
         label = slug_path or str(cat_id)
         await ctx.send(
             f"Category set to `{label}` (id `{cat_id}`). "
-            f"Endpoint validated — found {len(topics)} recent topic(s)."
+            f"Endpoint validated, found {len(topics)} recent topic(s)."
         )
 
     @appealset.command(name="forum")
@@ -994,7 +1018,7 @@ class AppealFeeder(commands.Cog):
     ) -> None:
         """Set (or clear) the Discourse API key. Run with no argument to clear.
 
-        Tip: run this in DM to avoid exposing the key in chat — and delete the
+        Tip: run this in DM to avoid exposing the key in chat, and delete the
         invocation message afterwards if you must run it in a channel.
         """
         if api_key is None or not api_key.strip():
@@ -1050,8 +1074,8 @@ class AppealFeeder(commands.Cog):
         """Configure Discourse comment templates.
 
         Available placeholders:
-          • `{discord_link}` — link to the Discord forum thread
-          • `{votes_breakdown}` — tally text (closing comments only)
+          • `{discord_link}`, link to the Discord forum thread
+          • `{votes_breakdown}`, tally text (closing comments only)
         """
         await ctx.send_help()
 
@@ -1151,7 +1175,7 @@ class AppealFeeder(commands.Cog):
         if not fields:
             await ctx.send("No extraction fields configured.")
             return
-        lines = [f"• **{label}** — `{pat}`" for label, pat in fields.items()]
+        lines = [f"• **{label}**, `{pat}`" for label, pat in fields.items()]
         await ctx.send("\n".join(lines)[:1900])
 
     @appealset_field.command(name="reset")
@@ -1210,7 +1234,7 @@ class AppealFeeder(commands.Cog):
         )
         embed.add_field(
             name="Last topic ID",
-            value=f"`{s.get('last_topic_id')}`" if s.get("last_topic_id") else "—",
+            value=f"`{s.get('last_topic_id')}`" if s.get("last_topic_id") else ",",
             inline=True,
         )
         embed.add_field(
@@ -1247,6 +1271,77 @@ class AppealFeeder(commands.Cog):
         else:
             await ctx.send(f"Cursor set to `{topic_id}`.")
 
+    @appealset.command(name="purge")
+    async def appealset_purge(
+        self, ctx: commands.Context, confirm: Optional[str] = None,
+    ) -> None:
+        """Wipe the cog's tracking state for this guild. **Destructive.**
+
+        Without an argument, prints a dry-run summary. Pass `confirm` to
+        actually run it. Best-effort:
+          • cancels pending reminder tasks
+          • deletes the matching polls via the Polls cog
+          • deletes the Discord forum threads the cog created
+          • clears tracked + archived appeal records
+          • resets the Discourse cursor (next poll re-initializes it)
+        """
+        s = await self.config.guild(ctx.guild).all()
+        tracked: Dict[str, Any] = s.get("tracked_appeals") or {}
+        archived: Dict[str, Any] = s.get("archived_appeals") or {}
+        cursor = s.get("last_topic_id")
+
+        if not tracked and not archived and cursor is None:
+            await ctx.send("Nothing to purge.")
+            return
+
+        if confirm != "confirm":
+            await ctx.send(
+                f"Would purge **{len(tracked)}** active and **{len(archived)}** "
+                f"archived appeal record(s), and reset the cursor "
+                f"(currently `{cursor}`).\n"
+                f"Run `{ctx.clean_prefix}appealset purge confirm` to proceed."
+            )
+            return
+
+        polls_cog = self.bot.get_cog("Polls")
+        deleted_polls = 0
+        deleted_threads = 0
+
+        for topic_id, info in list(tracked.items()):
+            self._cancel_reminder(ctx.guild.id, topic_id)
+            poll_id = info.get("poll_id")
+            if polls_cog is not None and hasattr(polls_cog, "api") and poll_id:
+                try:
+                    if await polls_cog.api.delete_poll(poll_id):
+                        deleted_polls += 1
+                except Exception:
+                    log.exception("Failed to delete poll %s during purge", poll_id)
+            thread_id = info.get("discord_thread_id")
+            if thread_id:
+                thread = ctx.guild.get_thread(int(thread_id))
+                if thread is None:
+                    try:
+                        thread = await self.bot.fetch_channel(int(thread_id))
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        thread = None
+                if isinstance(thread, discord.Thread):
+                    try:
+                        await thread.delete()
+                        deleted_threads += 1
+                    except (discord.Forbidden, discord.HTTPException):
+                        log.exception("Failed to delete thread %s during purge", thread_id)
+
+        await self.config.guild(ctx.guild).tracked_appeals.set({})
+        await self.config.guild(ctx.guild).archived_appeals.set({})
+        await self.config.guild(ctx.guild).last_topic_id.set(None)
+
+        await ctx.send(
+            f"Purge complete. Cleared **{len(tracked)}** tracked + "
+            f"**{len(archived)}** archived record(s); deleted "
+            f"**{deleted_polls}** poll(s) and **{deleted_threads}** thread(s). "
+            f"Cursor cleared, next poll initializes it without backfilling."
+        )
+
     @appealset.command(name="testpoll")
     @commands.is_owner()
     async def appealset_testpoll(self, ctx: commands.Context) -> None:
@@ -1279,7 +1374,7 @@ class AppealFeeder(commands.Cog):
             )).total_seconds() / 3600
             reminded = "🔔" if info.get("reminded") else "⏳"
             lines.append(
-                f"{reminded} `#{topic_id}` — <#{info.get('discord_thread_id')}> "
+                f"{reminded} `#{topic_id}`, <#{info.get('discord_thread_id')}> "
                 f"poll `{info.get('poll_id')}` (age {age_h:.1f}h)"
             )
         await ctx.send(
