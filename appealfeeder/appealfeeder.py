@@ -585,6 +585,7 @@ class AppealFeeder(commands.Cog):
                 options=POLL_OPTIONS,
                 duration_seconds=POLL_DURATION_SECONDS,
                 allowed_role_ids=[role.id],
+                hide_voters=True,
             )
         except Exception:
             log.exception("Polls.create_poll failed for topic %s", topic_id)
