@@ -18,8 +18,8 @@ log = logging.getLogger("red.durk-cogs.appealfeeder")
 
 
 POLL_OPTIONS: List[str] = ["Accept", "Reduce", "Deny"]
-POLL_DURATION_SECONDS: int = 7 * 86400
-REMINDER_AFTER_SECONDS: int = 5 * 86400
+POLL_DURATION_SECONDS: int = 3 * 86400
+REMINDER_AFTER_SECONDS: int = 2 * 86400
 DEFAULT_VOTE_THRESHOLD: int = 4
 LOOP_MINUTES: int = 5
 HTTP_TIMEOUT_SECONDS: int = 20
