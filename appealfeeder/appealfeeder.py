@@ -107,6 +107,36 @@ def discord_thread_link(guild_id: int, thread_id: int) -> str:
     return f"https://discord.com/channels/{guild_id}/{thread_id}"
 
 
+def parse_category_input(raw: str) -> Tuple[Optional[int], Optional[str]]:
+    """Parse user-provided category text into (category_id, slug_path).
+
+    Accepts any of:
+      - Numeric ID:                            '6'
+      - Full URL with trailing ID:             'https://.../c/ban-appeals/game-server-appeals/6'
+      - Path with ID:                          'c/ban-appeals/game-server-appeals/6'
+      - Slug path only (needs auto-resolve):   'ban-appeals/game-server-appeals'
+
+    Strips trailing `.json`, `/latest`, `/l/<filter>` decoration.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None, None
+    if "://" in s:
+        s = urlparse(s).path
+    s = s.strip("/")
+    if s.startswith("c/"):
+        s = s[2:]
+    s = re.sub(r"\.json$", "", s)
+    s = re.sub(r"/l/(?:latest|new|top|hot|unread|categories)$", "", s)
+    s = re.sub(r"/(?:latest|new|top|hot)$", "", s)
+    parts = [p for p in s.split("/") if p]
+    if not parts:
+        return None, None
+    if parts[-1].isdigit():
+        return int(parts[-1]), "/".join(parts[:-1]) or None
+    return None, "/".join(parts)
+
+
 def votes_breakdown(options: List[str], counts: List[int]) -> str:
     total = sum(counts)
     parts: List[str] = []
@@ -180,15 +210,74 @@ class DiscourseClient:
                 raise DiscourseError(f"Non-JSON response from {url}: {e}") from e
 
     async def list_category_topics(
-        self, session: aiohttp.ClientSession, category_path: str
+        self, session: aiohttp.ClientSession, category_id: int,
     ) -> List[Dict[str, Any]]:
-        """Hit `<category_path>/latest.json` and return its topic list, newest first."""
-        path = category_path.strip("/")
-        if not path.endswith(".json"):
-            path = f"{path}/latest.json"
-        data = await self._request(session, "GET", path)
+        """Hit `/c/<id>.json` and return its topic list (defaults to the
+        'latest' filter on the Discourse side)."""
+        data = await self._request(session, "GET", f"c/{int(category_id)}.json")
         topics = (data.get("topic_list") or {}).get("topics") or []
         return list(topics)
+
+    async def fetch_categories(
+        self, session: aiohttp.ClientSession,
+    ) -> List[Dict[str, Any]]:
+        """Return a flat list of all categories (parents + sub-categories).
+
+        Tries `/site.json` first (which exposes a flat `categories` array),
+        and falls back to `/categories.json` (which may nest sub-categories).
+        """
+        try:
+            data = await self._request(session, "GET", "site.json")
+            cats = data.get("categories")
+            if isinstance(cats, list) and cats:
+                return list(cats)
+        except DiscourseError as e:
+            log.debug("site.json fetch failed (%s); falling back to categories.json", e)
+
+        data = await self._request(session, "GET", "categories.json")
+        raw = ((data.get("category_list") or {}).get("categories")) or []
+        flat: List[Dict[str, Any]] = []
+
+        def _visit(c: Dict[str, Any]) -> None:
+            flat.append(c)
+            for sc in (c.get("subcategory_list") or []):
+                _visit(sc)
+
+        for c in raw:
+            _visit(c)
+        return flat
+
+    async def resolve_category(
+        self, session: aiohttp.ClientSession, slug_path: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve a slug path like 'ban-appeals/game-server-appeals' to its
+        category record. Returns None if not found or ambiguous."""
+        parts = [p.lower() for p in slug_path.strip("/").split("/") if p]
+        if not parts:
+            return None
+        cats = await self.fetch_categories(session)
+        if not cats:
+            return None
+        by_id: Dict[int, Dict[str, Any]] = {
+            int(c["id"]): c for c in cats if "id" in c
+        }
+        last = parts[-1]
+        candidates = [c for c in cats if (c.get("slug") or "").lower() == last]
+        if len(parts) == 1:
+            return candidates[0] if len(candidates) == 1 else None
+        for cand in candidates:
+            chain: List[str] = []
+            cur: Optional[Dict[str, Any]] = cand
+            depth = 0
+            while cur is not None and depth < 8:
+                chain.append((cur.get("slug") or "").lower())
+                pid = cur.get("parent_category_id")
+                cur = by_id.get(int(pid)) if pid else None
+                depth += 1
+            chain.reverse()
+            if len(chain) >= len(parts) and chain[-len(parts):] == parts:
+                return cand
+        return None
 
     async def get_topic(
         self, session: aiohttp.ClientSession, topic_id: int
@@ -220,7 +309,8 @@ class AppealFeeder(commands.Cog):
         self.config.register_guild(
             enabled=False,
             discourse_base_url=None,
-            discourse_category_path=None,
+            discourse_category_id=None,
+            discourse_category_label=None,
             discourse_api_key=None,
             discourse_api_username=None,
             forum_channel_id=None,
@@ -296,10 +386,10 @@ class AppealFeeder(commands.Cog):
 
     async def _poll_guild(self, guild_id: int, settings: Dict[str, Any]) -> None:
         base = settings.get("discourse_base_url")
-        category = settings.get("discourse_category_path")
+        category_id = settings.get("discourse_category_id")
         forum_id = settings.get("forum_channel_id")
         role_id = settings.get("vote_role_id")
-        if not (base and category and forum_id and role_id):
+        if not (base and category_id and forum_id and role_id):
             return
 
         guild = self.bot.get_guild(guild_id)
@@ -323,7 +413,7 @@ class AppealFeeder(commands.Cog):
         if self._session is None:
             return
         try:
-            topics = await client.list_category_topics(self._session, category)
+            topics = await client.list_category_topics(self._session, int(category_id))
         except DiscourseError as e:
             log.warning("Discourse listing failed for guild %s: %s", guild_id, e)
             return
@@ -769,7 +859,7 @@ class AppealFeeder(commands.Cog):
         missing = []
         if not settings.get("discourse_base_url"):
             missing.append("`instance`")
-        if not settings.get("discourse_category_path"):
+        if not settings.get("discourse_category_id"):
             missing.append("`category`")
         if not settings.get("forum_channel_id"):
             missing.append("`forum`")
@@ -808,18 +898,71 @@ class AppealFeeder(commands.Cog):
         await ctx.send(f"Discourse instance set to `{clean}`.")
 
     @appealset.command(name="category")
-    async def appealset_category(self, ctx: commands.Context, *, category_path: str) -> None:
-        """Set the Discourse category path to monitor.
+    async def appealset_category(
+        self, ctx: commands.Context, *, category: str,
+    ) -> None:
+        """Set the Discourse category to monitor.
 
-        Example: `c/appeals/5` (the part after the instance URL).
+        Accepts any of:
+          • A category URL: `https://forums.example.com/c/ban-appeals/game-server-appeals/6`
+          • A slug path with ID: `c/ban-appeals/game-server-appeals/6`
+          • A slug path without ID (auto-resolved): `ban-appeals/game-server-appeals`
+          • A bare numeric ID: `6`
         """
-        path = category_path.strip().strip("/")
-        if path.endswith(".json"):
-            path = path[:-5]
-        if path.endswith("/latest"):
-            path = path[: -len("/latest")]
-        await self.config.guild(ctx.guild).discourse_category_path.set(path)
-        await ctx.send(f"Discourse category path set to `{path}`.")
+        base = await self.config.guild(ctx.guild).discourse_base_url()
+        if not base:
+            await ctx.send(
+                f"Set the Discourse instance first with "
+                f"`{ctx.clean_prefix}appealset instance <url>`."
+            )
+            return
+        if self._session is None:
+            await ctx.send("HTTP session unavailable; please reload the cog.")
+            return
+
+        cat_id, slug_path = parse_category_input(category)
+        if cat_id is None and not slug_path:
+            await ctx.send(
+                "Couldn't parse that. Provide a category URL, a slug path, or a numeric ID."
+            )
+            return
+
+        client = DiscourseClient(
+            base,
+            api_key=await self.config.guild(ctx.guild).discourse_api_key(),
+            api_username=await self.config.guild(ctx.guild).discourse_api_username(),
+        )
+
+        if cat_id is None:
+            assert slug_path is not None
+            try:
+                cat = await client.resolve_category(self._session, slug_path)
+            except DiscourseError as e:
+                await ctx.send(f"Discourse lookup failed: `{e}`")
+                return
+            if cat is None:
+                await ctx.send(
+                    f"No category matching `{slug_path}` found on `{base}`. "
+                    "If the slug is correct, try passing the numeric category ID directly."
+                )
+                return
+            cat_id = int(cat["id"])
+            slug_path = (cat.get("slug") or slug_path).strip("/")
+
+        # Validate by hitting /c/<id>.json
+        try:
+            topics = await client.list_category_topics(self._session, cat_id)
+        except DiscourseError as e:
+            await ctx.send(f"Could not load category `{cat_id}`: `{e}`")
+            return
+
+        await self.config.guild(ctx.guild).discourse_category_id.set(cat_id)
+        await self.config.guild(ctx.guild).discourse_category_label.set(slug_path or str(cat_id))
+        label = slug_path or str(cat_id)
+        await ctx.send(
+            f"Category set to `{label}` (id `{cat_id}`). "
+            f"Endpoint validated — found {len(topics)} recent topic(s)."
+        )
 
     @appealset.command(name="forum")
     async def appealset_forum(
@@ -1043,11 +1186,13 @@ class AppealFeeder(commands.Cog):
             value=f"`{s.get('discourse_base_url') or 'Not set'}`",
             inline=False,
         )
-        embed.add_field(
-            name="Category path",
-            value=f"`{s.get('discourse_category_path') or 'Not set'}`",
-            inline=False,
-        )
+        cat_id = s.get("discourse_category_id")
+        cat_label = s.get("discourse_category_label")
+        if cat_id:
+            cat_value = f"`{cat_label or cat_id}` (id `{cat_id}`)"
+        else:
+            cat_value = "Not set"
+        embed.add_field(name="Category", value=cat_value, inline=False)
         embed.add_field(name="Forum channel", value=forum_mention, inline=True)
         embed.add_field(name="Vote role", value=role_mention, inline=True)
         embed.add_field(
