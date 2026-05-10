@@ -1,0 +1,22 @@
+{
+    "author": [
+        "Durk"
+    ],
+    "install_msg": "Thank you for installing Polls! Use `/poll create` to start a poll, or `[p]help Polls` for more.",
+    "name": "Polls",
+    "short": "Slash-command polls with persistent buttons and a public API.",
+    "description": "Create polls via slash command with configurable duration, hidden voters/tallies, multi-choice, and role gating. Exposes a public API and dispatches lifecycle events for other cogs.",
+    "tags": [
+        "poll",
+        "polls",
+        "voting",
+        "utility",
+        "api"
+    ],
+    "requirements": [
+        "aiosqlite"
+    ],
+    "required_cogs": {},
+    "min_bot_version": "3.5.0",
+    "end_user_data_statement": "This cog stores Discord user IDs alongside their votes for the duration of each poll's lifetime. Vote records are kept indefinitely until the poll is deleted by a moderator or the poll's creator."
+}
