@@ -562,16 +562,18 @@ def render_poll_embed(
         if show_tally:
             count = counts[i]
             pct = (count / total_votes * 100) if total_votes else 0.0
-            desc_lines.append(
-                f"**{i + 1}. {option}**\n`{_bar(pct)}` `{count}` ({pct:.1f}%)"
-            )
+            desc_lines.append(f"**{i + 1}.** {option}")
+            desc_lines.append(f"`{_bar(pct)}` `{count}` ({pct:.1f}%)")
         else:
-            desc_lines.append(f"**{i + 1}. {option}**")
+            desc_lines.append(f"**{i + 1}.** {option}")
 
     if not show_tally and total_unique_voters is not None:
-        desc_lines.append(f"\n*{total_unique_voters} vote(s) so far — results hidden until close.*")
+        desc_lines.append("")
+        desc_lines.append(
+            f"*{total_unique_voters} vote(s) so far — results hidden until close.*"
+        )
 
-    embed.description = "\n\n".join(desc_lines)
+    embed.description = "\n".join(desc_lines)
 
     if (
         poll.status != "open"
