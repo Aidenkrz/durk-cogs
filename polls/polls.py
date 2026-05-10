@@ -557,7 +557,7 @@ def render_poll_embed(
     show_tally = poll.status != "open" or not poll.hide_tally_until_close
     total_votes = sum(counts)
 
-    desc_lines: List[str] = []
+    desc_lines: List[str] = [f"_{state_text}_", ""]
     for i, option in enumerate(poll.options):
         if show_tally:
             count = counts[i]
@@ -603,7 +603,7 @@ def render_poll_embed(
     if poll.allowed_role_ids:
         flags.append("role-restricted")
 
-    footer = f"ID: {poll.id}  •  {state_text}"
+    footer = f"ID: {poll.id}"
     if flags:
         footer += "  •  " + " · ".join(flags)
     embed.set_footer(text=footer)
@@ -1218,12 +1218,15 @@ class Polls(commands.Cog):
         await self.db.mark_closed(poll_id, status=status, closed_at=closed_at)
         poll = replace(poll, status=status, closed_at=closed_at)
 
-        # Cancel scheduled tasks
+        # Cancel scheduled tasks (but never self-cancel — that would abort
+        # the rest of this method when _close_poll is invoked from the
+        # scheduled close task itself).
+        current = asyncio.current_task()
         ct = self._close_tasks.pop(poll_id, None)
-        if ct is not None and not ct.done():
+        if ct is not None and not ct.done() and ct is not current:
             ct.cancel()
         tt = self._tally_tasks.pop(poll_id, None)
-        if tt is not None and not tt.done():
+        if tt is not None and not tt.done() and tt is not current:
             tt.cancel()
 
         # Render final state on the original message + post results message
