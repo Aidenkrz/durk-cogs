@@ -70,7 +70,7 @@ class DeadlockTracker(commands.Cog):
             "enabled": False,
             "ping_matches": True,
             # account_id (str) -> {account_id, label, discord_id, last_match_id,
-            #                      last_rank}
+            #                      last_badge}
             "players": {},
         }
         self.config.register_guild(**default_guild)
@@ -80,6 +80,10 @@ class DeadlockTracker(commands.Cog):
             timeout=aiohttp.ClientTimeout(total=30),
         )
 
+        # deadlock-api Patreon key (X-API-KEY); unlocks the official player card
+        # and thus real in-game ranks. Loaded from Red's shared API tokens.
+        self._api_key: Optional[str] = None
+
         # Asset caches (id -> name / tier -> info), refreshed lazily.
         self._heroes: dict[int, str] = {}
         self._ranks: dict[int, dict] = {}
@@ -88,6 +92,15 @@ class DeadlockTracker(commands.Cog):
 
         self.feed_task.start()
 
+    async def cog_load(self):
+        tokens = await self.bot.get_shared_api_tokens("deadlock")
+        self._api_key = tokens.get("api_key")
+
+    @commands.Cog.listener()
+    async def on_red_api_tokens_update(self, service_name: str, api_tokens: dict):
+        if service_name == "deadlock":
+            self._api_key = api_tokens.get("api_key")
+
     def cog_unload(self):
         self.feed_task.cancel()
         asyncio.create_task(self.session.close())
@@ -95,11 +108,16 @@ class DeadlockTracker(commands.Cog):
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
+    def _auth_headers(self) -> Optional[dict]:
+        return {"X-API-KEY": self._api_key} if self._api_key else None
+
     async def _api_get(self, path: str, params: Optional[dict] = None):
         """GET from the deadlock API. Returns (data, None) or (None, error_str)."""
         url = f"{API_BASE}{path}"
         try:
-            async with self.session.get(url, params=params) as resp:
+            async with self.session.get(
+                url, params=params, headers=self._auth_headers()
+            ) as resp:
                 data = await resp.json(content_type=None)
                 if resp.status != 200:
                     msg = None
@@ -160,27 +178,132 @@ class DeadlockTracker(commands.Cog):
             return data[0], None
         return None, None
 
-    async def _get_mmr_batch(self, account_ids: list) -> dict:
-        """Fetch current MMR for many accounts at once -> {account_id: row}."""
-        if not account_ids:
-            return {}
-        data, err = await self._api_get(
-            "/v1/players/mmr",
-            params={"account_ids": ",".join(str(a) for a in account_ids)},
-        )
-        if err or not isinstance(data, list):
-            return {}
-        out: dict = {}
-        for row in data:
-            acc = row.get("account_id")
-            if acc is None:
-                continue
-            # Keep the most recent row per account.
-            if acc not in out or row.get("start_time", 0) > out[acc].get(
-                "start_time", 0
-            ):
-                out[acc] = row
-        return out
+    async def _get_card(self, account_id: int) -> dict:
+        """
+        Fetch the official player card (Patreon-only, requires the account to
+        have friended a deadlock-api bot).
+
+        Returns a dict: ``badge`` (combined ranked badge, e.g. 102) and
+        ``division``/``subrank`` when available; ``needs_friend`` with
+        ``invite_links`` when the account must add a bot first; ``no_key`` when
+        no API key is configured; otherwise ``error``.
+        """
+        result = {
+            "badge": None,
+            "division": None,
+            "subrank": None,
+            "needs_friend": False,
+            "invite_links": [],
+            "no_key": False,
+            "error": None,
+        }
+        if not self._api_key:
+            result["no_key"] = True
+            return result
+
+        url = f"{API_BASE}/v1/players/{account_id}/card"
+        try:
+            async with self.session.get(url, headers=self._auth_headers()) as resp:
+                status = resp.status
+                data = await resp.json(content_type=None)
+        except Exception as e:  # noqa: BLE001
+            result["error"] = str(e)
+            return result
+
+        if status == 200 and isinstance(data, dict):
+            div = data.get("ranked_rank")
+            sub = data.get("ranked_subrank")
+            badge = data.get("ranked_badge_level")
+            if badge is None and div is not None:
+                badge = div * 10 + (sub or 0)
+            if badge is not None and div is None:
+                div, sub = divmod(int(badge), 10)
+            result["badge"] = badge
+            result["division"] = div
+            result["subrank"] = sub
+            return result
+
+        # Error response: detect "friend the bot" (carries Steam invite links).
+        msg = ""
+        links = []
+        if isinstance(data, dict):
+            msg = str(data.get("error") or data.get("message") or "")
+            links = self._find_invite_links(data)
+        low = msg.lower()
+        if status == 403 or "patreon" in low:
+            result["no_key"] = True
+        elif links or "friend" in low or "invite" in low:
+            result["needs_friend"] = True
+            result["invite_links"] = links
+        else:
+            result["error"] = msg or f"status {status}"
+        return result
+
+    @staticmethod
+    def _find_invite_links(obj) -> list:
+        """Recursively collect Steam friend/invite URLs from an error payload."""
+        found = []
+
+        def walk(o):
+            if isinstance(o, str):
+                if "steamcommunity.com" in o or o.startswith("steam://") or "s.team" in o:
+                    found.append(o)
+            elif isinstance(o, dict):
+                for v in o.values():
+                    walk(v)
+            elif isinstance(o, list):
+                for v in o:
+                    walk(v)
+
+        walk(obj)
+        # De-duplicate, preserve order.
+        return list(dict.fromkeys(found))
+
+    async def _resolve_rank(self, account_id: int, mmr: Optional[dict] = None) -> dict:
+        """
+        Resolve a player's rank, preferring the official card badge and falling
+        back to the MMR estimate.
+
+        Returns: ``label`` (e.g. "Ascendant II"), ``badge_image`` URL,
+        ``sort_value`` (badge number for ranking), ``official`` /``estimated``
+        booleans, ``needs_friend``, and ``badge`` (official combined badge or
+        None).
+        """
+        needs_friend = False
+        if self._api_key:
+            card = await self._get_card(account_id)
+            if card["division"] is not None:
+                label, image = self._rank_display(card["division"], card["subrank"])
+                badge = card["badge"]
+                return {
+                    "label": label,
+                    "badge_image": image,
+                    "sort_value": badge or 0,
+                    "official": True,
+                    "estimated": False,
+                    "needs_friend": False,
+                    "badge": badge,
+                }
+            needs_friend = card["needs_friend"]
+
+        # Fall back to the MMR estimate.
+        if mmr is None:
+            mmr, _ = await self._get_mmr(account_id)
+        if mmr:
+            div, sub = mmr.get("division"), mmr.get("division_tier")
+            label, image = self._rank_display(div, sub)
+            sort_value = mmr.get("rank") or 0
+        else:
+            label, image, sort_value = "Unranked", None, 0
+        return {
+            "label": label,
+            "badge_image": image,
+            "sort_value": sort_value,
+            "official": False,
+            "estimated": True,
+            "needs_friend": needs_friend,
+            "badge": None,
+        }
 
     async def _get_steam_profile(self, account_id: int):
         data, err = await self._api_get(
@@ -372,9 +495,9 @@ class DeadlockTracker(commands.Cog):
                     "excluded from stats."
                 )
 
-            mmr, _ = await self._get_mmr(account_id)
+            rank_info = await self._resolve_rank(account_id)
             profile = await self._get_steam_profile(account_id)
-            embed = self._build_stats_embed(account_id, history, mmr, profile)
+            embed = self._build_stats_embed(account_id, history, rank_info, profile)
             await ctx.send(embed=embed)
 
     @deadlock.command(name="leaderboard", aliases=["lb", "top"])
@@ -397,19 +520,14 @@ class DeadlockTracker(commands.Cog):
 
         async with ctx.typing():
             await self._ensure_assets()
-            mmr_rows = await self._get_mmr_batch(
-                [e["account_id"] for e in players.values()]
-            )
 
             rows = []  # (entry, sort_key, display)
             for entry in players.values():
                 acc = entry["account_id"]
-                mmr = mmr_rows.get(acc)
-                rank_label, _ = self._rank_display(
-                    (mmr or {}).get("division"), (mmr or {}).get("division_tier")
-                )
                 if sort == "rank":
-                    rows.append((entry, (mmr or {}).get("rank") or 0, rank_label))
+                    ri = await self._resolve_rank(acc)
+                    label = ri["label"] + (" *(est.)*" if ri["estimated"] else "")
+                    rows.append((entry, ri["sort_value"], label))
                 else:
                     history, err = await self._get_match_history(acc)
                     # Exclude Street Brawl from win-rate / KDA aggregation.
@@ -429,7 +547,7 @@ class DeadlockTracker(commands.Cog):
                         d = sum(r.get("player_deaths", 0) for r in window)
                         a = sum(r.get("player_assists", 0) for r in window)
                         kda = self._kda_ratio(k, d, a)
-                        rows.append((entry, kda, f"{kda:.2f} KDA · {rank_label}"))
+                        rows.append((entry, kda, f"{kda:.2f} KDA"))
 
         rows.sort(key=lambda x: x[1], reverse=True)
         medals = {0: "🥇", 1: "🥈", 2: "🥉"}
@@ -450,11 +568,74 @@ class DeadlockTracker(commands.Cog):
         )
         await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
+    @deadlock.command(name="friendbot")
+    @commands.guild_only()
+    async def deadlock_friendbot(
+        self, ctx: commands.Context, *, player: Optional[str] = None
+    ):
+        """
+        Get the Steam link to friend the deadlock-api bot for official ranks.
+
+        Friending the bot unlocks a player's exact in-game rank (otherwise ranks
+        are estimates). `player` defaults to your own linked account.
+        """
+        if not self._api_key:
+            return await ctx.send(
+                "No deadlock-api API key is configured, so official ranks aren't "
+                "available. The bot owner can set one with "
+                f"`{ctx.clean_prefix}set api deadlock api_key <key>` "
+                "(requires a deadlock-api Patreon subscription)."
+            )
+
+        if player is None:
+            account_id = await self._account_for_member(ctx.guild, ctx.author.id)
+            if account_id is None:
+                return await ctx.send(
+                    "Tell me which player — a name, id, profile URL, or @mention "
+                    "(if linked)."
+                )
+        else:
+            account_id, err = await self._resolve_query(ctx, player)
+            if err:
+                return await ctx.send(err)
+
+        async with ctx.typing():
+            card = await self._get_card(account_id)
+
+        if card.get("badge"):
+            label, _ = self._rank_display(*divmod(int(card["badge"]), 10))
+            return await ctx.send(
+                f"✅ Account `{account_id}` is already friended — official rank "
+                f"is readable (**{label}**)."
+            )
+        if card.get("no_key"):
+            return await ctx.send(
+                "The configured API key was rejected (it needs an active "
+                "deadlock-api Patreon subscription)."
+            )
+        if card.get("needs_friend"):
+            links = card.get("invite_links") or []
+            if links:
+                joined = "\n".join(links)
+                return await ctx.send(
+                    f"To unlock the **official** rank for `{account_id}`, add one of "
+                    f"these deadlock-api bots on Steam — it then updates "
+                    f"automatically:\n{joined}"
+                )
+            return await ctx.send(
+                f"`{account_id}` needs to friend a deadlock-api bot to unlock "
+                "official rank, but the API returned no invite links. See "
+                "https://deadlock-api.com for the current bot accounts."
+            )
+        return await ctx.send(
+            f"Couldn't read the player card: {card.get('error') or 'unknown error'}."
+        )
+
     def _build_stats_embed(
         self,
         account_id: int,
         history: list,
-        mmr: Optional[dict],
+        rank_info: dict,
         profile: Optional[dict],
     ) -> discord.Embed:
         window = history[:STATS_WINDOW]
@@ -479,13 +660,11 @@ class DeadlockTracker(commands.Cog):
             icon_url=(profile or {}).get("avatarfull"),
         )
 
-        rank_label = "Unranked"
-        if mmr:
-            rank_label, badge = self._rank_display(
-                mmr.get("division"), mmr.get("division_tier")
-            )
-            if badge:
-                embed.set_thumbnail(url=badge)
+        rank_label = rank_info.get("label", "Unranked")
+        if rank_info.get("estimated"):
+            rank_label += " *(est.)*"
+        if rank_info.get("badge_image"):
+            embed.set_thumbnail(url=rank_info["badge_image"])
 
         # Current win/loss streak from the most recent games.
         streak_n, streak_win = self._current_streak(history)
@@ -559,7 +738,10 @@ class DeadlockTracker(commands.Cog):
                 name="🕑 Recent matches", value="\n".join(recent_lines), inline=False
             )
 
-        embed.set_footer(text=f"Deadlock · account {account_id}")
+        footer = f"Deadlock · account {account_id}"
+        if rank_info.get("estimated"):
+            footer += " · rank estimated — friend the deadlock-api bot for exact rank"
+        embed.set_footer(text=footer)
         return embed
 
     @staticmethod
@@ -682,23 +864,35 @@ class DeadlockTracker(commands.Cog):
                 )
             last_match_id = history[0]["match_id"] if history else 0
 
-            # Seed the rank so we don't announce a spurious rank-up on first add.
-            mmr, _ = await self._get_mmr(account_id)
-            last_rank = (mmr or {}).get("rank")
+            # Seed the official badge (if available) so the first rank check
+            # doesn't fire a spurious announcement. Stays None until the player
+            # friends a bot; rank-ups are only tracked from official badges.
+            card = await self._get_card(account_id)
+            last_badge = card.get("badge")
 
             players[str(account_id)] = {
                 "account_id": account_id,
                 "label": label,
                 "discord_id": member.id if member else None,
                 "last_match_id": last_match_id,
-                "last_rank": last_rank,
+                "last_badge": last_badge,
             }
             await self.config.guild(ctx.guild).players.set(players)
 
         link = f" linked to {member.mention}" if member else ""
+        note = ""
+        if not self._api_key:
+            note = (
+                " Rank shown will be an estimate until a deadlock-api API key is set."
+            )
+        elif card.get("needs_friend"):
+            note = (
+                f" Rank will be estimated until **{label}** friends the bot — "
+                f"run `{ctx.clean_prefix}deadlock friendbot {account_id}` for the link."
+            )
         await ctx.send(
             f"Now watching **{label}** (`{account_id}`){link}. "
-            f"New matches will be posted to the feed channel.",
+            f"New matches will be posted to the feed channel.{note}",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -757,6 +951,11 @@ class DeadlockTracker(commands.Cog):
         embed.add_field(
             name="Match pings",
             value="On" if conf.get("ping_matches", True) else "Off",
+            inline=True,
+        )
+        embed.add_field(
+            name="Official ranks",
+            value="API key set" if self._api_key else "Estimate only (no key)",
             inline=True,
         )
         embed.add_field(
@@ -921,13 +1120,11 @@ class DeadlockTracker(commands.Cog):
                         stored[key]["last_match_id"] = match_id
         return posted
 
-    def _build_rank_embed(self, entry: dict, old_rank: int, new_row: dict, is_up: bool):
-        """Build the embed + ping content for a rank change."""
-        old_div, old_sub = divmod(int(old_rank), 10)
-        old_label, _ = self._rank_display(old_div, old_sub)
-        new_label, new_badge = self._rank_display(
-            new_row.get("division"), new_row.get("division_tier")
-        )
+    def _build_rank_embed(self, entry: dict, old_badge: int, new_badge: int, is_up: bool):
+        """Build the embed + ping content for an official rank change."""
+        old_label, _ = self._rank_display(*divmod(int(old_badge), 10))
+        new_div, new_sub = divmod(int(new_badge), 10)
+        new_label, new_image = self._rank_display(new_div, new_sub)
         if is_up:
             title = f"📈 {entry.get('label')} ranked up!"
             color = discord.Color.green()
@@ -940,8 +1137,8 @@ class DeadlockTracker(commands.Cog):
             description=f"{old_label} → **{new_label}**",
             color=color,
         )
-        if new_badge:
-            embed.set_thumbnail(url=new_badge)
+        if new_image:
+            embed.set_thumbnail(url=new_image)
         embed.set_footer(text=f"Deadlock · account {entry['account_id']}")
 
         # Rank-ups always ping the linked member; deranks never ping.
@@ -950,7 +1147,16 @@ class DeadlockTracker(commands.Cog):
         return embed, content
 
     async def _check_ranks(self, guild: discord.Guild) -> int:
-        """Detect and announce rank changes for watched players. Returns count."""
+        """
+        Detect and announce official rank changes for watched players.
+
+        Only works with a configured API key, and only for players who have
+        friended a deadlock-api bot (so we can read their real badge). Players
+        whose official badge can't be read are skipped — no estimate-based
+        announcements. Returns the number of changes posted.
+        """
+        if not self._api_key:
+            return 0
         conf = await self.config.guild(guild).all()
         players = conf.get("players", {})
         if not players:
@@ -959,35 +1165,28 @@ class DeadlockTracker(commands.Cog):
         channel = guild.get_channel(rankup_id) if rankup_id else None
         if channel is None:
             return 0
-
-        mmr_rows = await self._get_mmr_batch(
-            [e["account_id"] for e in players.values()]
-        )
-        if not mmr_rows:
-            return 0
         await self._ensure_assets()
 
-        announcements = []  # (entry, old_rank, new_row, is_up)
+        announcements = []  # (entry, old_badge, new_badge, is_up)
         updates: dict[str, int] = {}
         for key, entry in players.items():
-            row = mmr_rows.get(entry["account_id"])
-            if not row:
+            card = await self._get_card(entry["account_id"])
+            new_badge = card.get("badge")
+            if not new_badge:
+                # Not friended / no card data -> don't track or announce.
                 continue
-            new_rank = row.get("rank")
-            if not new_rank:
+            old_badge = entry.get("last_badge")
+            if old_badge is None:
+                # Seed silently the first time we can read an official badge.
+                updates[key] = new_badge
                 continue
-            old_rank = entry.get("last_rank")
-            if old_rank is None:
-                # Seed silently so existing watchlist entries don't fire on first run.
-                updates[key] = new_rank
-                continue
-            if new_rank != old_rank:
-                updates[key] = new_rank
-                announcements.append((entry, old_rank, row, new_rank > old_rank))
+            if new_badge != old_badge:
+                updates[key] = new_badge
+                announcements.append((entry, old_badge, new_badge, new_badge > old_badge))
 
         posted = 0
-        for entry, old_rank, row, is_up in announcements:
-            embed, content = self._build_rank_embed(entry, old_rank, row, is_up)
+        for entry, old_badge, new_badge, is_up in announcements:
+            embed, content = self._build_rank_embed(entry, old_badge, new_badge, is_up)
             try:
                 await channel.send(
                     content=content,
@@ -1002,9 +1201,9 @@ class DeadlockTracker(commands.Cog):
 
         if updates:
             async with self.config.guild(guild).players() as stored:
-                for key, new_rank in updates.items():
+                for key, badge in updates.items():
                     if key in stored:
-                        stored[key]["last_rank"] = new_rank
+                        stored[key]["last_badge"] = badge
         return posted
 
     @tasks.loop(minutes=5)
