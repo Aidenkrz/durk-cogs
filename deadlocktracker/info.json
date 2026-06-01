@@ -3,8 +3,8 @@
   "install_msg": "Thanks for installing DeadlockTracker! Use `[p]help DeadlockTracker` to get started. Set a feed channel with `[p]deadlockset channel #channel`, add players with `[p]deadlockset addplayer <steamid/name/url> [@member]`, then enable with `[p]deadlockset toggle on`.",
   "name": "DeadlockTracker",
   "short": "Track Deadlock players: look up stats and auto-post their match results to a channel.",
-  "description": "A Redbot cog using the deadlock-api.com API. Look up a player's stats (rank, recent win-rate, top heroes, recent matches) and maintain a per-server watchlist of players whose finished matches are automatically posted to a feed channel, with optional Discord member links so posts can ping them.",
+  "description": "A Redbot cog using the deadlock-api.com API. Look up a player's stats (rank, recent win-rate, top heroes, recent matches), rank watched players against each other on a leaderboard, and maintain a per-server watchlist of players whose finished matches are automatically posted to a feed channel. Optional Discord member links let match posts ping players, and rank-ups/deranks are announced to a configurable channel (rank-ups ping, deranks don't). Street Brawl matches are excluded from aggregated stats.",
   "tags": ["deadlock", "stats", "feed", "games", "valve"],
   "requirements": [],
-  "end_user_data_statement": "This cog stores Deadlock account IDs added to the per-server watchlist, an optional Discord user ID linking a watched player to a Discord member, a per-player display label, and the last processed match ID used to detect new matches. It does not store message content."
+  "end_user_data_statement": "This cog stores Deadlock account IDs added to the per-server watchlist, an optional Discord user ID linking a watched player to a Discord member, a per-player display label, the last processed match ID used to detect new matches, and the last known rank used to detect rank changes. It does not store message content."
 }

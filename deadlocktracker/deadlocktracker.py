@@ -66,8 +66,11 @@ class DeadlockTracker(commands.Cog):
         )
         default_guild = {
             "channel_id": None,
+            "rankup_channel_id": None,
             "enabled": False,
-            # account_id (str) -> {account_id, label, discord_id, last_match_id}
+            "ping_matches": True,
+            # account_id (str) -> {account_id, label, discord_id, last_match_id,
+            #                      last_rank}
             "players": {},
         }
         self.config.register_guild(**default_guild)
@@ -157,6 +160,28 @@ class DeadlockTracker(commands.Cog):
             return data[0], None
         return None, None
 
+    async def _get_mmr_batch(self, account_ids: list) -> dict:
+        """Fetch current MMR for many accounts at once -> {account_id: row}."""
+        if not account_ids:
+            return {}
+        data, err = await self._api_get(
+            "/v1/players/mmr",
+            params={"account_ids": ",".join(str(a) for a in account_ids)},
+        )
+        if err or not isinstance(data, list):
+            return {}
+        out: dict = {}
+        for row in data:
+            acc = row.get("account_id")
+            if acc is None:
+                continue
+            # Keep the most recent row per account.
+            if acc not in out or row.get("start_time", 0) > out[acc].get(
+                "start_time", 0
+            ):
+                out[acc] = row
+        return out
+
     async def _get_steam_profile(self, account_id: int):
         data, err = await self._api_get(
             "/v1/players/steam", params={"account_ids": str(account_id)}
@@ -208,6 +233,11 @@ class DeadlockTracker(commands.Cog):
     @staticmethod
     def _won(row: dict) -> bool:
         return row.get("player_team") == row.get("match_result")
+
+    @staticmethod
+    def _is_brawl(row: dict) -> bool:
+        """Street Brawl (game_mode 4) is excluded from aggregated player stats."""
+        return row.get("game_mode") == 4
 
     @staticmethod
     def _fmt_duration(seconds: Optional[int]) -> str:
@@ -334,10 +364,91 @@ class DeadlockTracker(commands.Cog):
             if not history:
                 return await ctx.send("That player has no recorded matches.")
 
+            # Street Brawl is a casual mode and is excluded from stats.
+            history = [r for r in history if not self._is_brawl(r)]
+            if not history:
+                return await ctx.send(
+                    "That player only has Street Brawl matches, which are "
+                    "excluded from stats."
+                )
+
             mmr, _ = await self._get_mmr(account_id)
             profile = await self._get_steam_profile(account_id)
             embed = self._build_stats_embed(account_id, history, mmr, profile)
             await ctx.send(embed=embed)
+
+    @deadlock.command(name="leaderboard", aliases=["lb", "top"])
+    async def deadlock_leaderboard(
+        self, ctx: commands.Context, sort: str = "rank"
+    ):
+        """
+        Rank this server's watched players against each other.
+
+        `sort` may be `rank` (default), `winrate`, or `kda`. `winrate` and `kda`
+        are computed over each player's recent matches and take a little longer.
+        """
+        sort = sort.lower()
+        if sort not in ("rank", "winrate", "kda"):
+            return await ctx.send("Sort must be one of: `rank`, `winrate`, `kda`.")
+
+        players = await self.config.guild(ctx.guild).players()
+        if not players:
+            return await ctx.send("No players are being watched yet.")
+
+        async with ctx.typing():
+            await self._ensure_assets()
+            mmr_rows = await self._get_mmr_batch(
+                [e["account_id"] for e in players.values()]
+            )
+
+            rows = []  # (entry, sort_key, display)
+            for entry in players.values():
+                acc = entry["account_id"]
+                mmr = mmr_rows.get(acc)
+                rank_label, _ = self._rank_display(
+                    (mmr or {}).get("division"), (mmr or {}).get("division_tier")
+                )
+                if sort == "rank":
+                    rows.append((entry, (mmr or {}).get("rank") or 0, rank_label))
+                else:
+                    history, err = await self._get_match_history(acc)
+                    # Exclude Street Brawl from win-rate / KDA aggregation.
+                    ranked = [r for r in (history or []) if not self._is_brawl(r)]
+                    window = ranked[:STATS_WINDOW]
+                    if err or not window:
+                        rows.append((entry, -1, "no recent matches"))
+                        continue
+                    wins = sum(1 for r in window if self._won(r))
+                    if sort == "winrate":
+                        wr = wins / len(window) * 100
+                        rows.append(
+                            (entry, wr, f"{wr:.0f}% WR ({wins}W·{len(window) - wins}L)")
+                        )
+                    else:  # kda
+                        k = sum(r.get("player_kills", 0) for r in window)
+                        d = sum(r.get("player_deaths", 0) for r in window)
+                        a = sum(r.get("player_assists", 0) for r in window)
+                        kda = self._kda_ratio(k, d, a)
+                        rows.append((entry, kda, f"{kda:.2f} KDA · {rank_label}"))
+
+        rows.sort(key=lambda x: x[1], reverse=True)
+        medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+        lines = []
+        for i, (entry, _key, display) in enumerate(rows):
+            prefix = medals.get(i, f"**{i + 1}.**")
+            lines.append(f"{prefix} **{entry.get('label')}** — {display}")
+
+        titles = {
+            "rank": "by Rank",
+            "winrate": f"by Win Rate (last {STATS_WINDOW})",
+            "kda": f"by KDA (last {STATS_WINDOW})",
+        }
+        embed = discord.Embed(
+            title=f"🏆 Deadlock Leaderboard — {titles[sort]}",
+            description="\n".join(lines),
+            color=discord.Color.from_rgb(199, 124, 60),
+        )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     def _build_stats_embed(
         self,
@@ -483,6 +594,24 @@ class DeadlockTracker(commands.Cog):
         await self.config.guild(ctx.guild).channel_id.set(channel.id)
         await ctx.send(f"Match feed channel set to {channel.mention}.")
 
+    @deadlockset.command(name="rankupchannel")
+    async def deadlockset_rankupchannel(
+        self, ctx: commands.Context, channel: Optional[discord.TextChannel] = None
+    ):
+        """
+        Set the channel for rank-up / derank announcements.
+
+        Omit the channel to clear it; rank-ups then fall back to the match feed
+        channel.
+        """
+        if channel is None:
+            await self.config.guild(ctx.guild).rankup_channel_id.set(None)
+            return await ctx.send(
+                "Rank-up channel cleared. Announcements will use the match feed channel."
+            )
+        await self.config.guild(ctx.guild).rankup_channel_id.set(channel.id)
+        await ctx.send(f"Rank-up announcements will be posted to {channel.mention}.")
+
     @deadlockset.command(name="toggle")
     async def deadlockset_toggle(
         self, ctx: commands.Context, on_off: Optional[bool] = None
@@ -495,6 +624,26 @@ class DeadlockTracker(commands.Cog):
             )
         await self.config.guild(ctx.guild).enabled.set(on_off)
         await ctx.send(f"Match feed {'enabled' if on_off else 'disabled'}.")
+
+    @deadlockset.command(name="pingmatches")
+    async def deadlockset_pingmatches(
+        self, ctx: commands.Context, on_off: Optional[bool] = None
+    ):
+        """
+        Toggle whether match-result posts ping linked members.
+
+        Rank-up announcements always ping (deranks never do); this only affects
+        the match feed.
+        """
+        current = await self.config.guild(ctx.guild).ping_matches()
+        if on_off is None:
+            return await ctx.send(
+                f"Match posts currently {'ping' if current else 'do not ping'} linked members."
+            )
+        await self.config.guild(ctx.guild).ping_matches.set(on_off)
+        await ctx.send(
+            f"Match posts will {'now ping' if on_off else 'no longer ping'} linked members."
+        )
 
     @deadlockset.command(name="addplayer")
     async def deadlockset_addplayer(
@@ -533,11 +682,16 @@ class DeadlockTracker(commands.Cog):
                 )
             last_match_id = history[0]["match_id"] if history else 0
 
+            # Seed the rank so we don't announce a spurious rank-up on first add.
+            mmr, _ = await self._get_mmr(account_id)
+            last_rank = (mmr or {}).get("rank")
+
             players[str(account_id)] = {
                 "account_id": account_id,
                 "label": label,
                 "discord_id": member.id if member else None,
                 "last_match_id": last_match_id,
+                "last_rank": last_rank,
             }
             await self.config.guild(ctx.guild).players.set(players)
 
@@ -587,6 +741,8 @@ class DeadlockTracker(commands.Cog):
         conf = await self.config.guild(ctx.guild).all()
         channel_id = conf.get("channel_id")
         channel = f"<#{channel_id}>" if channel_id else "Not set"
+        rankup_id = conf.get("rankup_channel_id")
+        rankup = f"<#{rankup_id}>" if rankup_id else "Match feed channel"
         embed = discord.Embed(
             title="DeadlockTracker settings",
             color=discord.Color.from_rgb(199, 124, 60),
@@ -597,6 +753,12 @@ class DeadlockTracker(commands.Cog):
             inline=True,
         )
         embed.add_field(name="Feed channel", value=channel, inline=True)
+        embed.add_field(name="Rank-up channel", value=rankup, inline=True)
+        embed.add_field(
+            name="Match pings",
+            value="On" if conf.get("ping_matches", True) else "Off",
+            inline=True,
+        )
         embed.add_field(
             name="Players watched", value=str(len(conf.get("players", {}))), inline=True
         )
@@ -625,7 +787,11 @@ class DeadlockTracker(commands.Cog):
             f"Previewing the last {count} match(es) per watched player…"
         )
         posted = await self._process_guild(
-            ctx.guild, channel, force_recent=count, update_watermark=False
+            ctx.guild,
+            channel,
+            force_recent=count,
+            update_watermark=False,
+            ping=False,
         )
         await ctx.send(f"Done. Posted {posted} match result(s).")
 
@@ -695,6 +861,7 @@ class DeadlockTracker(commands.Cog):
         channel: discord.abc.Messageable,
         force_recent: Optional[int] = None,
         update_watermark: bool = True,
+        ping: bool = True,
     ) -> int:
         """
         Poll all watched players in a guild and post matches. Returns the count.
@@ -702,6 +869,7 @@ class DeadlockTracker(commands.Cog):
         Normally only matches newer than each player's watermark are posted. If
         `force_recent` is set, the last N matches per player are posted instead
         (a preview), and `update_watermark=False` leaves the live feed untouched.
+        `ping=False` suppresses pinging linked members.
         """
         await self._ensure_assets()
         players = await self.config.guild(guild).players()
@@ -732,6 +900,8 @@ class DeadlockTracker(commands.Cog):
         for match_id in sorted(new_by_match):
             rows = new_by_match[match_id]
             embed, content = self._build_match_embed(match_id, rows)
+            if not ping:
+                content = None
             try:
                 await channel.send(
                     content=content,
@@ -751,27 +921,125 @@ class DeadlockTracker(commands.Cog):
                         stored[key]["last_match_id"] = match_id
         return posted
 
+    def _build_rank_embed(self, entry: dict, old_rank: int, new_row: dict, is_up: bool):
+        """Build the embed + ping content for a rank change."""
+        old_div, old_sub = divmod(int(old_rank), 10)
+        old_label, _ = self._rank_display(old_div, old_sub)
+        new_label, new_badge = self._rank_display(
+            new_row.get("division"), new_row.get("division_tier")
+        )
+        if is_up:
+            title = f"📈 {entry.get('label')} ranked up!"
+            color = discord.Color.green()
+        else:
+            title = f"📉 {entry.get('label')} deranked"
+            color = discord.Color.dark_red()
+
+        embed = discord.Embed(
+            title=title,
+            description=f"{old_label} → **{new_label}**",
+            color=color,
+        )
+        if new_badge:
+            embed.set_thumbnail(url=new_badge)
+        embed.set_footer(text=f"Deadlock · account {entry['account_id']}")
+
+        # Rank-ups always ping the linked member; deranks never ping.
+        discord_id = entry.get("discord_id")
+        content = f"<@{discord_id}>" if (is_up and discord_id) else None
+        return embed, content
+
+    async def _check_ranks(self, guild: discord.Guild) -> int:
+        """Detect and announce rank changes for watched players. Returns count."""
+        conf = await self.config.guild(guild).all()
+        players = conf.get("players", {})
+        if not players:
+            return 0
+        rankup_id = conf.get("rankup_channel_id") or conf.get("channel_id")
+        channel = guild.get_channel(rankup_id) if rankup_id else None
+        if channel is None:
+            return 0
+
+        mmr_rows = await self._get_mmr_batch(
+            [e["account_id"] for e in players.values()]
+        )
+        if not mmr_rows:
+            return 0
+        await self._ensure_assets()
+
+        announcements = []  # (entry, old_rank, new_row, is_up)
+        updates: dict[str, int] = {}
+        for key, entry in players.items():
+            row = mmr_rows.get(entry["account_id"])
+            if not row:
+                continue
+            new_rank = row.get("rank")
+            if not new_rank:
+                continue
+            old_rank = entry.get("last_rank")
+            if old_rank is None:
+                # Seed silently so existing watchlist entries don't fire on first run.
+                updates[key] = new_rank
+                continue
+            if new_rank != old_rank:
+                updates[key] = new_rank
+                announcements.append((entry, old_rank, row, new_rank > old_rank))
+
+        posted = 0
+        for entry, old_rank, row, is_up in announcements:
+            embed, content = self._build_rank_embed(entry, old_rank, row, is_up)
+            try:
+                await channel.send(
+                    content=content,
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions(
+                        users=True, roles=False, everyone=False
+                    ),
+                )
+                posted += 1
+            except discord.HTTPException:
+                log.exception("Failed to post rank change in guild %s", guild.id)
+
+        if updates:
+            async with self.config.guild(guild).players() as stored:
+                for key, new_rank in updates.items():
+                    if key in stored:
+                        stored[key]["last_rank"] = new_rank
+        return posted
+
     @tasks.loop(minutes=5)
     async def feed_task(self):
         all_guilds = await self.config.all_guilds()
         for guild_id, conf in all_guilds.items():
-            if not conf.get("enabled") or not conf.get("channel_id"):
-                continue
-            if not conf.get("players"):
+            if not conf.get("enabled") or not conf.get("players"):
                 continue
             guild = self.bot.get_guild(guild_id)
             if guild is None:
                 continue
-            channel = guild.get_channel(conf["channel_id"])
-            if channel is None:
-                log.warning(
-                    "Feed channel %s missing in guild %s", conf["channel_id"], guild_id
-                )
-                continue
+
+            # Match feed (needs the match channel).
+            match_channel = None
+            if conf.get("channel_id"):
+                match_channel = guild.get_channel(conf["channel_id"])
+                if match_channel is None:
+                    log.warning(
+                        "Feed channel %s missing in guild %s",
+                        conf["channel_id"],
+                        guild_id,
+                    )
+            if match_channel is not None:
+                try:
+                    await self._process_guild(
+                        guild, match_channel, ping=conf.get("ping_matches", True)
+                    )
+                except Exception:  # noqa: BLE001 - never let one guild kill the loop
+                    log.exception("Error processing match feed for guild %s", guild_id)
+
+            # Rank-up announcements (resolve their own channel).
             try:
-                await self._process_guild(guild, channel)
-            except Exception:  # noqa: BLE001 - never let one guild kill the loop
-                log.exception("Error processing feed for guild %s", guild_id)
+                await self._check_ranks(guild)
+            except Exception:  # noqa: BLE001
+                log.exception("Error processing rank changes for guild %s", guild_id)
 
     @feed_task.before_loop
     async def before_feed_task(self):
