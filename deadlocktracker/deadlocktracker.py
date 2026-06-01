@@ -4,7 +4,7 @@ import re
 import time
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Optional, Union
+from typing import Optional
 
 import aiohttp
 import discord
@@ -347,27 +347,26 @@ class DeadlockTracker(commands.Cog):
         profile: Optional[dict],
     ) -> discord.Embed:
         window = history[:STATS_WINDOW]
+        n = len(window)
         wins = sum(1 for r in window if self._won(r))
-        losses = len(window) - wins
-        winrate = (wins / len(window) * 100) if window else 0
+        losses = n - wins
+        winrate = (wins / n * 100) if n else 0
         tot_k = sum(r.get("player_kills", 0) for r in window)
         tot_d = sum(r.get("player_deaths", 0) for r in window)
         tot_a = sum(r.get("player_assists", 0) for r in window)
-        avg_nw = (
-            sum(r.get("net_worth", 0) for r in window) / len(window) if window else 0
-        )
-        avg_dur = (
-            sum(r.get("match_duration_s", 0) for r in window) / len(window)
-            if window
-            else 0
-        )
+        avg = (lambda key: (sum(r.get(key, 0) for r in window) / n) if n else 0)
+        avg_nw = avg("net_worth")
+        avg_dur = avg("match_duration_s")
+        avg_k, avg_d, avg_a = avg("player_kills"), avg("player_deaths"), avg("player_assists")
+        avg_lh, avg_dn = avg("last_hits"), avg("denies")
 
         name = (profile or {}).get("personaname") or f"Account {account_id}"
-        embed = discord.Embed(title=name, color=discord.Color.from_rgb(199, 124, 60))
-        if profile:
-            embed.url = profile.get("profileurl")
-            if profile.get("avatarfull"):
-                embed.set_author(name=name, icon_url=profile["avatarfull"])
+        embed = discord.Embed(color=discord.Color.from_rgb(199, 124, 60))
+        embed.set_author(
+            name=name,
+            url=(profile or {}).get("profileurl"),
+            icon_url=(profile or {}).get("avatarfull"),
+        )
 
         rank_label = "Unranked"
         if mmr:
@@ -376,23 +375,42 @@ class DeadlockTracker(commands.Cog):
             )
             if badge:
                 embed.set_thumbnail(url=badge)
-        embed.add_field(name="Rank", value=rank_label, inline=True)
+
+        # Current win/loss streak from the most recent games.
+        streak_n, streak_win = self._current_streak(history)
+        streak_value = (
+            f"{'🟩' if streak_win else '🟥'} {'W' if streak_win else 'L'}{streak_n}"
+            if streak_n
+            else "—"
+        )
+
+        # Row 1: identity / record / momentum
+        embed.add_field(name="🏅 Rank", value=rank_label, inline=True)
         embed.add_field(
-            name=f"Last {len(window)}",
-            value=f"{wins}W–{losses}L · {winrate:.0f}%",
+            name="📊 Win rate",
+            value=f"**{winrate:.0f}%**\n{wins}W · {losses}L",
+            inline=True,
+        )
+        embed.add_field(name="🔥 Streak", value=streak_value, inline=True)
+        # Row 2: combat
+        embed.add_field(
+            name="⚔️ KDA",
+            value=f"**{self._kda_ratio(tot_k, tot_d, tot_a):.2f}**\n"
+            f"{avg_k:.1f} / {avg_d:.1f} / {avg_a:.1f}",
             inline=True,
         )
         embed.add_field(
-            name="KDA",
-            value=f"{self._kda_ratio(tot_k, tot_d, tot_a):.2f}",
+            name="💰 Avg net worth",
+            value=self._fmt_networth(round(avg_nw)),
             inline=True,
         )
         embed.add_field(
-            name="Avg net worth", value=self._fmt_networth(round(avg_nw)), inline=True
+            name="⏱️ Avg length", value=self._fmt_duration(avg_dur), inline=True
         )
-        embed.add_field(
-            name="Avg length", value=self._fmt_duration(avg_dur), inline=True
-        )
+        # Row 3: farm
+        embed.add_field(name="🌾 Avg last hits", value=f"{avg_lh:.0f}", inline=True)
+        embed.add_field(name="🛡️ Avg denies", value=f"{avg_dn:.0f}", inline=True)
+        embed.add_field(name="🎮 Matches", value=f"{n} of {len(history)}", inline=True)
 
         # Top heroes in the window.
         hero_ids = [r.get("hero_id") for r in window if r.get("hero_id") is not None]
@@ -406,27 +424,46 @@ class DeadlockTracker(commands.Cog):
                 d = sum(r.get("player_deaths", 0) for r in rows)
                 a = sum(r.get("player_assists", 0) for r in rows)
                 lines.append(
-                    f"**{self._hero_name(hero_id)}** — {count} · "
-                    f"{hw / count * 100:.0f}% · {self._kda_ratio(k, d, a):.1f} KDA"
+                    f"**{self._hero_name(hero_id)}** · {count} games · "
+                    f"{hw / count * 100:.0f}% WR · {self._kda_ratio(k, d, a):.1f} KDA"
                 )
-            embed.add_field(name="Top heroes", value="\n".join(lines), inline=False)
+            embed.add_field(
+                name=f"⭐ Top heroes (last {n})", value="\n".join(lines), inline=False
+            )
 
         # Most recent matches.
         recent_lines = []
         for r in history[:RECENT_COUNT]:
             result = "🟩" if self._won(r) else "🟥"
+            start = r.get("start_time")
+            when = f" · <t:{start}:R>" if start else ""
             recent_lines.append(
-                f"{result} {self._hero_name(r.get('hero_id'))} "
+                f"{result} **{self._hero_name(r.get('hero_id'))}** "
                 f"{r.get('player_kills', 0)}/{r.get('player_deaths', 0)}/"
-                f"{r.get('player_assists', 0)}"
+                f"{r.get('player_assists', 0)} · "
+                f"{self._fmt_networth(r.get('net_worth'))}{when}"
             )
         if recent_lines:
             embed.add_field(
-                name="Recent matches", value="\n".join(recent_lines), inline=False
+                name="🕑 Recent matches", value="\n".join(recent_lines), inline=False
             )
 
-        embed.set_footer(text=f"account id {account_id}")
+        embed.set_footer(text=f"Deadlock · account {account_id}")
         return embed
+
+    @staticmethod
+    def _current_streak(history: list):
+        """Return (length, won) of the most-recent unbroken win/loss streak."""
+        if not history:
+            return 0, False
+        first = DeadlockTracker._won(history[0])
+        count = 0
+        for r in history:
+            if DeadlockTracker._won(r) == first:
+                count += 1
+            else:
+                break
+        return count, first
 
     # ------------------------------------------------------------------
     # Settings group
@@ -567,8 +604,15 @@ class DeadlockTracker(commands.Cog):
 
     @deadlock.command(name="testfeed")
     @commands.is_owner()
-    async def deadlock_testfeed(self, ctx: commands.Context):
-        """Manually run one feed poll for this server (bot owner only)."""
+    async def deadlock_testfeed(self, ctx: commands.Context, count: int = 1):
+        """
+        Preview the feed by posting each watched player's last `count` matches.
+
+        Unlike the live feed this ignores the per-player watermark (so it always
+        has something to show) and does not advance it, so the real feed is
+        unaffected. `count` is clamped to 1–10. Bot owner only.
+        """
+        count = max(1, min(count, 10))
         conf = await self.config.guild(ctx.guild).all()
         if not conf.get("channel_id"):
             return await ctx.send("No feed channel is set.")
@@ -577,14 +621,18 @@ class DeadlockTracker(commands.Cog):
         channel = ctx.guild.get_channel(conf["channel_id"])
         if channel is None:
             return await ctx.send("The configured feed channel no longer exists.")
-        await ctx.send("Running a feed poll for this server…")
-        posted = await self._process_guild(ctx.guild, channel)
+        await ctx.send(
+            f"Previewing the last {count} match(es) per watched player…"
+        )
+        posted = await self._process_guild(
+            ctx.guild, channel, force_recent=count, update_watermark=False
+        )
         await ctx.send(f"Done. Posted {posted} match result(s).")
 
     # ------------------------------------------------------------------
     # Feed loop
     # ------------------------------------------------------------------
-    def _build_match_embed(self, guild: discord.Guild, match_id: int, rows: list):
+    def _build_match_embed(self, match_id: int, rows: list):
         """
         Build the embed + ping content for one match.
 
@@ -642,9 +690,19 @@ class DeadlockTracker(commands.Cog):
         return embed, content
 
     async def _process_guild(
-        self, guild: discord.Guild, channel: discord.abc.Messageable
+        self,
+        guild: discord.Guild,
+        channel: discord.abc.Messageable,
+        force_recent: Optional[int] = None,
+        update_watermark: bool = True,
     ) -> int:
-        """Poll all watched players in a guild and post new matches. Returns count."""
+        """
+        Poll all watched players in a guild and post matches. Returns the count.
+
+        Normally only matches newer than each player's watermark are posted. If
+        `force_recent` is set, the last N matches per player are posted instead
+        (a preview), and `update_watermark=False` leaves the live feed untouched.
+        """
         await self._ensure_assets()
         players = await self.config.guild(guild).players()
         if not players:
@@ -659,8 +717,11 @@ class DeadlockTracker(commands.Cog):
             if err or not history:
                 # Leave the watermark untouched so we retry next cycle.
                 continue
-            last = entry.get("last_match_id") or 0
-            fresh = [r for r in history if r.get("match_id", 0) > last]
+            if force_recent is not None:
+                fresh = history[:force_recent]
+            else:
+                last = entry.get("last_match_id") or 0
+                fresh = [r for r in history if r.get("match_id", 0) > last]
             if not fresh:
                 continue
             new_watermarks[key] = max(r["match_id"] for r in fresh)
@@ -670,7 +731,7 @@ class DeadlockTracker(commands.Cog):
         posted = 0
         for match_id in sorted(new_by_match):
             rows = new_by_match[match_id]
-            embed, content = self._build_match_embed(guild, match_id, rows)
+            embed, content = self._build_match_embed(match_id, rows)
             try:
                 await channel.send(
                     content=content,
@@ -683,7 +744,7 @@ class DeadlockTracker(commands.Cog):
             except discord.HTTPException:
                 log.exception("Failed to post match %s in guild %s", match_id, guild.id)
 
-        if new_watermarks:
+        if update_watermark and new_watermarks:
             async with self.config.guild(guild).players() as stored:
                 for key, match_id in new_watermarks.items():
                     if key in stored:
