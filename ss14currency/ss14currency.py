@@ -11,6 +11,7 @@ import typing
 from typing import Dict, Optional
 import random
 from discord.ui import View, Button
+from discord.ext import tasks
 from dataclasses import dataclass
 from pathlib import Path
 import aiosqlite
@@ -228,7 +229,11 @@ class SS14Currency(commands.Cog):
         "transfer_rate_window": 60,  # Time window in seconds
         "gambling_cooldown": 10,  # Seconds between gambling attempts
         "large_transaction_threshold": 1000,  # Amount requiring confirmation
+        "role_payouts": {},  # {role_id (str): amount (int)} - monthly currency per role
     }
+
+    # Seconds in a payout period (30 days)
+    PAYOUT_PERIOD = 30 * 24 * 60 * 60
 
     def __init__(self, bot: Red):
         self.bot = bot
@@ -245,6 +250,9 @@ class SS14Currency(commands.Cog):
         # Rate limiting and cooldown tracking
         self.transfer_timestamps: Dict[int, list] = {}  # user_id -> list of timestamps
         self.gambling_cooldowns: Dict[int, float] = {}  # user_id -> timestamp
+
+        # Start the monthly role payout background loop
+        self.payout_loop.start()
 
     async def get_pool_for_guild(self, guild_id: int) -> Optional[asyncpg.Pool]:
         if guild_id in self.guild_pools:
@@ -404,6 +412,16 @@ class SS14Currency(commands.Cog):
         await self.local_db.execute("""
             CREATE INDEX IF NOT EXISTS idx_tax_guild
             ON tax_revenue(guild_id)
+        """)
+
+        # Tracks when each member last received a monthly role payout
+        await self.local_db.execute("""
+            CREATE TABLE IF NOT EXISTS role_payout_history (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                last_paid_at INTEGER NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            )
         """)
 
         await self.local_db.commit()
@@ -649,11 +667,186 @@ class SS14Currency(commands.Cog):
             log.error(f"Error recording tax: {e}", exc_info=True)
             return False
 
+    async def get_last_payout(self, guild_id: int, user_id: int) -> Optional[int]:
+        """Gets the unix timestamp of a member's last monthly role payout."""
+        if self.local_db is None:
+            await self.initialize_local_db()
+
+        async with self.local_db.execute(
+            "SELECT last_paid_at FROM role_payout_history WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else None
+
+    async def set_last_payout(self, guild_id: int, user_id: int, timestamp: int) -> None:
+        """Records the unix timestamp of a member's most recent monthly role payout."""
+        if self.local_db is None:
+            await self.initialize_local_db()
+
+        await self.local_db.execute("""
+            INSERT INTO role_payout_history (guild_id, user_id, last_paid_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET last_paid_at = excluded.last_paid_at
+        """, (guild_id, user_id, timestamp))
+        await self.local_db.commit()
+
+    async def run_role_payouts(self, guild: discord.Guild) -> int:
+        """Pays out monthly currency to eligible members of a guild.
+
+        A member is eligible if they hold at least one configured paying role and
+        at least PAYOUT_PERIOD seconds have passed since their own last payout.
+        Each eligible member receives the amount of their single highest-value role.
+        Returns the number of members paid.
+        """
+        role_payouts = await self.config.guild(guild).role_payouts()
+        if not role_payouts:
+            return 0
+
+        # Config keys are stored as strings; normalise to int role ids
+        payout_map = {int(role_id): amount for role_id, amount in role_payouts.items()}
+
+        pool = await self.get_pool_for_guild(guild.id)
+        if not pool:
+            return 0
+
+        now = int(time.time())
+        paid_count = 0
+
+        for member in guild.members:
+            if member.bot:
+                continue
+
+            # Highest-value applicable role only
+            amounts = [payout_map[role.id] for role in member.roles if role.id in payout_map]
+            if not amounts:
+                continue
+            amount = max(amounts)
+            if amount <= 0:
+                continue
+
+            last_paid = await self.get_last_payout(guild.id, member.id)
+            if last_paid is not None and now - last_paid < self.PAYOUT_PERIOD:
+                continue
+
+            # Currency is credited to a linked SS14 account; skip unlinked members
+            # so they start accruing once they link (no back-pay).
+            player_id = await get_player_id_from_discord(pool, member.id)
+            if not player_id:
+                continue
+
+            success, old_balance, new_balance = await add_player_currency(pool, player_id, amount)
+            if not success:
+                log.warning(f"Failed to pay monthly payout of {amount} to {member.id} in guild {guild.id}.")
+                continue
+
+            await self.set_last_payout(guild.id, member.id, now)
+            await self.log_transaction(
+                guild.id, "role_payout", amount,
+                to_player_id=player_id,
+                balance_before=old_balance,
+                balance_after=new_balance,
+                notes="Monthly role payout"
+            )
+            paid_count += 1
+
+            # Best-effort DM; ignore members with DMs closed or transient errors
+            try:
+                embed = discord.Embed(
+                    title="💰 Monthly Payout",
+                    description=f"You received **{amount:,}** coins as your monthly payout in **{guild.name}**!",
+                    color=discord.Color.green()
+                )
+                embed.add_field(name="💰 New Balance", value=f"{new_balance:,} coins", inline=True)
+                await member.send(embed=embed)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+        if paid_count:
+            log.info(f"Paid monthly role payout to {paid_count} member(s) in guild {guild.id}.")
+        return paid_count
+
+    @tasks.loop(hours=1)
+    async def payout_loop(self):
+        """Hourly check that pays out any member whose 30-day payout period has elapsed."""
+        try:
+            await self.initialize_local_db()
+            for guild in self.bot.guilds:
+                try:
+                    await self.run_role_payouts(guild)
+                except Exception as e:
+                    log.error(f"Error running role payouts for guild {guild.id}: {e}", exc_info=True)
+        except Exception as e:
+            log.error(f"Error in payout loop: {e}", exc_info=True)
+
+    @payout_loop.before_loop
+    async def before_payout_loop(self):
+        await self.bot.wait_until_ready()
+
     @commands.group(name="currency")
     @commands.guild_only()
     async def currency(self, ctx: commands.Context):
         """Manage SS14 server currency."""
         pass
+
+    @currency.group(name="payroll")
+    @checks.admin_or_permissions(manage_guild=True)
+    async def payroll(self, ctx: commands.Context):
+        """Configure monthly currency payouts for roles."""
+        pass
+
+    @payroll.command(name="set")
+    async def payroll_set(self, ctx: commands.Context, role: discord.Role, amount: int):
+        """Give a role a monthly payout of the given amount of coins."""
+        if amount <= 0:
+            await ctx.send("The payout amount must be a positive number.", ephemeral=True)
+            return
+
+        async with self.config.guild(ctx.guild).role_payouts() as payouts:
+            payouts[str(role.id)] = amount
+
+        embed = discord.Embed(title="✅ Payroll Updated", color=discord.Color.green())
+        embed.add_field(name="🏷️ Role", value=role.mention, inline=True)
+        embed.add_field(name="💰 Monthly Payout", value=f"{amount:,} coins", inline=True)
+        embed.set_footer(text="Members receive the amount of their highest paying role every 30 days.")
+        await ctx.send(embed=embed)
+
+    @payroll.command(name="remove")
+    async def payroll_remove(self, ctx: commands.Context, role: discord.Role):
+        """Stop paying a monthly payout for a role."""
+        async with self.config.guild(ctx.guild).role_payouts() as payouts:
+            removed = payouts.pop(str(role.id), None)
+
+        if removed is None:
+            await ctx.send(f"{role.mention} does not have a monthly payout configured.", ephemeral=True)
+            return
+
+        embed = discord.Embed(title="🗑️ Payroll Removed", color=discord.Color.orange())
+        embed.add_field(name="🏷️ Role", value=role.mention, inline=True)
+        embed.add_field(name="💰 Was Paying", value=f"{removed:,} coins", inline=True)
+        await ctx.send(embed=embed)
+
+    @payroll.command(name="list")
+    async def payroll_list(self, ctx: commands.Context):
+        """List all roles with a configured monthly payout."""
+        payouts = await self.config.guild(ctx.guild).role_payouts()
+        if not payouts:
+            await ctx.send("No roles have a monthly payout configured. Use `payroll set` to add one.", ephemeral=True)
+            return
+
+        # Sort by amount, highest first
+        entries = sorted(payouts.items(), key=lambda kv: kv[1], reverse=True)
+
+        embed = discord.Embed(
+            title="💵 Monthly Role Payouts",
+            description="Members receive the amount of their single highest paying role every 30 days.",
+            color=discord.Color.gold()
+        )
+        for role_id, amount in entries:
+            role = ctx.guild.get_role(int(role_id))
+            role_display = role.mention if role else f"*deleted role ({role_id})*"
+            embed.add_field(name=role_display, value=f"{amount:,} coins / month", inline=False)
+        await ctx.send(embed=embed)
 
     @currency.command(name="self")
     async def self_coins(self, ctx: commands.Context):
@@ -1155,8 +1348,9 @@ class SS14Currency(commands.Cog):
         await interaction.response.send_modal(DbConfigModal(self, interaction.guild_id))
 
     async def cog_unload(self):
+        self.payout_loop.cancel()
         await self.session.close()
-        
+
         # Close SS14 database pools
         guild_ids = list(self.guild_pools.keys())
         for guild_id in guild_ids:
