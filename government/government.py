@@ -14,6 +14,7 @@ from discord.ext import tasks
 from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.data_manager import cog_data_path
+from redbot.core.utils.menus import DEFAULT_CONTROLS, menu
 
 log = logging.getLogger("red.durk-cogs.government")
 
@@ -1523,6 +1524,7 @@ class Government(commands.Cog):
         )
         page_size = 8
         page_count = (len(ordered_parties) + page_size - 1) // page_size
+        pages: List[discord.Embed] = []
         for page_index in range(page_count):
             page = ordered_parties[
                 page_index * page_size : (page_index + 1) * page_size
@@ -1557,12 +1559,16 @@ class Government(commands.Cog):
                         f"*“{slogan[:100]}{'…' if len(slogan) > 100 else ''}”*"
                     )
                 embed.add_field(
-                    name=f"{item['name']} — {member_count} member{'s' if member_count != 1 else ''}",
+                    name=f"{item['name']} - {member_count} member{'s' if member_count != 1 else ''}",
                     value="\n".join(details),
                     inline=False,
                 )
             embed.set_footer(text=f"Page {page_index + 1} of {page_count}")
-            await ctx.send(embed=embed)
+            pages.append(embed)
+        if len(pages) == 1:
+            await ctx.send(embed=pages[0])
+        else:
+            await menu(ctx, pages, DEFAULT_CONTROLS, timeout=120)
 
     @party.command(name="info")
     async def party_info(self, ctx: commands.Context, *, party_name: str) -> None:

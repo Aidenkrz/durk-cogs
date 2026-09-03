@@ -14,8 +14,8 @@ for persistent button voting.
    admin set-laws-channel` if you prefer an existing channel.
 3. Put the bot's role above the roles it creates and grant it **Manage Roles**,
    **Manage Channels**, **Manage Messages**, **Send Messages**, **Embed Links**,
-   and **Create Public Threads** (the last is optional but recommended for law
-   discussion threads).
+   **Add Reactions**, and **Read Message History**. **Create Public Threads** is
+   optional but recommended for law discussion threads.
 4. Configure a campaign channel so the permissionless `Party Leader` role can
    post there. Only leaders of parties with at least five current members keep
    that shared role.
@@ -84,3 +84,5 @@ Useful prefix examples:
 - `[p]government law amend 3 "Updated Park Rules" Replacement law text here.`
 - `[p]government admin rename-party "Old Party" New Party`
 - `[p]government admin delete-party Party Name`
+
+The party list uses one message with reaction controls to move between pages.
