@@ -22,6 +22,9 @@ TERM_SECONDS = 14 * DAY_SECONDS
 MIN_PARTY_MEMBERS = 5
 MAX_ICON_BYTES = 256 * 1024
 MAX_PARTY_NAME = 50
+MAX_PARTY_SLOGAN = 100
+MAX_PARTY_DESCRIPTION = 500
+MAX_PARTY_MANIFESTO = 1000
 MAX_LAW_TITLE = 100
 MAX_LAW_TEXT = 3500
 
@@ -101,6 +104,22 @@ def clean_party_name(value: str) -> str:
     if any(ord(char) < 32 for char in name):
         raise ValueError("Party names cannot contain control characters.")
     return name
+
+
+def clean_profile_field(
+    value: Optional[str], *, label: str, maximum: int
+) -> Optional[str]:
+    """Validate an optional profile value. A single dash clears the field."""
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if cleaned == "-":
+        return ""
+    if not cleaned:
+        raise ValueError(f"{label} cannot be empty. Use `-` to clear it.")
+    if len(cleaned) > maximum:
+        raise ValueError(f"{label} may not exceed {maximum} characters.")
+    return cleaned
 
 
 class Government(commands.Cog):
@@ -1161,6 +1180,9 @@ class Government(commands.Cog):
         name="Party name",
         color="Hex color such as #5865F2",
         icon="PNG, JPEG, or WebP up to 256 KiB",
+        slogan="Optional party slogan (up to 100 characters)",
+        description="Optional party description (up to 500 characters)",
+        manifesto="Optional party manifesto (up to 1,000 characters)",
     )
     async def party_create(
         self,
@@ -1168,6 +1190,9 @@ class Government(commands.Cog):
         name: str,
         color: str,
         icon: discord.Attachment,
+        slogan: Optional[str] = None,
+        description: Optional[str] = None,
+        manifesto: Optional[str] = None,
     ) -> None:
         guild = self._guild(interaction)
         if guild is None:
@@ -1178,6 +1203,17 @@ class Government(commands.Cog):
             clean_name = clean_party_name(name)
             color_value = parse_color(color)
             icon_data, image_type = await self._read_icon(icon)
+            clean_slogan = clean_profile_field(
+                slogan, label="Slogan", maximum=MAX_PARTY_SLOGAN
+            )
+            clean_description = clean_profile_field(
+                description,
+                label="Description",
+                maximum=MAX_PARTY_DESCRIPTION,
+            )
+            clean_manifesto = clean_profile_field(
+                manifesto, label="Manifesto", maximum=MAX_PARTY_MANIFESTO
+            )
         except ValueError as exc:
             return await self._reply(interaction, str(exc))
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1203,13 +1239,16 @@ class Government(commands.Cog):
                 "member_ids": [interaction.user.id],
                 "color": color_value,
                 "icon_path": str(icon_path),
+                "slogan": clean_slogan or "",
+                "description": clean_description or "",
+                "manifesto": clean_manifesto or "",
                 "role_id": None,
                 "created_at": unix_now(),
             }
             await self.config.guild(guild).parties.set(parties)
         await self._reply(
             interaction,
-            f"Created **{clean_name}** (`{party_id}`). Its permissionless role will be created at {MIN_PARTY_MEMBERS} members.",
+            f"Created **{clean_name}** (`{party_id}`). Its permissionless role will be created at {MIN_PARTY_MEMBERS} members. Use `/government party edit` to update its profile.",
         )
 
     @party.command(name="join", description="Join a party; you may belong to only one")
@@ -1305,10 +1344,14 @@ class Government(commands.Cog):
                 if guild.get_role(int(item.get("role_id") or 0))
                 else "forming"
             )
-            lines.append(
+            line = (
                 f"**{item['name']}** (`{party_id}`) - {len(item.get('member_ids', []))} members, "
                 f"leader: {leader.mention if leader else 'vacant'}, {active}"
             )
+            slogan = item.get("slogan", "").strip()
+            if slogan:
+                line += f"\n*“{slogan[:60]}{'…' if len(slogan) > 60 else ''}”*"
+            lines.append(line)
         embed = discord.Embed(
             title="Political Parties",
             description="\n".join(lines),
@@ -1318,23 +1361,170 @@ class Government(commands.Cog):
             embed.set_footer(text=f"Showing 25 of {len(ordered_parties)} parties")
         await interaction.response.send_message(embed=embed)
 
-    @party.command(name="edit", description="Change your party's color and/or icon")
-    async def party_edit(
-        self,
-        interaction: discord.Interaction,
-        color: Optional[str] = None,
-        icon: Optional[discord.Attachment] = None,
+    @party.command(
+        name="info", description="Show a party's icon, color, leader, and members"
+    )
+    @app_commands.describe(party_name="Party name or ID")
+    async def party_info(
+        self, interaction: discord.Interaction, party_name: str
     ) -> None:
         guild = self._guild(interaction)
         if guild is None:
             return await self._reply(
                 interaction, "This command can only be used in a server."
             )
-        if color is None and icon is None:
-            return await self._reply(interaction, "Provide a new color, icon, or both.")
+        parties = await self.config.guild(guild).parties()
+        party_id, selected = self._find_party(parties, party_name)
+        if party_id is None or selected is None:
+            return await self._reply(
+                interaction,
+                "That party does not exist. Use `/government party list`.",
+            )
+
+        leader = guild.get_member(int(selected.get("leader_id") or 0))
+        role = guild.get_role(int(selected.get("role_id") or 0))
+        color_value = int(selected.get("color") or 0)
+        member_ids = [int(user_id) for user_id in selected.get("member_ids", [])]
+        member_lines = []
+        for user_id in member_ids:
+            member = guild.get_member(user_id)
+            member_lines.append(
+                member.mention
+                if member is not None
+                else f"Unknown member (`{user_id}`)"
+            )
+
+        embed = discord.Embed(
+            title=selected["name"],
+            description=(
+                f"*“{selected['slogan']}”*" if selected.get("slogan") else None
+            ),
+            colour=discord.Colour(color_value),
+        )
+        embed.add_field(name="Color", value=f"`#{color_value:06X}`", inline=True)
+        embed.add_field(
+            name="Leader", value=leader.mention if leader else "Vacant", inline=True
+        )
+        embed.add_field(
+            name="Party role",
+            value=(
+                role.mention
+                if role is not None
+                else f"Forms at {MIN_PARTY_MEMBERS} members"
+            ),
+            inline=True,
+        )
+        created_at = selected.get("created_at")
+        embed.add_field(
+            name="Founded",
+            value=(
+                f"<t:{int(created_at)}:D>" if created_at else "Before records began"
+            ),
+            inline=True,
+        )
+        if selected.get("description"):
+            embed.add_field(name="About", value=selected["description"], inline=False)
+        if selected.get("manifesto"):
+            embed.add_field(name="Manifesto", value=selected["manifesto"], inline=False)
+
+        chunks: List[str] = []
+        current_lines: List[str] = []
+        displayed = 0
+        for line in member_lines:
+            candidate = "\n".join(current_lines + [line])
+            if len(candidate) > 1000 and current_lines:
+                if len(chunks) >= 2:
+                    break
+                chunks.append("\n".join(current_lines))
+                current_lines = [line]
+            else:
+                current_lines.append(line)
+            displayed += 1
+        if current_lines and len(chunks) < 3:
+            chunks.append("\n".join(current_lines))
+        if not chunks:
+            chunks = ["No members"]
+        for index, chunk in enumerate(chunks):
+            embed.add_field(
+                name=(
+                    f"Members ({len(member_ids)})"
+                    if index == 0
+                    else "Members (continued)"
+                ),
+                value=chunk,
+                inline=False,
+            )
+        embed.set_footer(
+            text=(
+                f"Party ID: {party_id} • Showing {displayed} of {len(member_ids)} members"
+                if displayed < len(member_ids)
+                else f"Party ID: {party_id}"
+            )
+        )
+
+        icon_file: Optional[discord.File] = None
+        icon_path = Path(selected.get("icon_path", ""))
+        if icon_path.is_file():
+            filename = f"party-icon{icon_path.suffix.lower()}"
+            icon_file = discord.File(icon_path, filename=filename)
+            embed.set_thumbnail(url=f"attachment://{filename}")
+        if icon_file is not None:
+            await interaction.response.send_message(
+                embed=embed,
+                file=icon_file,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await interaction.response.send_message(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+    @party.command(
+        name="edit", description="Change your party's appearance or public profile"
+    )
+    @app_commands.describe(
+        color="New hex color",
+        icon="New PNG, JPEG, or WebP icon",
+        slogan="New slogan, or - to clear it",
+        description="New description, or - to clear it",
+        manifesto="New manifesto, or - to clear it",
+    )
+    async def party_edit(
+        self,
+        interaction: discord.Interaction,
+        color: Optional[str] = None,
+        icon: Optional[discord.Attachment] = None,
+        slogan: Optional[str] = None,
+        description: Optional[str] = None,
+        manifesto: Optional[str] = None,
+    ) -> None:
+        guild = self._guild(interaction)
+        if guild is None:
+            return await self._reply(
+                interaction, "This command can only be used in a server."
+            )
+        if all(
+            value is None for value in (color, icon, slogan, description, manifesto)
+        ):
+            return await self._reply(
+                interaction,
+                "Provide a new color, icon, slogan, description, or manifesto.",
+            )
         try:
             new_color = parse_color(color) if color is not None else None
             icon_result = await self._read_icon(icon) if icon is not None else None
+            new_slogan = clean_profile_field(
+                slogan, label="Slogan", maximum=MAX_PARTY_SLOGAN
+            )
+            new_description = clean_profile_field(
+                description,
+                label="Description",
+                maximum=MAX_PARTY_DESCRIPTION,
+            )
+            new_manifesto = clean_profile_field(
+                manifesto, label="Manifesto", maximum=MAX_PARTY_MANIFESTO
+            )
         except ValueError as exc:
             return await self._reply(interaction, str(exc))
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1351,6 +1541,12 @@ class Government(commands.Cog):
                 )
             if new_color is not None:
                 selected["color"] = new_color
+            if new_slogan is not None:
+                selected["slogan"] = new_slogan
+            if new_description is not None:
+                selected["description"] = new_description
+            if new_manifesto is not None:
+                selected["manifesto"] = new_manifesto
             if icon_result is not None:
                 data, image_type = icon_result
                 old_path = Path(selected["icon_path"])
@@ -1360,7 +1556,9 @@ class Government(commands.Cog):
                 if old_path != new_path:
                     old_path.unlink(missing_ok=True)
             await self.config.guild(guild).parties.set(parties)
-            _, warning = await self._ensure_party_role(guild, party_id, parties)
+            warning = None
+            if new_color is not None or icon_result is not None:
+                _, warning = await self._ensure_party_role(guild, party_id, parties)
         message = f"Updated **{selected['name']}**."
         if warning:
             message += f"\n⚠️ {warning}"
