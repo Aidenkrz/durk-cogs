@@ -23,7 +23,7 @@ CREDIT_NEGATIVE_BASE = -10
 # Default score for timeout scaling (1000 = no multiplier)
 DEFAULT_SCORE = 1000
 
-# Placeholder hug GIF list — replace URLs as needed
+# Placeholder hug GIF list - replace URLs as needed
 HUG_GIFS = [
     "https://static.klipy.com/ii/d7aec6f6f171607374b2065c836f92f4/3a/73/47Uxa6Nl.gif",
     "https://static.klipy.com/ii/8ce8357c78ea940b9c2015daf05ce1a5/c0/c8/Gsu4wPlf.gif",
@@ -708,7 +708,7 @@ class SocialCredit(commands.Cog):
                 role = ctx.guild.get_role(int(role_id_str))
                 name = role.mention if role else f"Unknown ({role_id_str})"
                 lines.append(
-                    f"{name} — **{cfg['direction']}** **{cfg['threshold']}**"
+                    f"{name} - **{cfg['direction']}** **{cfg['threshold']}**"
                 )
             embed.description = "\n".join(lines)
 

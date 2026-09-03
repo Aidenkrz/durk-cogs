@@ -60,7 +60,7 @@ class MarkovChain:
 
     START = "__START__"
     END = "__END__"
-    PUNCTUATION = {".", "!", "?", ",", ";", ":", "-", "—"}
+    PUNCTUATION = {".", "!", "?", ",", ";", ":", "-", "-"}
 
     def __init__(self, order: int = 2, max_order: int = None):
         """Initialize a Markov chain.

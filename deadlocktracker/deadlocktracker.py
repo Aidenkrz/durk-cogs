@@ -435,7 +435,7 @@ class DeadlockTracker(commands.Cog):
             return results[0]["account_id"], None
 
         lines = [
-            f"• `{r['account_id']}` — {r.get('personaname', 'Unknown')}"
+            f"• `{r['account_id']}` - {r.get('personaname', 'Unknown')}"
             for r in results[:5]
         ]
         joined = "\n".join(lines)
@@ -554,7 +554,7 @@ class DeadlockTracker(commands.Cog):
         lines = []
         for i, (entry, _key, display) in enumerate(rows):
             prefix = medals.get(i, f"**{i + 1}.**")
-            lines.append(f"{prefix} **{entry.get('label')}** — {display}")
+            lines.append(f"{prefix} **{entry.get('label')}** - {display}")
 
         titles = {
             "rank": "by Rank",
@@ -562,7 +562,7 @@ class DeadlockTracker(commands.Cog):
             "kda": f"by KDA (last {STATS_WINDOW})",
         }
         embed = discord.Embed(
-            title=f"🏆 Deadlock Leaderboard — {titles[sort]}",
+            title=f"🏆 Deadlock Leaderboard - {titles[sort]}",
             description="\n".join(lines),
             color=discord.Color.from_rgb(199, 124, 60),
         )
@@ -591,7 +591,7 @@ class DeadlockTracker(commands.Cog):
             account_id = await self._account_for_member(ctx.guild, ctx.author.id)
             if account_id is None:
                 return await ctx.send(
-                    "Tell me which player — a name, id, profile URL, or @mention "
+                    "Tell me which player - a name, id, profile URL, or @mention "
                     "(if linked)."
                 )
         else:
@@ -605,7 +605,7 @@ class DeadlockTracker(commands.Cog):
         if card.get("badge"):
             label, _ = self._rank_display(*divmod(int(card["badge"]), 10))
             return await ctx.send(
-                f"✅ Account `{account_id}` is already friended — official rank "
+                f"✅ Account `{account_id}` is already friended - official rank "
                 f"is readable (**{label}**)."
             )
         if card.get("no_key"):
@@ -619,7 +619,7 @@ class DeadlockTracker(commands.Cog):
                 joined = "\n".join(links)
                 return await ctx.send(
                     f"To unlock the **official** rank for `{account_id}`, add one of "
-                    f"these deadlock-api bots on Steam — it then updates "
+                    f"these deadlock-api bots on Steam - it then updates "
                     f"automatically:\n{joined}"
                 )
             return await ctx.send(
@@ -671,7 +671,7 @@ class DeadlockTracker(commands.Cog):
         streak_value = (
             f"{'🟩' if streak_win else '🟥'} {'W' if streak_win else 'L'}{streak_n}"
             if streak_n
-            else "—"
+            else "-"
         )
 
         # Row 1: identity / record / momentum
@@ -740,7 +740,7 @@ class DeadlockTracker(commands.Cog):
 
         footer = f"Deadlock · account {account_id}"
         if rank_info.get("estimated"):
-            footer += " · rank estimated — friend the deadlock-api bot for exact rank"
+            footer += " · rank estimated - friend the deadlock-api bot for exact rank"
         embed.set_footer(text=footer)
         return embed
 
@@ -887,7 +887,7 @@ class DeadlockTracker(commands.Cog):
             )
         elif card.get("needs_friend"):
             note = (
-                f" Rank will be estimated until **{label}** friends the bot — "
+                f" Rank will be estimated until **{label}** friends the bot - "
                 f"run `{ctx.clean_prefix}deadlock friendbot {account_id}` for the link."
             )
         await ctx.send(
@@ -1018,7 +1018,7 @@ class DeadlockTracker(commands.Cog):
             verb = "won" if self._won(r) else "lost"
             title = f"{entry.get('label')} {verb} as {self._hero_name(r.get('hero_id'))}"
         else:
-            title = f"Deadlock match — {len(rows)} watched players"
+            title = f"Deadlock match - {len(rows)} watched players"
 
         embed = discord.Embed(title=title, color=color)
         for entry, r in rows:
@@ -1031,7 +1031,7 @@ class DeadlockTracker(commands.Cog):
                 f"lvl {r.get('hero_level', 0)}"
             )
             embed.add_field(
-                name=f"{entry.get('label')} — {verb} · {self._hero_name(r.get('hero_id'))}",
+                name=f"{entry.get('label')} - {verb} · {self._hero_name(r.get('hero_id'))}",
                 value=value,
                 inline=False,
             )
@@ -1152,7 +1152,7 @@ class DeadlockTracker(commands.Cog):
 
         Only works with a configured API key, and only for players who have
         friended a deadlock-api bot (so we can read their real badge). Players
-        whose official badge can't be read are skipped — no estimate-based
+        whose official badge can't be read are skipped - no estimate-based
         announcements. Returns the number of changes posted.
         """
         if not self._api_key:

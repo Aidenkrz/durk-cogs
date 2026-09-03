@@ -370,7 +370,7 @@ class MessageFilter(commands.Cog):
     @sentiment.command(name="silent")
     @commands.admin_or_permissions(administrator=True)
     async def sentiment_silent(self, ctx):
-        """Toggle silent mode — only adjust social credit, don't delete messages or timeout users"""
+        """Toggle silent mode - only adjust social credit, don't delete messages or timeout users"""
         current = await self.config.guild(ctx.guild).sentiment_silent()
         new_val = not current
         await self.config.guild(ctx.guild).sentiment_silent.set(new_val)
@@ -505,7 +505,7 @@ class MessageFilter(commands.Cog):
         else:
             embed.add_field(
                 name=f"Detoxify (threshold: {tox_threshold})",
-                value="Skipped — VADER already triggered",
+                value="Skipped - VADER already triggered",
                 inline=False,
             )
 
@@ -627,8 +627,8 @@ class MessageFilter(commands.Cog):
         """Run layered sentiment filtering.
 
         Order:
-        1. VADER — clause-level scoring, deduped full-text scoring, neg-proportion.
-        2. Detoxify — only reached when VADER does not trigger.
+        1. VADER - clause-level scoring, deduped full-text scoring, neg-proportion.
+        2. Detoxify - only reached when VADER does not trigger.
         """
         channel_id = str(message.channel.id)
         sentiment_channels = await self.config.guild(message.guild).sentiment_channels()
@@ -685,7 +685,7 @@ class MessageFilter(commands.Cog):
             await self._handle_sentiment_violation(message, results, layer="Detoxify", detail=None)
             return
 
-        # All sentiment checks passed — reward positive behavior
+        # All sentiment checks passed - reward positive behavior
         social_credit = self.bot.get_cog("SocialCredit")
         if social_credit:
             await social_credit.reward_positive_sentiment(
@@ -696,7 +696,7 @@ class MessageFilter(commands.Cog):
             )
 
     async def _handle_sentiment_violation(self, message, scores, *, layer, detail):
-        """Delete message, DM user, timeout, log — shared by both layers. In silent mode, skip delete/DM/timeout but still adjust credit."""
+        """Delete message, DM user, timeout, log - shared by both layers. In silent mode, skip delete/DM/timeout but still adjust credit."""
         timeout_secs = await self.config.guild(message.guild).sentiment_timeout()
         channel_id = str(message.channel.id)
         silent = await self.config.guild(message.guild).sentiment_silent()

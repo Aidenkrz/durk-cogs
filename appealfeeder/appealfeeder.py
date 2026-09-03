@@ -905,7 +905,7 @@ class AppealFeeder(commands.Cog):
                     )
 
         # Close (archive + lock) the Discord forum thread so it's no longer
-        # an active discussion. Lock first, then archive — archived threads
+        # an active discussion. Lock first, then archive - archived threads
         # can be edited by their owner without the lock.
         if thread is not None:
             try:
