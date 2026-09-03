@@ -26,6 +26,12 @@ for persistent button voting.
   only one party. PNG, JPEG, and static WebP icons are signature-checked and
   limited to 256 KiB. Leaders may transfer leadership to another party member
   while their party is not on an active ballot.
+- `/government party info` shows a party's saved icon, exact color, leader,
+  slogan, description, manifesto, founding date, qualifying role status, and
+  current member list.
+- Party leaders can update those fields with `/government party edit`; entering
+  `-` clears a slogan, description, or manifesto. Profiles intentionally have
+  no website field or public application button.
 - At five members, the cog creates a party role with the requested color and
   icon and no permissions. The leader also receives the shared, permissionless
   `Party Leader` role.

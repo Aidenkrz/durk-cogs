@@ -1351,14 +1351,18 @@ class Government(commands.Cog):
             slogan = item.get("slogan", "").strip()
             if slogan:
                 line += f"\n*“{slogan[:60]}{'…' if len(slogan) > 60 else ''}”*"
+            if len("\n".join(lines + [line])) > 3900:
+                break
             lines.append(line)
         embed = discord.Embed(
             title="Political Parties",
             description="\n".join(lines),
             colour=discord.Colour.blurple(),
         )
-        if len(ordered_parties) > 25:
-            embed.set_footer(text=f"Showing 25 of {len(ordered_parties)} parties")
+        if len(lines) < len(ordered_parties):
+            embed.set_footer(
+                text=f"Showing {len(lines)} of {len(ordered_parties)} parties"
+            )
         await interaction.response.send_message(embed=embed)
 
     @party.command(
