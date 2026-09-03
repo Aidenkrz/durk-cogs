@@ -6,7 +6,7 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import discord
 from discord import app_commands
@@ -20,6 +20,7 @@ log = logging.getLogger("red.durk-cogs.government")
 
 DAY_SECONDS = 24 * 60 * 60
 TERM_SECONDS = 14 * DAY_SECONDS
+MERGE_REQUEST_SECONDS = DAY_SECONDS
 MIN_PARTY_MEMBERS = 5
 PARTY_CHANNEL_MIN_MEMBERS = MIN_PARTY_MEMBERS
 PARTY_RESOURCES_VERSION = 1
@@ -145,6 +146,7 @@ class Government(commands.Cog):
             law_message_ids={},
             default_laws_seeded=False,
             parties={},
+            pending_party_merges={},
             president_role_id=None,
             vice_president_role_id=None,
             party_leader_role_id=None,
@@ -221,6 +223,28 @@ class Government(commands.Cog):
             if user_id in [int(uid) for uid in party.get("member_ids", [])]:
                 return party_id, party
         return None, None
+
+    @staticmethod
+    def _party_is_on_ballot(election: Any, party_ids: Set[str]) -> bool:
+        return bool(
+            election
+            and any(
+                candidate.get("party_id") in party_ids
+                for candidate in election.get("candidates", [])
+            )
+        )
+
+    @staticmethod
+    def _remove_merge_requests_for_parties(
+        pending: Dict[str, Dict[str, Any]], party_ids: Set[str]
+    ) -> bool:
+        removed = False
+        for request_id, request in list(pending.items()):
+            source_ids = set(request.get("party_ids") or [])
+            if source_ids & party_ids:
+                del pending[request_id]
+                removed = True
+        return removed
 
     def _icon_path(self, guild_id: int, party_id: str, image_type: str) -> Path:
         return self._data_path / f"{guild_id}-{party_id}.{image_type}"
@@ -1060,6 +1084,16 @@ class Government(commands.Cog):
                 await self.config.guild(guild).party_resources_version.set(
                     PARTY_RESOURCES_VERSION
                 )
+            pending_merges = await self.config.guild(guild).pending_party_merges()
+            expired_merges = [
+                request_id
+                for request_id, request in pending_merges.items()
+                if int(request.get("expires_at") or 0) <= now
+            ]
+            if expired_merges:
+                for request_id in expired_merges:
+                    del pending_merges[request_id]
+                await self.config.guild(guild).pending_party_merges.set(pending_merges)
             term_end = settings.get("term_ends_at")
             if term_end and int(term_end) <= now:
                 await self._expire_term(guild, settings)
@@ -1625,6 +1659,16 @@ class Government(commands.Cog):
             ),
             inline=True,
         )
+        merged_from = selected.get("merged_from") or []
+        if merged_from:
+            embed.add_field(
+                name="Merged from",
+                value=" + ".join(
+                    str(source.get("name") or "Unknown party")
+                    for source in merged_from[:2]
+                ),
+                inline=False,
+            )
         if selected.get("description"):
             embed.add_field(name="About", value=selected["description"], inline=False)
         if selected.get("manifesto"):
@@ -1813,6 +1857,281 @@ class Government(commands.Cog):
             message += f"\n⚠️ {warning}"
         await self._reply(ctx, message, ephemeral=False)
 
+    @party.group(name="merge", invoke_without_command=True)
+    async def party_merge(self, ctx: commands.Context) -> None:
+        """Propose, accept, or cancel a merger between two parties."""
+        await ctx.send_help()
+
+    @party_merge.command(name="propose")
+    async def party_merge_propose(
+        self, ctx: commands.Context, other_leader: discord.Member, *, new_name: str
+    ) -> None:
+        """Propose a merger. You will lead the new party if it is accepted.
+
+        Example: government party merge propose @OtherLeader New Party Name
+        """
+        guild = self._guild(ctx)
+        if guild is None or not isinstance(ctx.author, discord.Member):
+            return await self._reply(ctx, "This command can only be used in a server.")
+        if other_leader.bot or other_leader.id == ctx.author.id:
+            return await self._reply(ctx, "Choose the leader of a different party.")
+        try:
+            clean_name = clean_party_name(new_name)
+        except ValueError as exc:
+            return await self._reply(ctx, str(exc))
+
+        async with self._lock(guild.id):
+            parties = await self.config.guild(guild).parties()
+            own_id, own_party = self._party_for_user(parties, ctx.author.id)
+            other_id, other_party = self._party_for_user(parties, other_leader.id)
+            if (
+                own_id is None
+                or own_party is None
+                or int(own_party.get("leader_id") or 0) != ctx.author.id
+            ):
+                return await self._reply(
+                    ctx, "Only a current party leader can propose a merger."
+                )
+            if (
+                other_id is None
+                or other_party is None
+                or other_id == own_id
+                or int(other_party.get("leader_id") or 0) != other_leader.id
+            ):
+                return await self._reply(
+                    ctx, "That member is not the leader of a different party."
+                )
+            if any(
+                party.get("name", "").casefold() == clean_name.casefold()
+                for party in parties.values()
+            ):
+                return await self._reply(
+                    ctx, "The merged party must have a new, unused name."
+                )
+            source_ids = {own_id, other_id}
+            election = await self.config.guild(guild).active_election()
+            if self._party_is_on_ballot(election, source_ids):
+                return await self._reply(
+                    ctx,
+                    "Parties cannot merge while either one is on an active ballot.",
+                )
+
+            pending = await self.config.guild(guild).pending_party_merges()
+            now = unix_now()
+            for request_id, request in list(pending.items()):
+                if int(request.get("expires_at") or 0) <= now:
+                    del pending[request_id]
+            if any(
+                set(request.get("party_ids") or []) & source_ids
+                for request in pending.values()
+            ):
+                await self.config.guild(guild).pending_party_merges.set(pending)
+                return await self._reply(
+                    ctx,
+                    "One of these parties already has a pending merger request.",
+                )
+            request_id = secrets.token_hex(3)
+            while request_id in pending:
+                request_id = secrets.token_hex(3)
+            expires_at = now + MERGE_REQUEST_SECONDS
+            pending[request_id] = {
+                "party_ids": [own_id, other_id],
+                "party_names": [own_party["name"], other_party["name"]],
+                "initiator_id": ctx.author.id,
+                "invited_leader_id": other_leader.id,
+                "new_name": clean_name,
+                "created_at": now,
+                "expires_at": expires_at,
+            }
+            await self.config.guild(guild).pending_party_merges.set(pending)
+
+        await ctx.send(
+            f"{other_leader.mention}, **{ctx.author.display_name}** proposes merging "
+            f"**{own_party['name']}** and **{other_party['name']}** into "
+            f"**{clean_name}**, led by {ctx.author.mention}.\n"
+            f"Accept with `{ctx.clean_prefix}government party merge accept {request_id}` "
+            f"before <t:{expires_at}:R>, or decline with "
+            f"`{ctx.clean_prefix}government party merge cancel {request_id}`.",
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False, roles=False, users=[other_leader]
+            ),
+        )
+
+    @party_merge.command(name="accept")
+    async def party_merge_accept(self, ctx: commands.Context, request_id: str) -> None:
+        """Accept a merger proposal sent to you."""
+        guild = self._guild(ctx)
+        if guild is None or not isinstance(ctx.author, discord.Member):
+            return await self._reply(ctx, "This command can only be used in a server.")
+        request_id = request_id.casefold().strip()
+        warnings: List[str] = []
+        async with self._lock(guild.id):
+            pending = await self.config.guild(guild).pending_party_merges()
+            request = pending.get(request_id)
+            if request is None:
+                return await self._reply(ctx, "That merger request does not exist.")
+            if int(request.get("expires_at") or 0) <= unix_now():
+                del pending[request_id]
+                await self.config.guild(guild).pending_party_merges.set(pending)
+                return await self._reply(ctx, "That merger request has expired.")
+            if int(request.get("invited_leader_id") or 0) != ctx.author.id:
+                return await self._reply(
+                    ctx, "Only the invited party leader can accept this merger."
+                )
+
+            source_ids = list(request.get("party_ids") or [])
+            if len(source_ids) != 2 or source_ids[0] == source_ids[1]:
+                del pending[request_id]
+                await self.config.guild(guild).pending_party_merges.set(pending)
+                return await self._reply(ctx, "That merger request is no longer valid.")
+            parties = await self.config.guild(guild).parties()
+            first = parties.get(source_ids[0])
+            second = parties.get(source_ids[1])
+            if first is None or second is None:
+                del pending[request_id]
+                await self.config.guild(guild).pending_party_merges.set(pending)
+                return await self._reply(
+                    ctx, "One of the source parties no longer exists."
+                )
+            initiator_id = int(request.get("initiator_id") or 0)
+            invited_id = int(request.get("invited_leader_id") or 0)
+            if (
+                int(first.get("leader_id") or 0) != initiator_id
+                or int(second.get("leader_id") or 0) != invited_id
+                or guild.get_member(initiator_id) is None
+            ):
+                del pending[request_id]
+                await self.config.guild(guild).pending_party_merges.set(pending)
+                return await self._reply(
+                    ctx,
+                    "Party leadership changed, so this merger request was cancelled.",
+                )
+            source_id_set = set(source_ids)
+            election = await self.config.guild(guild).active_election()
+            if self._party_is_on_ballot(election, source_id_set):
+                return await self._reply(
+                    ctx,
+                    "Parties cannot merge while either one is on an active ballot.",
+                )
+            clean_name = request["new_name"]
+            if any(
+                party_id not in source_id_set
+                and party.get("name", "").casefold() == clean_name.casefold()
+                for party_id, party in parties.items()
+            ):
+                return await self._reply(
+                    ctx,
+                    "Another party took the proposed name. Cancel this request and propose a new name.",
+                )
+
+            for source in (first, second):
+                channel = guild.get_channel(int(source.get("channel_id") or 0))
+                role = guild.get_role(int(source.get("role_id") or 0))
+                try:
+                    if isinstance(channel, discord.TextChannel):
+                        await channel.delete(reason="Government parties merged")
+                    if role is not None:
+                        await role.delete(reason="Government parties merged")
+                except discord.HTTPException:
+                    return await self._reply(
+                        ctx,
+                        "I could not remove the old party role or channel. Check my permissions and try again.",
+                    )
+
+            member_ids = list(
+                dict.fromkeys(
+                    int(user_id)
+                    for source in (first, second)
+                    for user_id in source.get("member_ids", [])
+                )
+            )
+            if initiator_id not in member_ids:
+                member_ids.insert(0, initiator_id)
+            new_party_id = secrets.token_hex(4)
+            while new_party_id in parties:
+                new_party_id = secrets.token_hex(4)
+            merged_party = {
+                "name": clean_name,
+                "leader_id": initiator_id,
+                "member_ids": member_ids,
+                "color": int(first.get("color") or 0),
+                "icon_path": first.get("icon_path", ""),
+                "slogan": first.get("slogan", ""),
+                "description": first.get("description", ""),
+                "manifesto": first.get("manifesto", ""),
+                "role_id": None,
+                "channel_id": None,
+                "created_at": unix_now(),
+                "merged_from": [
+                    {"party_id": source_ids[0], "name": first["name"]},
+                    {"party_id": source_ids[1], "name": second["name"]},
+                ],
+            }
+            first_icon = Path(first.get("icon_path", ""))
+            second_icon = Path(second.get("icon_path", ""))
+            del parties[source_ids[0]]
+            del parties[source_ids[1]]
+            parties[new_party_id] = merged_party
+            self._remove_merge_requests_for_parties(pending, source_id_set)
+            await self.config.guild(guild).parties.set(parties)
+            await self.config.guild(guild).pending_party_merges.set(pending)
+            if second_icon != first_icon and second_icon.is_file():
+                try:
+                    second_icon.unlink(missing_ok=True)
+                except OSError:
+                    log.exception(
+                        "Could not remove retired icon for merged party %s",
+                        source_ids[1],
+                    )
+
+            role, role_warning = await self._ensure_party_role(
+                guild, new_party_id, parties
+            )
+            if role_warning:
+                warnings.append(role_warning)
+            if role is not None:
+                _, channel_warning = await self._ensure_party_channel(
+                    guild, new_party_id, parties
+                )
+                if channel_warning:
+                    warnings.append(channel_warning)
+            _, leader_warning = await self._sync_party_leader_role(guild, parties)
+            if leader_warning:
+                warnings.append(leader_warning)
+
+        message = (
+            f"Merged **{first['name']}** and **{second['name']}** into "
+            f"**{clean_name}** with {len(member_ids)} members. "
+            f"<@{initiator_id}> is the new party leader."
+        )
+        if warnings:
+            message += "\n" + "\n".join(f"⚠️ {warning}" for warning in warnings)
+        await ctx.send(message, allowed_mentions=discord.AllowedMentions.none())
+
+    @party_merge.command(name="cancel", aliases=("decline",))
+    async def party_merge_cancel(self, ctx: commands.Context, request_id: str) -> None:
+        """Cancel or decline a merger request involving your party."""
+        guild = self._guild(ctx)
+        if guild is None:
+            return await self._reply(ctx, "This command can only be used in a server.")
+        request_id = request_id.casefold().strip()
+        async with self._lock(guild.id):
+            pending = await self.config.guild(guild).pending_party_merges()
+            request = pending.get(request_id)
+            if request is None:
+                return await self._reply(ctx, "That merger request does not exist.")
+            allowed_ids = {
+                int(request.get("initiator_id") or 0),
+                int(request.get("invited_leader_id") or 0),
+            }
+            if ctx.author.id not in allowed_ids:
+                return await self._reply(
+                    ctx, "Only the two involved party leaders can cancel this request."
+                )
+            del pending[request_id]
+            await self.config.guild(guild).pending_party_merges.set(pending)
+        await self._reply(ctx, f"Cancelled merger request `{request_id}`.")
+
     @party.command(name="disband")
     async def party_disband(self, ctx: commands.Context) -> None:
         """Permanently disband the party you lead."""
@@ -1860,6 +2179,9 @@ class Government(commands.Cog):
             Path(selected["icon_path"]).unlink(missing_ok=True)
             del parties[party_id]
             await self.config.guild(guild).parties.set(parties)
+            pending = await self.config.guild(guild).pending_party_merges()
+            if self._remove_merge_requests_for_parties(pending, {party_id}):
+                await self.config.guild(guild).pending_party_merges.set(pending)
             _, warning = await self._sync_party_leader_role(guild, parties)
         message = f"Disbanded **{selected['name']}** and removed its role and private channel."
         if warning:
@@ -2373,6 +2695,9 @@ class Government(commands.Cog):
             Path(selected["icon_path"]).unlink(missing_ok=True)
             del parties[party_id]
             await self.config.guild(guild).parties.set(parties)
+            pending = await self.config.guild(guild).pending_party_merges()
+            if self._remove_merge_requests_for_parties(pending, {party_id}):
+                await self.config.guild(guild).pending_party_merges.set(pending)
             _, warning = await self._sync_party_leader_role(guild, parties)
         message = f"Deleted **{selected['name']}**, its role, and its private channel."
         if warning:
@@ -2610,6 +2935,17 @@ class Government(commands.Cog):
                     changed = True
             if changed:
                 await group.parties.set(parties)
+            pending_merges = settings.get("pending_party_merges") or {}
+            pending_changed = False
+            for request_id, request in list(pending_merges.items()):
+                if user_id in {
+                    int(request.get("initiator_id") or 0),
+                    int(request.get("invited_leader_id") or 0),
+                }:
+                    del pending_merges[request_id]
+                    pending_changed = True
+            if pending_changed:
+                await group.pending_party_merges.set(pending_merges)
             if int(settings.get("president_id") or 0) == user_id:
                 await group.president_id.set(None)
             if int(settings.get("vice_president_id") or 0) == user_id:

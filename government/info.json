@@ -5,7 +5,7 @@
     "install_msg": "Government installed. Load the Polls cog, then use `[p]government admin setup #channel` to choose the government channel and create the read-only current-laws register. Most commands are prefix commands; party create/edit remain slash commands.",
     "name": "Government",
     "short": "Parties, presidential elections, terms, and constitutional lawmaking.",
-    "description": "A persistent server government with political parties, permissionless party and qualifying Party Leader roles, private qualifying-party channels, administrative party management, 24-hour presidential elections, two-week terms, presidential appointments, mandatory law discussion periods, public law and repeal votes, a synchronized read-only current-laws channel, and immutable safety rules.",
+    "description": "A persistent server government with political parties, consensual party mergers, permissionless party and qualifying Party Leader roles, private qualifying-party channels, administrative party management, 24-hour presidential elections, two-week terms, presidential appointments, mandatory law discussion periods, public law and repeal votes, a synchronized read-only current-laws channel, and immutable safety rules.",
     "tags": [
         "government",
         "elections",
@@ -18,5 +18,5 @@
         "Polls": "https://github.com/Aidenkrz/durk-cogs"
     },
     "min_bot_version": "3.5.0",
-    "end_user_data_statement": "This cog stores Discord user IDs for party membership, party leadership, elected offices, law proposals, and election records. Administrators can remove government records, and Red's data-deletion hooks remove a requesting user's memberships and office references."
+    "end_user_data_statement": "This cog stores Discord user IDs for party membership, party leadership, merger requests, elected offices, law proposals, and election records. Administrators can remove government records, and Red's data-deletion hooks remove a requesting user's memberships, merger requests, and office references."
 }

@@ -36,6 +36,11 @@ for persistent button voting.
 - Party leaders can update those fields with `/government party edit`; entering
   `-` clears a slogan, description, or manifesto. Profiles intentionally have
   no website field or public application button.
+- A leader can propose a merger with `[p]government party merge propose @OtherLeader New Party Name`.
+  The invited leader has 24 hours to accept. Once accepted, memberships are
+  combined into a newly named party led by the proposer. It inherits the
+  proposer's profile, color, and icon; the old roles and channels are replaced
+  with the merged party's managed resources.
 - At five members, the cog creates a party role with the requested color and
   icon and no permissions. The leader also receives the shared, permissionless
   `Party Leader` role.
@@ -80,6 +85,8 @@ Useful prefix examples:
 
 - `[p]government party list`
 - `[p]government party join Party Name`
+- `[p]government party merge propose @OtherLeader New Party Name`
+- `[p]government party merge accept abc123`
 - `[p]government law propose ordinary "Park Rules" Be respectful in the park.`
 - `[p]government law amend 3 "Updated Park Rules" Replacement law text here.`
 - `[p]government admin rename-party "Old Party" New Party`
