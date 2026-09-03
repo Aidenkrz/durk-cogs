@@ -440,11 +440,11 @@ class Government(commands.Cog):
             colour=discord.Colour.green(),
         )
         if law.get("source") == "founding_constitution":
-            kind = "Founding law — two-thirds vote required to change it"
+            kind = "Founding law - two-thirds vote required to change it"
         elif law.get("kind") == "amendment":
-            kind = "Constitutional law — two-thirds vote required"
+            kind = "Constitutional law - two-thirds vote required"
         else:
-            kind = "Ordinary law — simple majority required"
+            kind = "Ordinary law - simple majority required"
         embed.add_field(name="Type", value=kind)
         if law.get("action") == "amend" and law.get("target_law_id"):
             embed.add_field(name="Replaces", value=f"Law {law['target_law_id']}")
@@ -702,7 +702,7 @@ class Government(commands.Cog):
                 else (
                     f"Law {law_id}: amend Law {target_law_id}?"
                     if is_amendment
-                    else f"Law {law_id}: {law['title']} — approve?"
+                    else f"Law {law_id}: {law['title']} - approve?"
                 )
             ),
             options=(
