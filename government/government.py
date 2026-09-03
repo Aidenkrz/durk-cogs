@@ -36,6 +36,33 @@ IMMUTABLE_LAWS = (
     "conflicting law is automatically void.",
 )
 
+DEFAULT_LAWS = (
+    (
+        "Presidential Term",
+        "The President is elected for a two-week term.",
+    ),
+    (
+        "Vice Presidential Appointment",
+        "After being elected, the President appoints a Vice President to serve for the remainder of the term.",
+    ),
+    (
+        "Presidential Powers",
+        "The President may propose laws, administer approved laws, appoint officials, and organize government activities.",
+    ),
+    (
+        "Presidential Succession",
+        "The Vice President assists the President and assumes the presidency if the President cannot serve.",
+    ),
+    (
+        "Public Lawmaking",
+        "Proposed laws must receive at least 24 hours of public discussion before being decided by a majority vote.",
+    ),
+    (
+        "Constitutional Amendments",
+        "These government rules may be amended by a two-thirds public vote, except for the Immutable Laws.",
+    ),
+)
+
 COLOR_RE = re.compile(r"^#?([0-9a-fA-F]{6})$")
 
 
@@ -89,6 +116,7 @@ class Government(commands.Cog):
             laws_channel_id=None,
             constitution_message_id=None,
             law_message_ids={},
+            default_laws_seeded=False,
             parties={},
             president_role_id=None,
             vice_president_role_id=None,
@@ -368,20 +396,41 @@ class Government(commands.Cog):
             ),
             inline=False,
         )
-        embed.add_field(
-            name="The Presidency",
-            value=(
-                "• The President is elected for a two-week term.\n"
-                "• The President appoints a Vice President for the remainder of the term.\n"
-                "• The President may propose laws, administer approved laws, appoint officials, and organize government activities.\n"
-                "• The Vice President assists and succeeds the President if necessary.\n"
-                "• Laws receive at least 24 hours of discussion, followed by a 24-hour majority vote.\n"
-                "• Amendments require a two-thirds public vote and cannot alter the Immutable Laws."
-            ),
-            inline=False,
-        )
         embed.set_footer(text="The Immutable Laws cannot be repealed or amended.")
         return embed
+
+    async def _seed_default_laws(self, guild: discord.Guild) -> int:
+        """Create the amendable founding rules as normal enacted law records."""
+        settings = await self.config.guild(guild).all()
+        if settings.get("default_laws_seeded"):
+            return 0
+        laws = settings.get("laws") or {}
+        next_number = int(settings.get("next_law_number") or 1)
+        for title, text in DEFAULT_LAWS:
+            law_id = str(next_number)
+            laws[law_id] = {
+                "title": title,
+                "text": text,
+                "kind": "amendment",
+                "action": "enact",
+                "target_law_id": None,
+                "proposer_id": 0,
+                "status": "enacted",
+                "created_at": None,
+                "decided_at": None,
+                "approve_votes": None,
+                "reject_votes": None,
+                "source": "founding_constitution",
+                "channel_id": settings.get("channel_id"),
+                "message_id": None,
+                "thread_id": None,
+                "poll_id": None,
+            }
+            next_number += 1
+        await self.config.guild(guild).laws.set(laws)
+        await self.config.guild(guild).next_law_number.set(next_number)
+        await self.config.guild(guild).default_laws_seeded.set(True)
+        return len(DEFAULT_LAWS)
 
     @staticmethod
     def _current_law_embed(law_id: str, law: Dict[str, Any]) -> discord.Embed:
@@ -390,12 +439,17 @@ class Government(commands.Cog):
             description=law["text"],
             colour=discord.Colour.green(),
         )
-        kind = (
-            "Constitutional amendment"
-            if law.get("kind") == "amendment"
-            else "Ordinary law"
-        )
+        if law.get("source") == "founding_constitution":
+            kind = "Founding law — two-thirds vote required to change it"
+        elif law.get("kind") == "amendment":
+            kind = "Constitutional law — two-thirds vote required"
+        else:
+            kind = "Ordinary law — simple majority required"
         embed.add_field(name="Type", value=kind)
+        if law.get("action") == "amend" and law.get("target_law_id"):
+            embed.add_field(name="Replaces", value=f"Law {law['target_law_id']}")
+        elif law.get("action") == "repeal" and law.get("target_law_id"):
+            embed.add_field(name="Repeals", value=f"Law {law['target_law_id']}")
         if law.get("approve_votes") is not None:
             embed.add_field(
                 name="Ratification vote",
@@ -584,6 +638,8 @@ class Government(commands.Cog):
         )
         if action == "repeal" and target_law_id is not None:
             embed.add_field(name="Would repeal", value=f"Law {target_law_id}")
+        elif action == "amend" and target_law_id is not None:
+            embed.add_field(name="Would replace", value=f"Law {target_law_id}")
         embed.set_footer(
             text="Immutable Laws always prevail. Administrators may void conflicting proposals."
         )
@@ -632,7 +688,9 @@ class Government(commands.Cog):
         requirement = (
             "two-thirds" if law["kind"] == "amendment" else "a simple majority"
         )
-        is_repeal = law.get("action") == "repeal"
+        action = law.get("action", "enact")
+        is_repeal = action == "repeal"
+        is_amendment = action == "amend"
         target_law_id = law.get("target_law_id")
         poll = await api.create_poll(
             guild=guild,
@@ -641,12 +699,20 @@ class Government(commands.Cog):
             question=(
                 f"Law {law_id}: repeal Law {target_law_id}?"
                 if is_repeal
-                else f"Law {law_id}: {law['title']} - approve?"
+                else (
+                    f"Law {law_id}: amend Law {target_law_id}?"
+                    if is_amendment
+                    else f"Law {law_id}: {law['title']} — approve?"
+                )
             ),
             options=(
                 ["Approve repeal", "Retain existing law"]
                 if is_repeal
-                else ["Approve", "Reject"]
+                else (
+                    ["Approve amendment", "Retain existing law"]
+                    if is_amendment
+                    else ["Approve", "Reject"]
+                )
             ),
             duration_seconds=DAY_SECONDS,
             hide_voters=False,
@@ -683,13 +749,16 @@ class Government(commands.Cog):
                     passed = total > 0 and approve * 3 >= total * 2
                 else:
                     passed = approve > reject
-                if passed and law.get("action") == "repeal":
+                action = law.get("action", "enact")
+                if passed and action in {"repeal", "amend"}:
                     target = laws.get(str(law.get("target_law_id")))
                     if target is not None and target.get("status") == "enacted":
-                        target["status"] = "repealed"
-                        target["repealed_at"] = unix_now()
-                        target["repealed_by"] = law_id
-                        law["status"] = "enacted"
+                        target["status"] = (
+                            "repealed" if action == "repeal" else "amended"
+                        )
+                        target[f"{target['status']}_at"] = unix_now()
+                        target[f"{target['status']}_by"] = law_id
+                        law["status"] = "executed" if action == "repeal" else "enacted"
                     else:
                         law["status"] = "moot"
                 else:
@@ -832,6 +901,11 @@ class Government(commands.Cog):
         self, guild: discord.Guild, settings: Dict[str, Any], now: int
     ) -> None:
         async with self._lock(guild.id):
+            seeded = await self._seed_default_laws(guild)
+            if seeded:
+                settings = await self.config.guild(guild).all()
+                if settings.get("laws_channel_id"):
+                    await self._sync_current_laws(guild)
             term_end = settings.get("term_ends_at")
             if term_end and int(term_end) <= now:
                 await self._expire_term(guild, settings)
@@ -1021,7 +1095,9 @@ class Government(commands.Cog):
             amendments = [
                 f"Law {law_id}: {law['title']}"
                 for law_id, law in laws.items()
-                if law.get("kind") == "amendment" and law.get("status") == "enacted"
+                if law.get("kind") == "amendment"
+                and law.get("status") == "enacted"
+                and law.get("source") != "founding_constitution"
             ]
             if amendments:
                 embed.add_field(
@@ -1534,13 +1610,14 @@ class Government(commands.Cog):
                     interaction, "That law is not currently enacted."
                 )
             if any(
-                law.get("action") == "repeal"
+                law.get("action") in {"repeal", "amend"}
                 and str(law.get("target_law_id")) == target_id
                 and law.get("status") in {"discussion", "voting"}
                 for law in laws.values()
             ):
                 return await self._reply(
-                    interaction, "That law already has an active repeal proposal."
+                    interaction,
+                    "That law already has an active amendment or repeal proposal.",
                 )
             title = f"Repeal Law {target_id}: {target['title']}"[:MAX_LAW_TITLE]
             text = (
@@ -1567,6 +1644,84 @@ class Government(commands.Cog):
         await self._reply(
             interaction,
             f"Repeal proposal Law {repeal_id} is now in public discussion. If it passes, Law {target_id} will be removed from current laws.",
+        )
+
+    @law.command(
+        name="amend",
+        description="President: propose replacing a currently enacted law",
+    )
+    async def law_amend(
+        self,
+        interaction: discord.Interaction,
+        law_id: str,
+        new_title: str,
+        new_text: str,
+    ) -> None:
+        guild = self._guild(interaction)
+        if guild is None:
+            return await self._reply(
+                interaction, "This command can only be used in a server."
+            )
+        target_id = law_id.strip()
+        new_title = " ".join(new_title.split())
+        new_text = new_text.strip()
+        if (
+            not new_title
+            or len(new_title) > MAX_LAW_TITLE
+            or not new_text
+            or len(new_text) > MAX_LAW_TEXT
+        ):
+            return await self._reply(
+                interaction,
+                f"Use a 1–{MAX_LAW_TITLE} character title and 1–{MAX_LAW_TEXT} character replacement text.",
+            )
+        async with self._lock(guild.id):
+            settings = await self.config.guild(guild).all()
+            if int(settings.get("president_id") or 0) != interaction.user.id:
+                return await self._reply(
+                    interaction,
+                    "Only the sitting President can propose amending a law.",
+                )
+            if int(settings.get("term_ends_at") or 0) <= unix_now():
+                return await self._reply(
+                    interaction, "The presidential term has ended."
+                )
+            laws = settings.get("laws") or {}
+            target = laws.get(target_id)
+            if target is None or target.get("status") != "enacted":
+                return await self._reply(
+                    interaction, "That law is not currently enacted."
+                )
+            if any(
+                law.get("action") in {"repeal", "amend"}
+                and str(law.get("target_law_id")) == target_id
+                and law.get("status") in {"discussion", "voting"}
+                for law in laws.values()
+            ):
+                return await self._reply(
+                    interaction,
+                    "That law already has an active amendment or repeal proposal.",
+                )
+            try:
+                amendment_id = await self._post_law_discussion(
+                    guild,
+                    settings,
+                    proposer_id=interaction.user.id,
+                    title=new_title,
+                    text=new_text,
+                    kind=target.get("kind", "ordinary"),
+                    action="amend",
+                    target_law_id=target_id,
+                )
+            except ValueError as exc:
+                return await self._reply(interaction, str(exc))
+            except discord.Forbidden:
+                return await self._reply(
+                    interaction, "I cannot post in the configured government channel."
+                )
+        await self._reply(
+            interaction,
+            f"Amendment proposal Law {amendment_id} is now in public discussion. If it passes, it will replace Law {target_id} in current laws.",
         )
 
     @law.command(name="list", description="List recent law proposals and outcomes")
@@ -1644,6 +1799,9 @@ class Government(commands.Cog):
                 "I need Manage Roles and my role must be above the office roles.",
             )
         await self.config.guild(guild).channel_id.set(channel.id)
+        seeded = await self._seed_default_laws(guild)
+        if seeded:
+            warnings.append(f"Added {seeded} amendable founding laws.")
         if warning:
             warnings.append(warning)
         laws_channel: Optional[discord.TextChannel] = None
@@ -1678,6 +1836,7 @@ class Government(commands.Cog):
         if guild is None or not await self._require_admin(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
+        await self._seed_default_laws(guild)
         settings = await self.config.guild(guild).all()
         old_channel = guild.get_channel(int(settings.get("laws_channel_id") or 0))
         if isinstance(old_channel, discord.TextChannel):

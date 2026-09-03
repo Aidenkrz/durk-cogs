@@ -8,7 +8,8 @@ for persistent button voting.
 
 1. Load `Polls`, then load `Government`.
 2. Run `/government admin setup #channel`. The cog also creates a read-only
-   `current-laws` channel, publishes the Founding Constitution, and immediately
+   `current-laws` channel, publishes the four immutable provisions, seeds the
+   six Presidency rules as separate amendable founding laws, and immediately
    backfills every enacted law already in its stored register. Use `/government
    admin set-laws-channel` if you prefer an existing channel.
 3. Put the bot's role above the roles it creates and grant it **Manage Roles**,
@@ -42,6 +43,10 @@ for persistent button voting.
   Repeals use the same discussion and voting requirements as the target law;
   once passed, the old law is removed from `current-laws` while its historical
   record is retained.
+- `/government law amend` proposes replacement text for an enacted law. A
+  successful vote archives the old version as amended and publishes the new
+  version. The six founding government rules require two-thirds votes to amend
+  or repeal; the four Immutable Laws are not law records and cannot be targeted.
 - Administrators can void proposals or enacted laws that conflict with the
   immutable Discord, legal, safety, owner-authority, or infrastructure rules.
 
