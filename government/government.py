@@ -20,7 +20,8 @@ log = logging.getLogger("red.durk-cogs.government")
 DAY_SECONDS = 24 * 60 * 60
 TERM_SECONDS = 14 * DAY_SECONDS
 MIN_PARTY_MEMBERS = 5
-PARTY_CHANNEL_MIN_MEMBERS = 6
+PARTY_CHANNEL_MIN_MEMBERS = MIN_PARTY_MEMBERS
+PARTY_RESOURCES_VERSION = 1
 CONSTITUTION_VERSION = 2
 MAX_ICON_BYTES = 256 * 1024
 MAX_PARTY_NAME = 50
@@ -147,6 +148,7 @@ class Government(commands.Cog):
             vice_president_role_id=None,
             party_leader_role_id=None,
             party_channel_category_id=None,
+            party_resources_version=0,
             president_id=None,
             vice_president_id=None,
             term_started_at=None,
@@ -173,31 +175,30 @@ class Government(commands.Cog):
         cog = self.bot.get_cog("Polls")
         return getattr(cog, "api", None) if cog is not None else None
 
-    async def _require_admin(self, interaction: discord.Interaction) -> bool:
-        member = interaction.user
+    async def _require_admin(self, source: Any) -> bool:
+        member = getattr(source, "author", None) or source.user
         allowed = (
             isinstance(member, discord.Member)
             and member.guild_permissions.administrator
         ) or await self.bot.is_owner(member)
         if not allowed:
-            await interaction.response.send_message(
-                "This command requires the **Administrator** permission.",
-                ephemeral=True,
+            await self._reply(
+                source, "This command requires the **Administrator** permission."
             )
         return allowed
 
     @staticmethod
-    async def _reply(
-        interaction: discord.Interaction, content: str, *, ephemeral: bool = True
-    ) -> None:
-        if interaction.response.is_done():
-            await interaction.followup.send(content, ephemeral=ephemeral)
+    async def _reply(source: Any, content: str, *, ephemeral: bool = True) -> None:
+        if isinstance(source, commands.Context):
+            await source.send(content)
+        elif source.response.is_done():
+            await source.followup.send(content, ephemeral=ephemeral)
         else:
-            await interaction.response.send_message(content, ephemeral=ephemeral)
+            await source.response.send_message(content, ephemeral=ephemeral)
 
     @staticmethod
-    def _guild(interaction: discord.Interaction) -> Optional[discord.Guild]:
-        return interaction.guild
+    def _guild(source: Any) -> Optional[discord.Guild]:
+        return source.guild
 
     @staticmethod
     def _find_party(
@@ -446,7 +447,7 @@ class Government(commands.Cog):
                     self._party_channel_name(party["name"], party_id),
                     overwrites=overwrites,
                     topic=f"Private channel for {party['name']} • Party ID: {party_id}",
-                    reason="Party exceeded five members",
+                    reason="Party reached five members",
                 )
                 party["channel_id"] = channel.id
                 await self.config.guild(guild).parties.set(parties)
@@ -728,7 +729,7 @@ class Government(commands.Cog):
         channel = guild.get_channel(int(settings.get("channel_id") or 0))
         if channel is None:
             raise ValueError(
-                "An administrator must first run `/government admin setup`."
+                "An administrator must first run `government admin setup #channel`."
             )
         number = int(settings.get("next_law_number") or 1)
         law_id = str(number)
@@ -1025,6 +1026,39 @@ class Government(commands.Cog):
                 != CONSTITUTION_VERSION
             ):
                 await self._sync_current_laws(guild)
+            if (
+                int(settings.get("party_resources_version") or 0)
+                != PARTY_RESOURCES_VERSION
+            ):
+                parties = settings.get("parties") or {}
+                for party_id, party in parties.items():
+                    if len(party.get("member_ids", [])) < MIN_PARTY_MEMBERS:
+                        continue
+                    role, role_warning = await self._ensure_party_role(
+                        guild, party_id, parties
+                    )
+                    if role_warning:
+                        log.warning(
+                            "Could not migrate role for party %s in %s: %s",
+                            party_id,
+                            guild.id,
+                            role_warning,
+                        )
+                    if role is not None:
+                        _, channel_warning = await self._ensure_party_channel(
+                            guild, party_id, parties
+                        )
+                        if channel_warning:
+                            log.warning(
+                                "Could not migrate channel for party %s in %s: %s",
+                                party_id,
+                                guild.id,
+                                channel_warning,
+                            )
+                await self._sync_party_leader_role(guild, parties)
+                await self.config.guild(guild).party_resources_version.set(
+                    PARTY_RESOURCES_VERSION
+                )
             term_end = settings.get("term_ends_at")
             if term_end and int(term_end) <= now:
                 await self._expire_term(guild, settings)
@@ -1232,26 +1266,42 @@ class Government(commands.Cog):
                 message.channel.id,
             )
 
-    government = app_commands.Group(
+    slash_government = app_commands.Group(
         name="government", description="Server government and constitution"
     )
-    party = app_commands.Group(
-        name="party", description="Political party commands", parent=government
-    )
-    law = app_commands.Group(
-        name="law", description="Propose and inspect laws", parent=government
-    )
-    admin = app_commands.Group(
-        name="admin", description="Government administration", parent=government
+    slash_party = app_commands.Group(
+        name="party",
+        description="Create and edit political parties",
+        parent=slash_government,
     )
 
-    @government.command(
-        name="constitution", description="Display the founding constitution"
-    )
-    async def constitution(self, interaction: discord.Interaction) -> None:
+    @commands.group(name="government", aliases=("gov",), invoke_without_command=True)
+    @commands.guild_only()
+    async def government(self, ctx: commands.Context) -> None:
+        """Server government and constitution commands."""
+        await ctx.send_help()
+
+    @government.group(name="party", invoke_without_command=True)
+    async def party(self, ctx: commands.Context) -> None:
+        """Political party commands."""
+        await ctx.send_help()
+
+    @government.group(name="law", invoke_without_command=True)
+    async def law(self, ctx: commands.Context) -> None:
+        """Propose and inspect laws."""
+        await ctx.send_help()
+
+    @government.group(name="admin", invoke_without_command=True)
+    async def admin(self, ctx: commands.Context) -> None:
+        """Government administration commands."""
+        await ctx.send_help()
+
+    @government.command(name="constitution")
+    async def constitution(self, ctx: commands.Context) -> None:
+        """Display the founding constitution."""
         embed = self._founding_constitution_embed()
-        if interaction.guild is not None:
-            laws = await self.config.guild(interaction.guild).laws()
+        if ctx.guild is not None:
+            laws = await self.config.guild(ctx.guild).laws()
             amendments = [
                 f"Law {law_id}: {law['title']}"
                 for law_id, law in laws.items()
@@ -1265,17 +1315,14 @@ class Government(commands.Cog):
                     value="\n".join(amendments[-8:]),
                     inline=False,
                 )
-        await interaction.response.send_message(embed=embed)
+        await ctx.send(embed=embed)
 
-    @government.command(
-        name="status", description="Show current offices and election status"
-    )
-    async def government_status(self, interaction: discord.Interaction) -> None:
-        guild = self._guild(interaction)
+    @government.command(name="status")
+    async def government_status(self, ctx: commands.Context) -> None:
+        """Show current offices and election status."""
+        guild = self._guild(ctx)
         if guild is None:
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
+            return await self._reply(ctx, "This command can only be used in a server.")
         settings = await self.config.guild(guild).all()
         president = guild.get_member(int(settings.get("president_id") or 0))
         vice = guild.get_member(int(settings.get("vice_president_id") or 0))
@@ -1314,9 +1361,11 @@ class Government(commands.Cog):
             if item.get("status") == "enacted"
         )
         embed.add_field(name="Enacted laws", value=str(enacted))
-        await interaction.response.send_message(embed=embed)
+        await ctx.send(embed=embed)
 
-    @party.command(name="create", description="Create a party and become its leader")
+    @slash_party.command(
+        name="create", description="Create a party and become its leader"
+    )
     @app_commands.describe(
         name="Party name",
         color="Hex color such as #5865F2",
@@ -1390,144 +1439,143 @@ class Government(commands.Cog):
             await self.config.guild(guild).parties.set(parties)
         await self._reply(
             interaction,
-            f"Created **{clean_name}** (`{party_id}`). Its permissionless role will be created at {MIN_PARTY_MEMBERS} members. Use `/government party edit` to update its profile.",
+            f"Created **{clean_name}** (`{party_id}`). Its permissionless role and private channel will be created at {MIN_PARTY_MEMBERS} members. Use `/government party edit` to update its profile.",
         )
 
-    @party.command(name="join", description="Join a party; you may belong to only one")
-    @app_commands.describe(party_name="Party name or ID")
-    async def party_join(
-        self, interaction: discord.Interaction, party_name: str
-    ) -> None:
-        guild = self._guild(interaction)
-        if guild is None or not isinstance(interaction.user, discord.Member):
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
-        await interaction.response.defer(ephemeral=True, thinking=True)
+    @party.command(name="join")
+    async def party_join(self, ctx: commands.Context, *, party_name: str) -> None:
+        """Join a party by name or ID; you may belong to only one."""
+        guild = self._guild(ctx)
+        if guild is None or not isinstance(ctx.author, discord.Member):
+            return await self._reply(ctx, "This command can only be used in a server.")
         async with self._lock(guild.id):
             parties = await self.config.guild(guild).parties()
-            if self._party_for_user(parties, interaction.user.id)[0] is not None:
+            if self._party_for_user(parties, ctx.author.id)[0] is not None:
                 return await self._reply(
-                    interaction, "You already belong to a party. Leave it first."
+                    ctx, "You already belong to a party. Leave it first."
                 )
             party_id, selected = self._find_party(parties, party_name)
             if selected is None or party_id is None:
                 return await self._reply(
-                    interaction,
-                    "That party does not exist. Use `/government party list`.",
+                    ctx,
+                    "That party does not exist. Use `government party list`.",
                 )
-            selected.setdefault("member_ids", []).append(interaction.user.id)
+            selected.setdefault("member_ids", []).append(ctx.author.id)
             if not selected.get("leader_id"):
-                selected["leader_id"] = interaction.user.id
+                selected["leader_id"] = ctx.author.id
             await self.config.guild(guild).parties.set(parties)
             role, warning = await self._ensure_party_role(guild, party_id, parties)
             _, leader_warning = await self._sync_party_leader_role(guild, parties)
             _, channel_warning = await self._ensure_party_channel(
                 guild, party_id, parties
             )
-            if role is not None and role not in interaction.user.roles:
+            if role is not None and role not in ctx.author.roles:
                 try:
-                    await interaction.user.add_roles(
-                        role, reason="Joined government party"
-                    )
+                    await ctx.author.add_roles(role, reason="Joined government party")
                 except discord.HTTPException:
                     warning = "You joined, but I could not assign the party role."
             warning = warning or leader_warning or channel_warning
             message = f"You joined **{selected['name']}** ({len(selected['member_ids'])} members)."
             if warning:
                 message += f"\n⚠️ {warning}"
-        await self._reply(interaction, message)
+        await self._reply(ctx, message)
 
-    @party.command(name="leave", description="Leave your current party")
-    async def party_leave(self, interaction: discord.Interaction) -> None:
-        guild = self._guild(interaction)
-        if guild is None or not isinstance(interaction.user, discord.Member):
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
+    @party.command(name="leave")
+    async def party_leave(self, ctx: commands.Context) -> None:
+        """Leave your current party."""
+        guild = self._guild(ctx)
+        if guild is None or not isinstance(ctx.author, discord.Member):
+            return await self._reply(ctx, "This command can only be used in a server.")
         async with self._lock(guild.id):
             parties = await self.config.guild(guild).parties()
-            party_id, selected = self._party_for_user(parties, interaction.user.id)
+            party_id, selected = self._party_for_user(parties, ctx.author.id)
             if selected is None or party_id is None:
-                return await self._reply(interaction, "You do not belong to a party.")
+                return await self._reply(ctx, "You do not belong to a party.")
             members = [
                 int(uid)
                 for uid in selected.get("member_ids", [])
-                if int(uid) != interaction.user.id
+                if int(uid) != ctx.author.id
             ]
             selected["member_ids"] = members
-            if int(selected.get("leader_id") or 0) == interaction.user.id:
+            if int(selected.get("leader_id") or 0) == ctx.author.id:
                 selected["leader_id"] = members[0] if members else None
             await self.config.guild(guild).parties.set(parties)
-            await self._remove_role(interaction.user, selected.get("role_id"))
+            await self._remove_role(ctx.author, selected.get("role_id"))
             _, warning = await self._sync_party_leader_role(guild, parties)
         message = f"You left **{selected['name']}**."
         if warning:
             message += f"\n⚠️ {warning}"
-        await self._reply(interaction, message)
+        await self._reply(ctx, message)
 
-    @party.command(name="list", description="List all political parties")
-    async def party_list(self, interaction: discord.Interaction) -> None:
-        guild = self._guild(interaction)
+    @party.command(name="list")
+    async def party_list(self, ctx: commands.Context) -> None:
+        """List all political parties."""
+        guild = self._guild(ctx)
         if guild is None:
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
+            return await self._reply(ctx, "This command can only be used in a server.")
         parties = await self.config.guild(guild).parties()
         if not parties:
             return await self._reply(
-                interaction, "No parties have been formed yet.", ephemeral=False
+                ctx, "No parties have been formed yet.", ephemeral=False
             )
-        lines = []
         ordered_parties = sorted(
             parties.items(), key=lambda pair: pair[1]["name"].casefold()
         )
-        for party_id, item in ordered_parties[:25]:
-            leader = guild.get_member(int(item.get("leader_id") or 0))
-            active = (
-                "active role"
-                if guild.get_role(int(item.get("role_id") or 0))
-                else "forming"
+        page_size = 8
+        page_count = (len(ordered_parties) + page_size - 1) // page_size
+        for page_index in range(page_count):
+            page = ordered_parties[
+                page_index * page_size : (page_index + 1) * page_size
+            ]
+            embed = discord.Embed(
+                title="Political Parties",
+                description=(
+                    f"{len(ordered_parties)} registered parties • "
+                    f"Roles and private channels unlock at {MIN_PARTY_MEMBERS} members."
+                ),
+                colour=discord.Colour.blurple(),
             )
-            line = (
-                f"**{item['name']}** (`{party_id}`) - {len(item.get('member_ids', []))} members, "
-                f"leader: {leader.mention if leader else 'vacant'}, {active}"
-            )
-            slogan = item.get("slogan", "").strip()
-            if slogan:
-                line += f"\n*“{slogan[:60]}{'…' if len(slogan) > 60 else ''}”*"
-            if len("\n".join(lines + [line])) > 3900:
-                break
-            lines.append(line)
-        embed = discord.Embed(
-            title="Political Parties",
-            description="\n".join(lines),
-            colour=discord.Colour.blurple(),
-        )
-        if len(lines) < len(ordered_parties):
-            embed.set_footer(
-                text=f"Showing {len(lines)} of {len(ordered_parties)} parties"
-            )
-        await interaction.response.send_message(embed=embed)
+            for party_id, item in page:
+                member_count = len(item.get("member_ids", []))
+                leader = guild.get_member(int(item.get("leader_id") or 0))
+                role = guild.get_role(int(item.get("role_id") or 0))
+                channel = guild.get_channel(int(item.get("channel_id") or 0))
+                if member_count >= MIN_PARTY_MEMBERS:
+                    status_parts = ["Qualified" if role else "Qualified; role pending"]
+                else:
+                    status_parts = [f"Forming ({member_count}/{MIN_PARTY_MEMBERS})"]
+                if isinstance(channel, discord.TextChannel):
+                    status_parts.append("private channel active")
+                slogan = item.get("slogan", "").strip()
+                details = [
+                    f"**Leader:** {leader.mention if leader else 'Vacant'}",
+                    f"**Status:** {' • '.join(status_parts)}",
+                    f"**Party ID:** `{party_id}`",
+                ]
+                if slogan:
+                    details.append(
+                        f"*“{slogan[:100]}{'…' if len(slogan) > 100 else ''}”*"
+                    )
+                embed.add_field(
+                    name=f"{item['name']} — {member_count} member{'s' if member_count != 1 else ''}",
+                    value="\n".join(details),
+                    inline=False,
+                )
+            embed.set_footer(text=f"Page {page_index + 1} of {page_count}")
+            await ctx.send(embed=embed)
 
-    @party.command(
-        name="info", description="Show a party's icon, color, leader, and members"
-    )
-    @app_commands.describe(party_name="Party name or ID")
-    async def party_info(
-        self, interaction: discord.Interaction, party_name: str
-    ) -> None:
-        guild = self._guild(interaction)
+    @party.command(name="info")
+    async def party_info(self, ctx: commands.Context, *, party_name: str) -> None:
+        """Show a party's icon, color, leader, and members."""
+        guild = self._guild(ctx)
         if guild is None:
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
+            return await self._reply(ctx, "This command can only be used in a server.")
         parties = await self.config.guild(guild).parties()
         party_id, selected = self._find_party(parties, party_name)
         if party_id is None or selected is None:
             return await self._reply(
-                interaction,
-                "That party does not exist. Use `/government party list`.",
+                ctx,
+                "That party does not exist. Use `government party list`.",
             )
 
         leader = guild.get_member(int(selected.get("leader_id") or 0))
@@ -1618,18 +1666,18 @@ class Government(commands.Cog):
             icon_file = discord.File(icon_path, filename=filename)
             embed.set_thumbnail(url=f"attachment://{filename}")
         if icon_file is not None:
-            await interaction.response.send_message(
+            await ctx.send(
                 embed=embed,
                 file=icon_file,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
         else:
-            await interaction.response.send_message(
+            await ctx.send(
                 embed=embed,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
-    @party.command(
+    @slash_party.command(
         name="edit", description="Change your party's appearance or public profile"
     )
     @app_commands.describe(
@@ -1713,35 +1761,32 @@ class Government(commands.Cog):
             message += f"\n⚠️ {warning}"
         await self._reply(interaction, message)
 
-    @party.command(name="transfer", description="Transfer leadership to a party member")
+    @party.command(name="transfer")
     async def party_transfer(
-        self, interaction: discord.Interaction, member: discord.Member
+        self, ctx: commands.Context, member: discord.Member
     ) -> None:
-        guild = self._guild(interaction)
+        """Transfer leadership to another member of your party."""
+        guild = self._guild(ctx)
         if guild is None:
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
-        if member.bot or member.id == interaction.user.id:
-            return await self._reply(
-                interaction, "Choose another human member of your party."
-            )
+            return await self._reply(ctx, "This command can only be used in a server.")
+        if member.bot or member.id == ctx.author.id:
+            return await self._reply(ctx, "Choose another human member of your party.")
         async with self._lock(guild.id):
             parties = await self.config.guild(guild).parties()
-            party_id, selected = self._party_for_user(parties, interaction.user.id)
+            party_id, selected = self._party_for_user(parties, ctx.author.id)
             target_party_id, _ = self._party_for_user(parties, member.id)
             if (
                 selected is None
                 or party_id is None
-                or int(selected.get("leader_id") or 0) != interaction.user.id
+                or int(selected.get("leader_id") or 0) != ctx.author.id
             ):
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "Only your party's current leader can transfer leadership.",
                 )
             if target_party_id != party_id:
                 return await self._reply(
-                    interaction, "The new leader must belong to your party."
+                    ctx, "The new leader must belong to your party."
                 )
             election = await self.config.guild(guild).active_election()
             if election and any(
@@ -1749,7 +1794,7 @@ class Government(commands.Cog):
                 for candidate in election.get("candidates", [])
             ):
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "Leadership cannot change while the party is on an active ballot.",
                 )
             selected["leader_id"] = member.id
@@ -1760,26 +1805,24 @@ class Government(commands.Cog):
         )
         if warning:
             message += f"\n⚠️ {warning}"
-        await self._reply(interaction, message, ephemeral=False)
+        await self._reply(ctx, message, ephemeral=False)
 
-    @party.command(name="disband", description="Permanently disband the party you lead")
-    async def party_disband(self, interaction: discord.Interaction) -> None:
-        guild = self._guild(interaction)
+    @party.command(name="disband")
+    async def party_disband(self, ctx: commands.Context) -> None:
+        """Permanently disband the party you lead."""
+        guild = self._guild(ctx)
         if guild is None:
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
-        await interaction.response.defer(ephemeral=True, thinking=True)
+            return await self._reply(ctx, "This command can only be used in a server.")
         async with self._lock(guild.id):
             parties = await self.config.guild(guild).parties()
-            party_id, selected = self._party_for_user(parties, interaction.user.id)
+            party_id, selected = self._party_for_user(parties, ctx.author.id)
             if (
                 selected is None
                 or party_id is None
-                or int(selected.get("leader_id") or 0) != interaction.user.id
+                or int(selected.get("leader_id") or 0) != ctx.author.id
             ):
                 return await self._reply(
-                    interaction, "Only your party's leader can disband it."
+                    ctx, "Only your party's leader can disband it."
                 )
             election = await self.config.guild(guild).active_election()
             if election and any(
@@ -1787,7 +1830,7 @@ class Government(commands.Cog):
                 for item in election.get("candidates", [])
             ):
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "A party cannot disband while it is on an active election ballot.",
                 )
             party_channel = guild.get_channel(int(selected.get("channel_id") or 0))
@@ -1796,7 +1839,7 @@ class Government(commands.Cog):
                     await party_channel.delete(reason="Government party disbanded")
                 except discord.Forbidden:
                     return await self._reply(
-                        interaction,
+                        ctx,
                         "I cannot delete the private party channel; check my permissions.",
                     )
             role = guild.get_role(int(selected.get("role_id") or 0))
@@ -1805,7 +1848,7 @@ class Government(commands.Cog):
                     await role.delete(reason="Government party disbanded")
                 except discord.Forbidden:
                     return await self._reply(
-                        interaction,
+                        ctx,
                         "I cannot delete the party role; check my role position.",
                     )
             Path(selected["icon_path"]).unlink(missing_ok=True)
@@ -1815,33 +1858,26 @@ class Government(commands.Cog):
         message = f"Disbanded **{selected['name']}** and removed its role and private channel."
         if warning:
             message += f"\n⚠️ {warning}"
-        await self._reply(interaction, message)
+        await self._reply(ctx, message)
 
-    @government.command(
-        name="appoint", description="President: appoint the Vice President"
-    )
-    async def appoint(
-        self, interaction: discord.Interaction, member: discord.Member
-    ) -> None:
-        guild = self._guild(interaction)
+    @government.command(name="appoint")
+    async def appoint(self, ctx: commands.Context, member: discord.Member) -> None:
+        """President: appoint the Vice President."""
+        guild = self._guild(ctx)
         if guild is None:
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
+            return await self._reply(ctx, "This command can only be used in a server.")
         async with self._lock(guild.id):
             settings = await self.config.guild(guild).all()
-            if int(settings.get("president_id") or 0) != interaction.user.id:
+            if int(settings.get("president_id") or 0) != ctx.author.id:
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "Only the sitting President can appoint the Vice President.",
                 )
             if int(settings.get("term_ends_at") or 0) <= unix_now():
+                return await self._reply(ctx, "The presidential term has ended.")
+            if member.bot or member.id == ctx.author.id:
                 return await self._reply(
-                    interaction, "The presidential term has ended."
-                )
-            if member.bot or member.id == interaction.user.id:
-                return await self._reply(
-                    interaction, "Choose another human member of this server."
+                    ctx, "Choose another human member of this server."
                 )
             _, vice_role = await self._ensure_office_roles(guild)
             previous = guild.get_member(int(settings.get("vice_president_id") or 0))
@@ -1851,42 +1887,36 @@ class Government(commands.Cog):
                 await member.add_roles(vice_role, reason="Appointed Vice President")
             except discord.Forbidden:
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "I cannot assign the Vice President role; check my role position.",
                 )
             await self.config.guild(guild).vice_president_id.set(member.id)
         await self._reply(
-            interaction,
+            ctx,
             f"Appointed {member.mention} as **Vice President**.",
             ephemeral=False,
         )
 
-    @law.command(
-        name="propose",
-        description="President: begin a law's required 24-hour discussion",
-    )
-    @app_commands.choices(
-        kind=[
-            app_commands.Choice(
-                name="Ordinary law (simple majority)", value="ordinary"
-            ),
-            app_commands.Choice(
-                name="Constitutional amendment (two-thirds)", value="amendment"
-            ),
-        ]
-    )
+    @law.command(name="propose")
     async def law_propose(
         self,
-        interaction: discord.Interaction,
+        ctx: commands.Context,
+        kind: str,
         title: str,
+        *,
         text: str,
-        kind: app_commands.Choice[str],
     ) -> None:
-        guild = self._guild(interaction)
+        """President: propose a law. Quote the title if it contains spaces.
+
+        Kind must be `ordinary` or `amendment`. The remaining text becomes the
+        law body. Example: government law propose ordinary "Park Rules" Be nice.
+        """
+        guild = self._guild(ctx)
         if guild is None:
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
+            return await self._reply(ctx, "This command can only be used in a server.")
+        kind = kind.casefold().strip()
+        if kind not in {"ordinary", "amendment"}:
+            return await self._reply(ctx, "Kind must be `ordinary` or `amendment`.")
         title = " ".join(title.split())
         text = text.strip()
         if (
@@ -1896,75 +1926,65 @@ class Government(commands.Cog):
             or len(text) > MAX_LAW_TEXT
         ):
             return await self._reply(
-                interaction,
+                ctx,
                 f"Use a 1–{MAX_LAW_TITLE} character title and 1–{MAX_LAW_TEXT} character text.",
             )
         async with self._lock(guild.id):
             settings = await self.config.guild(guild).all()
-            if int(settings.get("president_id") or 0) != interaction.user.id:
+            if int(settings.get("president_id") or 0) != ctx.author.id:
                 return await self._reply(
-                    interaction, "Only the sitting President can propose laws."
+                    ctx, "Only the sitting President can propose laws."
                 )
             if int(settings.get("term_ends_at") or 0) <= unix_now():
-                return await self._reply(
-                    interaction, "The presidential term has ended."
-                )
+                return await self._reply(ctx, "The presidential term has ended.")
             try:
                 law_id = await self._post_law_discussion(
                     guild,
                     settings,
-                    proposer_id=interaction.user.id,
+                    proposer_id=ctx.author.id,
                     title=title,
                     text=text,
-                    kind=kind.value,
+                    kind=kind,
                 )
             except ValueError as exc:
-                return await self._reply(interaction, str(exc))
+                return await self._reply(ctx, str(exc))
             except discord.Forbidden:
                 return await self._reply(
-                    interaction, "I cannot post in the configured government channel."
+                    ctx, "I cannot post in the configured government channel."
                 )
         await self._reply(
-            interaction,
+            ctx,
             f"Law {law_id} is now in public discussion. Its 24-hour vote will start automatically.",
         )
 
-    @law.command(
-        name="repeal",
-        description="President: propose removing a currently enacted law",
-    )
+    @law.command(name="repeal")
     async def law_repeal(
-        self, interaction: discord.Interaction, law_id: str, reason: str
+        self, ctx: commands.Context, law_id: str, *, reason: str
     ) -> None:
-        guild = self._guild(interaction)
+        """President: propose repealing an enacted law, followed by the reason."""
+        guild = self._guild(ctx)
         if guild is None:
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
+            return await self._reply(ctx, "This command can only be used in a server.")
         target_id = law_id.strip()
         reason = reason.strip()
         if not reason or len(reason) > MAX_LAW_TEXT - 150:
             return await self._reply(
-                interaction,
+                ctx,
                 f"Give a repeal reason between 1 and {MAX_LAW_TEXT - 150} characters.",
             )
         async with self._lock(guild.id):
             settings = await self.config.guild(guild).all()
-            if int(settings.get("president_id") or 0) != interaction.user.id:
+            if int(settings.get("president_id") or 0) != ctx.author.id:
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "Only the sitting President can propose repealing a law.",
                 )
             if int(settings.get("term_ends_at") or 0) <= unix_now():
-                return await self._reply(
-                    interaction, "The presidential term has ended."
-                )
+                return await self._reply(ctx, "The presidential term has ended.")
             laws = settings.get("laws") or {}
             target = laws.get(target_id)
             if target is None or target.get("status") != "enacted":
-                return await self._reply(
-                    interaction, "That law is not currently enacted."
-                )
+                return await self._reply(ctx, "That law is not currently enacted.")
             if any(
                 law.get("action") in {"repeal", "amend"}
                 and str(law.get("target_law_id")) == target_id
@@ -1972,7 +1992,7 @@ class Government(commands.Cog):
                 for law in laws.values()
             ):
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "That law already has an active amendment or repeal proposal.",
                 )
             title = f"Repeal Law {target_id}: {target['title']}"[:MAX_LAW_TITLE]
@@ -1984,7 +2004,7 @@ class Government(commands.Cog):
                 repeal_id = await self._post_law_discussion(
                     guild,
                     settings,
-                    proposer_id=interaction.user.id,
+                    proposer_id=ctx.author.id,
                     title=title,
                     text=text,
                     kind=target.get("kind", "ordinary"),
@@ -1992,32 +2012,29 @@ class Government(commands.Cog):
                     target_law_id=target_id,
                 )
             except ValueError as exc:
-                return await self._reply(interaction, str(exc))
+                return await self._reply(ctx, str(exc))
             except discord.Forbidden:
                 return await self._reply(
-                    interaction, "I cannot post in the configured government channel."
+                    ctx, "I cannot post in the configured government channel."
                 )
         await self._reply(
-            interaction,
+            ctx,
             f"Repeal proposal Law {repeal_id} is now in public discussion. If it passes, Law {target_id} will be removed from current laws.",
         )
 
-    @law.command(
-        name="amend",
-        description="President: propose replacing a currently enacted law",
-    )
+    @law.command(name="amend")
     async def law_amend(
         self,
-        interaction: discord.Interaction,
+        ctx: commands.Context,
         law_id: str,
         new_title: str,
+        *,
         new_text: str,
     ) -> None:
-        guild = self._guild(interaction)
+        """President: replace a law. Quote the new title; remaining text is its body."""
+        guild = self._guild(ctx)
         if guild is None:
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
+            return await self._reply(ctx, "This command can only be used in a server.")
         target_id = law_id.strip()
         new_title = " ".join(new_title.split())
         new_text = new_text.strip()
@@ -2028,26 +2045,22 @@ class Government(commands.Cog):
             or len(new_text) > MAX_LAW_TEXT
         ):
             return await self._reply(
-                interaction,
+                ctx,
                 f"Use a 1–{MAX_LAW_TITLE} character title and 1–{MAX_LAW_TEXT} character replacement text.",
             )
         async with self._lock(guild.id):
             settings = await self.config.guild(guild).all()
-            if int(settings.get("president_id") or 0) != interaction.user.id:
+            if int(settings.get("president_id") or 0) != ctx.author.id:
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "Only the sitting President can propose amending a law.",
                 )
             if int(settings.get("term_ends_at") or 0) <= unix_now():
-                return await self._reply(
-                    interaction, "The presidential term has ended."
-                )
+                return await self._reply(ctx, "The presidential term has ended.")
             laws = settings.get("laws") or {}
             target = laws.get(target_id)
             if target is None or target.get("status") != "enacted":
-                return await self._reply(
-                    interaction, "That law is not currently enacted."
-                )
+                return await self._reply(ctx, "That law is not currently enacted.")
             if any(
                 law.get("action") in {"repeal", "amend"}
                 and str(law.get("target_law_id")) == target_id
@@ -2055,14 +2068,14 @@ class Government(commands.Cog):
                 for law in laws.values()
             ):
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "That law already has an active amendment or repeal proposal.",
                 )
             try:
                 amendment_id = await self._post_law_discussion(
                     guild,
                     settings,
-                    proposer_id=interaction.user.id,
+                    proposer_id=ctx.author.id,
                     title=new_title,
                     text=new_text,
                     kind=target.get("kind", "ordinary"),
@@ -2070,27 +2083,26 @@ class Government(commands.Cog):
                     target_law_id=target_id,
                 )
             except ValueError as exc:
-                return await self._reply(interaction, str(exc))
+                return await self._reply(ctx, str(exc))
             except discord.Forbidden:
                 return await self._reply(
-                    interaction, "I cannot post in the configured government channel."
+                    ctx, "I cannot post in the configured government channel."
                 )
         await self._reply(
-            interaction,
+            ctx,
             f"Amendment proposal Law {amendment_id} is now in public discussion. If it passes, it will replace Law {target_id} in current laws.",
         )
 
-    @law.command(name="list", description="List recent law proposals and outcomes")
-    async def law_list(self, interaction: discord.Interaction) -> None:
-        guild = self._guild(interaction)
+    @law.command(name="list")
+    async def law_list(self, ctx: commands.Context) -> None:
+        """List recent law proposals and outcomes."""
+        guild = self._guild(ctx)
         if guild is None:
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
+            return await self._reply(ctx, "This command can only be used in a server.")
         laws = await self.config.guild(guild).laws()
         if not laws:
             return await self._reply(
-                interaction, "No laws have been proposed.", ephemeral=False
+                ctx, "No laws have been proposed.", ephemeral=False
             )
         ordered = sorted(laws.items(), key=lambda pair: int(pair[0]), reverse=True)[:15]
         lines = [
@@ -2102,18 +2114,17 @@ class Government(commands.Cog):
             description="\n".join(lines),
             colour=discord.Colour.blurple(),
         )
-        await interaction.response.send_message(embed=embed)
+        await ctx.send(embed=embed)
 
-    @law.command(name="show", description="Show the full text and status of a law")
-    async def law_show(self, interaction: discord.Interaction, law_id: str) -> None:
-        guild = self._guild(interaction)
+    @law.command(name="show")
+    async def law_show(self, ctx: commands.Context, law_id: str) -> None:
+        """Show the full text and status of a law."""
+        guild = self._guild(ctx)
         if guild is None:
-            return await self._reply(
-                interaction, "This command can only be used in a server."
-            )
+            return await self._reply(ctx, "This command can only be used in a server.")
         law = (await self.config.guild(guild).laws()).get(law_id.strip())
         if law is None:
-            return await self._reply(interaction, "That law does not exist.")
+            return await self._reply(ctx, "That law does not exist.")
         embed = discord.Embed(
             title=f"Law {law_id}: {law['title']}",
             description=law["text"],
@@ -2127,22 +2138,20 @@ class Government(commands.Cog):
                 value=f"{law['approve_votes']} approve / {law['reject_votes']} reject",
                 inline=False,
             )
-        await interaction.response.send_message(embed=embed)
+        await ctx.send(embed=embed)
 
-    @admin.command(
-        name="setup", description="Set the government channel and create office roles"
-    )
+    @admin.command(name="setup")
     async def admin_setup(
-        self, interaction: discord.Interaction, channel: discord.TextChannel
+        self, ctx: commands.Context, channel: discord.TextChannel
     ) -> None:
-        guild = self._guild(interaction)
-        if guild is None or not await self._require_admin(interaction):
+        """Set the government channel and create office roles."""
+        guild = self._guild(ctx)
+        if guild is None or not await self._require_admin(ctx):
             return
         if self._polls_api() is None:
             return await self._reply(
-                interaction, "Load the `Polls` cog before setting up Government."
+                ctx, "Load the `Polls` cog before setting up Government."
             )
-        await interaction.response.defer(ephemeral=True, thinking=True)
         warnings: List[str] = []
         try:
             await self._ensure_office_roles(guild)
@@ -2151,7 +2160,7 @@ class Government(commands.Cog):
             )
         except discord.HTTPException:
             return await self._reply(
-                interaction,
+                ctx,
                 "I need Manage Roles and my role must be above the office roles.",
             )
         await self.config.guild(guild).channel_id.set(channel.id)
@@ -2179,19 +2188,16 @@ class Government(commands.Cog):
             message += f" Current laws are mirrored in {laws_channel.mention}."
         if warnings:
             message += "\n" + "\n".join(f"⚠️ {item}" for item in warnings)
-        await self._reply(interaction, message)
+        await self._reply(ctx, message)
 
-    @admin.command(
-        name="set-laws-channel",
-        description="Use an existing channel as the read-only current-laws register",
-    )
+    @admin.command(name="set-laws-channel")
     async def admin_set_laws_channel(
-        self, interaction: discord.Interaction, channel: discord.TextChannel
+        self, ctx: commands.Context, channel: discord.TextChannel
     ) -> None:
-        guild = self._guild(interaction)
-        if guild is None or not await self._require_admin(interaction):
+        """Use an existing channel as the read-only current-laws register."""
+        guild = self._guild(ctx)
+        if guild is None or not await self._require_admin(ctx):
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
         await self._seed_default_laws(guild)
         settings = await self.config.guild(guild).all()
         old_channel = guild.get_channel(int(settings.get("laws_channel_id") or 0))
@@ -2216,7 +2222,7 @@ class Government(commands.Cog):
             warning = await self._sync_current_laws(guild)
         except discord.HTTPException:
             return await self._reply(
-                interaction,
+                ctx,
                 "I could not configure that channel. Grant me Manage Channels, Send Messages, Embed Links, and Manage Messages.",
             )
         message = (
@@ -2225,19 +2231,16 @@ class Government(commands.Cog):
         )
         if warning:
             message += f"\n⚠️ {warning}"
-        await self._reply(interaction, message)
+        await self._reply(ctx, message)
 
-    @admin.command(
-        name="set-party-category",
-        description="Set the category used for private qualifying-party channels",
-    )
+    @admin.command(name="set-party-category")
     async def admin_set_party_category(
-        self, interaction: discord.Interaction, category: discord.CategoryChannel
+        self, ctx: commands.Context, category: discord.CategoryChannel
     ) -> None:
-        guild = self._guild(interaction)
-        if guild is None or not await self._require_admin(interaction):
+        """Set the category used for private qualifying-party channels."""
+        guild = self._guild(ctx)
+        if guild is None or not await self._require_admin(ctx):
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
         warnings: List[str] = []
         created_or_synced = 0
         async with self._lock(guild.id):
@@ -2267,43 +2270,39 @@ class Government(commands.Cog):
         )
         if warnings:
             message += "\n" + "\n".join(f"⚠️ {item}" for item in warnings[:10])
-        await self._reply(interaction, message)
+        await self._reply(ctx, message)
 
-    @admin.command(
-        name="rename-party", description="Rename a party and its managed resources"
-    )
+    @admin.command(name="rename-party")
     async def admin_rename_party(
-        self, interaction: discord.Interaction, party_name: str, new_name: str
+        self, ctx: commands.Context, party_name: str, *, new_name: str
     ) -> None:
-        guild = self._guild(interaction)
-        if guild is None or not await self._require_admin(interaction):
+        """Rename a party and its resources. Quote a multi-word current name."""
+        guild = self._guild(ctx)
+        if guild is None or not await self._require_admin(ctx):
             return
         try:
             clean_name = clean_party_name(new_name)
         except ValueError as exc:
-            return await self._reply(interaction, str(exc))
-        await interaction.response.defer(ephemeral=True, thinking=True)
+            return await self._reply(ctx, str(exc))
         warnings: List[str] = []
         async with self._lock(guild.id):
             parties = await self.config.guild(guild).parties()
             party_id, selected = self._find_party(parties, party_name)
             if party_id is None or selected is None:
-                return await self._reply(interaction, "That party does not exist.")
+                return await self._reply(ctx, "That party does not exist.")
             if any(
                 other_id != party_id
                 and party.get("name", "").casefold() == clean_name.casefold()
                 for other_id, party in parties.items()
             ):
-                return await self._reply(
-                    interaction, "A party with that name already exists."
-                )
+                return await self._reply(ctx, "A party with that name already exists.")
             election = await self.config.guild(guild).active_election()
             if election and any(
                 candidate.get("party_id") == party_id
                 for candidate in election.get("candidates", [])
             ):
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "A party cannot be renamed while it is on an active ballot.",
                 )
             old_name = selected["name"]
@@ -2329,31 +2328,28 @@ class Government(commands.Cog):
         message = f"Renamed **{old_name}** to **{clean_name}**."
         if warnings:
             message += "\n" + "\n".join(f"⚠️ {item}" for item in warnings)
-        await self._reply(interaction, message)
+        await self._reply(ctx, message)
 
-    @admin.command(
-        name="delete-party",
-        description="Permanently delete a party and its managed resources",
-    )
+    @admin.command(name="delete-party")
     async def admin_delete_party(
-        self, interaction: discord.Interaction, party_name: str
+        self, ctx: commands.Context, *, party_name: str
     ) -> None:
-        guild = self._guild(interaction)
-        if guild is None or not await self._require_admin(interaction):
+        """Permanently delete a party and its managed resources."""
+        guild = self._guild(ctx)
+        if guild is None or not await self._require_admin(ctx):
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
         async with self._lock(guild.id):
             parties = await self.config.guild(guild).parties()
             party_id, selected = self._find_party(parties, party_name)
             if party_id is None or selected is None:
-                return await self._reply(interaction, "That party does not exist.")
+                return await self._reply(ctx, "That party does not exist.")
             election = await self.config.guild(guild).active_election()
             if election and any(
                 candidate.get("party_id") == party_id
                 for candidate in election.get("candidates", [])
             ):
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "A party cannot be deleted while it is on an active ballot.",
                 )
             channel = guild.get_channel(int(selected.get("channel_id") or 0))
@@ -2365,7 +2361,7 @@ class Government(commands.Cog):
                     await role.delete(reason="Party deleted by government admin")
             except discord.Forbidden:
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "I cannot delete that party's role or channel. Check my permissions and role position.",
                 )
             Path(selected["icon_path"]).unlink(missing_ok=True)
@@ -2375,35 +2371,33 @@ class Government(commands.Cog):
         message = f"Deleted **{selected['name']}**, its role, and its private channel."
         if warning:
             message += f"\n⚠️ {warning}"
-        await self._reply(interaction, message)
+        await self._reply(ctx, message)
 
-    @admin.command(
-        name="start-election", description="Start a 24-hour presidential election"
-    )
-    async def admin_start_election(self, interaction: discord.Interaction) -> None:
-        guild = self._guild(interaction)
-        if guild is None or not await self._require_admin(interaction):
+    @admin.command(name="start-election")
+    async def admin_start_election(self, ctx: commands.Context) -> None:
+        """Start a 24-hour presidential election."""
+        guild = self._guild(ctx)
+        if guild is None or not await self._require_admin(ctx):
             return
         api = self._polls_api()
         if api is None:
-            return await self._reply(interaction, "The Polls cog must be loaded.")
-        await interaction.response.defer(ephemeral=True, thinking=True)
+            return await self._reply(ctx, "The Polls cog must be loaded.")
         async with self._lock(guild.id):
             settings = await self.config.guild(guild).all()
             if settings.get("active_election"):
                 return await self._reply(
-                    interaction, "A presidential election is already active."
+                    ctx, "A presidential election is already active."
                 )
             term_end = int(settings.get("term_ends_at") or 0)
             if settings.get("president_id") and term_end > unix_now() + DAY_SECONDS:
                 return await self._reply(
-                    interaction,
+                    ctx,
                     f"The current term has more than 24 hours remaining (<t:{term_end}:R>).",
                 )
             channel = guild.get_channel(int(settings.get("channel_id") or 0))
             if channel is None:
                 return await self._reply(
-                    interaction, "Run `/government admin setup` first."
+                    ctx, "Run `government admin setup #channel` first."
                 )
             candidates = []
             options = []
@@ -2425,18 +2419,18 @@ class Government(commands.Cog):
                 options.append(party["name"])
             if len(candidates) < 2:
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "At least two parties with five members and an active leader are required.",
                 )
             if len(candidates) > 25:
                 return await self._reply(
-                    interaction,
+                    ctx,
                     "Discord polls support at most 25 options; reduce the qualified field before starting the election.",
                 )
             poll = await api.create_poll(
                 guild=guild,
                 channel=channel,
-                author_id=interaction.user.id,
+                author_id=ctx.author.id,
                 question="Presidential Election - choose a party",
                 options=options,
                 duration_seconds=DAY_SECONDS,
@@ -2453,29 +2447,22 @@ class Government(commands.Cog):
                 }
             )
         await self._reply(
-            interaction,
+            ctx,
             f"Presidential election `{poll.id}` started. Voting closes <t:{int(poll.closes_at.timestamp())}:R>.",
         )
 
-    @admin.command(
-        name="vacate",
-        description="Vacate an office; the VP succeeds a vacated President",
-    )
-    @app_commands.choices(
-        office=[
-            app_commands.Choice(name="President", value="president"),
-            app_commands.Choice(name="Vice President", value="vice"),
-        ]
-    )
-    async def admin_vacate(
-        self, interaction: discord.Interaction, office: app_commands.Choice[str]
-    ) -> None:
-        guild = self._guild(interaction)
-        if guild is None or not await self._require_admin(interaction):
+    @admin.command(name="vacate")
+    async def admin_vacate(self, ctx: commands.Context, office: str) -> None:
+        """Vacate `president` or `vice`; the VP succeeds a vacated President."""
+        guild = self._guild(ctx)
+        if guild is None or not await self._require_admin(ctx):
             return
+        office = office.casefold().strip()
+        if office not in {"president", "vice"}:
+            return await self._reply(ctx, "Office must be `president` or `vice`.")
         async with self._lock(guild.id):
             settings = await self.config.guild(guild).all()
-            if office.value == "vice":
+            if office == "vice":
                 vice = guild.get_member(int(settings.get("vice_president_id") or 0))
                 if vice:
                     await self._remove_role(
@@ -2504,27 +2491,25 @@ class Government(commands.Cog):
                     await self.config.guild(guild).term_started_at.set(None)
                     await self.config.guild(guild).term_ends_at.set(None)
                     message = "The Presidency is now vacant; there was no Vice President to succeed."
-        await self._reply(interaction, message, ephemeral=False)
+        await self._reply(ctx, message, ephemeral=False)
 
-    @admin.command(
-        name="void-law",
-        description="Void a proposal that conflicts with immutable safety rules",
-    )
+    @admin.command(name="void-law")
     async def admin_void_law(
-        self, interaction: discord.Interaction, law_id: str, reason: str
+        self, ctx: commands.Context, law_id: str, *, reason: str
     ) -> None:
-        guild = self._guild(interaction)
-        if guild is None or not await self._require_admin(interaction):
+        """Void a law or proposal that conflicts with the Immutable Laws."""
+        guild = self._guild(ctx)
+        if guild is None or not await self._require_admin(ctx):
             return
         law_id = law_id.strip()
         async with self._lock(guild.id):
             laws = await self.config.guild(guild).laws()
             law = laws.get(law_id)
             if law is None:
-                return await self._reply(interaction, "That law does not exist.")
+                return await self._reply(ctx, "That law does not exist.")
             if law.get("status") in {"void", "rejected", "cancelled"}:
                 return await self._reply(
-                    interaction, f"That law is already `{law.get('status')}`."
+                    ctx, f"That law is already `{law.get('status')}`."
                 )
             poll_id = law.get("poll_id")
             law["status"] = "void"
@@ -2544,16 +2529,14 @@ class Government(commands.Cog):
         message = f"Law {law_id} was marked void."
         if dashboard_warning:
             message += f"\n⚠️ {dashboard_warning}"
-        await self._reply(interaction, message)
+        await self._reply(ctx, message)
 
-    @admin.command(
-        name="reconcile", description="Repair and resync party and office roles"
-    )
-    async def admin_reconcile(self, interaction: discord.Interaction) -> None:
-        guild = self._guild(interaction)
-        if guild is None or not await self._require_admin(interaction):
+    @admin.command(name="reconcile")
+    async def admin_reconcile(self, ctx: commands.Context) -> None:
+        """Repair and resync party roles, channels, offices, and current laws."""
+        guild = self._guild(ctx)
+        if guild is None or not await self._require_admin(ctx):
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
         warnings: List[str] = []
         async with self._lock(guild.id):
             try:
@@ -2599,7 +2582,7 @@ class Government(commands.Cog):
         message = "Role reconciliation complete."
         if warnings:
             message += "\n" + "\n".join(f"⚠️ {item}" for item in warnings)
-        await self._reply(interaction, message)
+        await self._reply(ctx, message)
 
     async def red_delete_data_for_user(self, *, requester: str, user_id: int) -> None:
         all_guilds = await self.config.all_guilds()

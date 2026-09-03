@@ -2,7 +2,7 @@
     "author": [
         "Durk"
     ],
-    "install_msg": "Government installed. Load the Polls cog, then use `/government admin setup` to choose the government channel and create the read-only current-laws register.",
+    "install_msg": "Government installed. Load the Polls cog, then use `[p]government admin setup #channel` to choose the government channel and create the read-only current-laws register. Most commands are prefix commands; party create/edit remain slash commands.",
     "name": "Government",
     "short": "Parties, presidential elections, terms, and constitutional lawmaking.",
     "description": "A persistent server government with political parties, permissionless party and qualifying Party Leader roles, private qualifying-party channels, administrative party management, 24-hour presidential elections, two-week terms, presidential appointments, mandatory law discussion periods, public law and repeal votes, a synchronized read-only current-laws channel, and immutable safety rules.",
