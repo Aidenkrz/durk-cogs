@@ -20,6 +20,8 @@ log = logging.getLogger("red.durk-cogs.government")
 DAY_SECONDS = 24 * 60 * 60
 TERM_SECONDS = 14 * DAY_SECONDS
 MIN_PARTY_MEMBERS = 5
+PARTY_CHANNEL_MIN_MEMBERS = 6
+CONSTITUTION_VERSION = 2
 MAX_ICON_BYTES = 256 * 1024
 MAX_PARTY_NAME = 50
 MAX_PARTY_SLOGAN = 100
@@ -35,6 +37,9 @@ IMMUTABLE_LAWS = (
     "server, its members, or its infrastructure.",
     "The server owner retains final authority when required by Discord, law, "
     "safety, or technical necessity.",
+    "Each President may choose one in-game change to be implemented during "
+    "their term, provided it is technically possible and does not violate "
+    "these Immutable Laws.",
     "These Immutable Laws cannot be amended, suspended, or repealed. Any "
     "conflicting law is automatically void.",
 )
@@ -134,12 +139,14 @@ class Government(commands.Cog):
             channel_id=None,
             laws_channel_id=None,
             constitution_message_id=None,
+            constitution_version=0,
             law_message_ids={},
             default_laws_seeded=False,
             parties={},
             president_role_id=None,
             vice_president_role_id=None,
             party_leader_role_id=None,
+            party_channel_category_id=None,
             president_id=None,
             vice_president_id=None,
             term_started_at=None,
@@ -215,6 +222,12 @@ class Government(commands.Cog):
 
     def _icon_path(self, guild_id: int, party_id: str, image_type: str) -> Path:
         return self._data_path / f"{guild_id}-{party_id}.{image_type}"
+
+    @staticmethod
+    def _party_channel_name(name: str, party_id: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-")
+        slug = slug[:80].strip("-") or "party"
+        return f"{slug}-{party_id[:6]}"[:100]
 
     @staticmethod
     async def _read_icon(attachment: discord.Attachment) -> Tuple[bytes, str]:
@@ -343,8 +356,14 @@ class Government(commands.Cog):
                     reason="Synchronize government party role",
                 )
 
-            for user_id in party.get("member_ids", []):
-                member = guild.get_member(int(user_id))
+            member_ids = {int(user_id) for user_id in party.get("member_ids", [])}
+            for member in list(role.members):
+                if member.id not in member_ids:
+                    await member.remove_roles(
+                        role, reason="Not a member of this government party"
+                    )
+            for user_id in member_ids:
+                member = guild.get_member(user_id)
                 if member is not None and role not in member.roles:
                     await member.add_roles(role, reason="Government party membership")
             return role, None
@@ -364,6 +383,82 @@ class Government(commands.Cog):
                 None,
                 "Discord rejected the party role or icon. Try a different icon and run reconcile.",
             )
+
+    async def _ensure_party_channel(
+        self, guild: discord.Guild, party_id: str, parties: Dict[str, Dict[str, Any]]
+    ) -> Tuple[Optional[discord.TextChannel], Optional[str]]:
+        party = parties[party_id]
+        if len(party.get("member_ids", [])) < PARTY_CHANNEL_MIN_MEMBERS:
+            return None, None
+
+        category_id = await self.config.guild(guild).party_channel_category_id()
+        if not category_id:
+            return (
+                None,
+                "An administrator has not configured the party-channel category.",
+            )
+        category = guild.get_channel(int(category_id))
+        if not isinstance(category, discord.CategoryChannel):
+            await self.config.guild(guild).party_channel_category_id.set(None)
+            return None, "The configured party-channel category no longer exists."
+
+        role = guild.get_role(int(party.get("role_id") or 0))
+        if role is None:
+            return None, "The party role must be created before its private channel."
+
+        overwrites: Dict[Any, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=False,
+                send_messages=False,
+                read_message_history=False,
+            ),
+            role: discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                add_reactions=True,
+                attach_files=True,
+                embed_links=True,
+                use_external_emojis=True,
+            ),
+        }
+        if guild.me is not None:
+            overwrites[guild.me] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+                manage_channels=True,
+                manage_messages=True,
+            )
+
+        channel = guild.get_channel(int(party.get("channel_id") or 0))
+        try:
+            if isinstance(channel, discord.TextChannel):
+                await channel.edit(
+                    name=self._party_channel_name(party["name"], party_id),
+                    category=category,
+                    overwrites=overwrites,
+                    topic=f"Private channel for {party['name']} • Party ID: {party_id}",
+                    reason="Synchronize private government party channel",
+                )
+            else:
+                channel = await category.create_text_channel(
+                    self._party_channel_name(party["name"], party_id),
+                    overwrites=overwrites,
+                    topic=f"Private channel for {party['name']} • Party ID: {party_id}",
+                    reason="Party exceeded five members",
+                )
+                party["channel_id"] = channel.id
+                await self.config.guild(guild).parties.set(parties)
+            return channel, None
+        except discord.Forbidden:
+            return None, (
+                "I cannot create or secure the private party channel. "
+                "Check my Manage Channels permission."
+            )
+        except discord.HTTPException:
+            log.exception("Could not create/update party channel for %s", party_id)
+            return None, "Discord rejected the private party-channel update."
 
     async def _remove_role(
         self, member: discord.Member, role_id: Optional[int]
@@ -557,6 +652,7 @@ class Government(commands.Cog):
                 return f"I could not publish Law {law_id} in {channel.mention}."
 
         await self.config.guild(guild).law_message_ids.set(new_ids)
+        await self.config.guild(guild).constitution_version.set(CONSTITUTION_VERSION)
         return None
 
     async def _make_laws_channel(
@@ -923,8 +1019,12 @@ class Government(commands.Cog):
             seeded = await self._seed_default_laws(guild)
             if seeded:
                 settings = await self.config.guild(guild).all()
-                if settings.get("laws_channel_id"):
-                    await self._sync_current_laws(guild)
+            if (
+                settings.get("laws_channel_id")
+                and int(settings.get("constitution_version") or 0)
+                != CONSTITUTION_VERSION
+            ):
+                await self._sync_current_laws(guild)
             term_end = settings.get("term_ends_at")
             if term_end and int(term_end) <= now:
                 await self._expire_term(guild, settings)
@@ -1070,11 +1170,52 @@ class Government(commands.Cog):
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel: discord.abc.GuildChannel) -> None:
-        configured_id = await self.config.guild(channel.guild).laws_channel_id()
-        if int(configured_id or 0) == channel.id:
-            await self.config.guild(channel.guild).laws_channel_id.set(None)
-            await self.config.guild(channel.guild).constitution_message_id.set(None)
-            await self.config.guild(channel.guild).law_message_ids.set({})
+        async with self._lock(channel.guild.id):
+            settings = await self.config.guild(channel.guild).all()
+            group = self.config.guild(channel.guild)
+            if int(settings.get("laws_channel_id") or 0) == channel.id:
+                await group.laws_channel_id.set(None)
+                await group.constitution_message_id.set(None)
+                await group.law_message_ids.set({})
+            if int(settings.get("party_channel_category_id") or 0) == channel.id:
+                await group.party_channel_category_id.set(None)
+            parties = settings.get("parties") or {}
+            changed = False
+            for party in parties.values():
+                if int(party.get("channel_id") or 0) == channel.id:
+                    party["channel_id"] = None
+                    changed = True
+            if changed:
+                await group.parties.set(parties)
+
+    @commands.Cog.listener()
+    async def on_member_update(
+        self, before: discord.Member, after: discord.Member
+    ) -> None:
+        added_role_ids = {role.id for role in after.roles} - {
+            role.id for role in before.roles
+        }
+        if not added_role_ids:
+            return
+        parties = await self.config.guild(after.guild).parties()
+        for party in parties.values():
+            role_id = int(party.get("role_id") or 0)
+            if role_id not in added_role_ids:
+                continue
+            if after.id in {int(uid) for uid in party.get("member_ids", [])}:
+                continue
+            role = after.guild.get_role(role_id)
+            if role is not None:
+                try:
+                    await after.remove_roles(
+                        role, reason="Private party roles are limited to party members"
+                    )
+                except discord.HTTPException:
+                    log.warning(
+                        "Could not remove unauthorized party role %s from %s",
+                        role_id,
+                        after.id,
+                    )
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -1243,6 +1384,7 @@ class Government(commands.Cog):
                 "description": clean_description or "",
                 "manifesto": clean_manifesto or "",
                 "role_id": None,
+                "channel_id": None,
                 "created_at": unix_now(),
             }
             await self.config.guild(guild).parties.set(parties)
@@ -1280,6 +1422,9 @@ class Government(commands.Cog):
             await self.config.guild(guild).parties.set(parties)
             role, warning = await self._ensure_party_role(guild, party_id, parties)
             _, leader_warning = await self._sync_party_leader_role(guild, parties)
+            _, channel_warning = await self._ensure_party_channel(
+                guild, party_id, parties
+            )
             if role is not None and role not in interaction.user.roles:
                 try:
                     await interaction.user.add_roles(
@@ -1287,7 +1432,7 @@ class Government(commands.Cog):
                     )
                 except discord.HTTPException:
                     warning = "You joined, but I could not assign the party role."
-            warning = warning or leader_warning
+            warning = warning or leader_warning or channel_warning
             message = f"You joined **{selected['name']}** ({len(selected['member_ids'])} members)."
             if warning:
                 message += f"\n⚠️ {warning}"
@@ -1645,6 +1790,15 @@ class Government(commands.Cog):
                     interaction,
                     "A party cannot disband while it is on an active election ballot.",
                 )
+            party_channel = guild.get_channel(int(selected.get("channel_id") or 0))
+            if isinstance(party_channel, discord.TextChannel):
+                try:
+                    await party_channel.delete(reason="Government party disbanded")
+                except discord.Forbidden:
+                    return await self._reply(
+                        interaction,
+                        "I cannot delete the private party channel; check my permissions.",
+                    )
             role = guild.get_role(int(selected.get("role_id") or 0))
             if role is not None:
                 try:
@@ -1658,7 +1812,7 @@ class Government(commands.Cog):
             del parties[party_id]
             await self.config.guild(guild).parties.set(parties)
             _, warning = await self._sync_party_leader_role(guild, parties)
-        message = f"Disbanded **{selected['name']}** and removed its role."
+        message = f"Disbanded **{selected['name']}** and removed its role and private channel."
         if warning:
             message += f"\n⚠️ {warning}"
         await self._reply(interaction, message)
@@ -2074,6 +2228,156 @@ class Government(commands.Cog):
         await self._reply(interaction, message)
 
     @admin.command(
+        name="set-party-category",
+        description="Set the category used for private qualifying-party channels",
+    )
+    async def admin_set_party_category(
+        self, interaction: discord.Interaction, category: discord.CategoryChannel
+    ) -> None:
+        guild = self._guild(interaction)
+        if guild is None or not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        warnings: List[str] = []
+        created_or_synced = 0
+        async with self._lock(guild.id):
+            await self.config.guild(guild).party_channel_category_id.set(category.id)
+            parties = await self.config.guild(guild).parties()
+            for party_id, party in parties.items():
+                if len(party.get("member_ids", [])) < PARTY_CHANNEL_MIN_MEMBERS:
+                    continue
+                role, role_warning = await self._ensure_party_role(
+                    guild, party_id, parties
+                )
+                if role_warning:
+                    warnings.append(f"{party['name']}: {role_warning}")
+                if role is None:
+                    continue
+                channel, channel_warning = await self._ensure_party_channel(
+                    guild, party_id, parties
+                )
+                if channel is not None:
+                    created_or_synced += 1
+                if channel_warning:
+                    warnings.append(f"{party['name']}: {channel_warning}")
+        message = (
+            f"Private party channels will be created in **{category.name}** once "
+            f"a party has {PARTY_CHANNEL_MIN_MEMBERS} members. "
+            f"Created or synchronized {created_or_synced} channel(s)."
+        )
+        if warnings:
+            message += "\n" + "\n".join(f"⚠️ {item}" for item in warnings[:10])
+        await self._reply(interaction, message)
+
+    @admin.command(
+        name="rename-party", description="Rename a party and its managed resources"
+    )
+    async def admin_rename_party(
+        self, interaction: discord.Interaction, party_name: str, new_name: str
+    ) -> None:
+        guild = self._guild(interaction)
+        if guild is None or not await self._require_admin(interaction):
+            return
+        try:
+            clean_name = clean_party_name(new_name)
+        except ValueError as exc:
+            return await self._reply(interaction, str(exc))
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        warnings: List[str] = []
+        async with self._lock(guild.id):
+            parties = await self.config.guild(guild).parties()
+            party_id, selected = self._find_party(parties, party_name)
+            if party_id is None or selected is None:
+                return await self._reply(interaction, "That party does not exist.")
+            if any(
+                other_id != party_id
+                and party.get("name", "").casefold() == clean_name.casefold()
+                for other_id, party in parties.items()
+            ):
+                return await self._reply(
+                    interaction, "A party with that name already exists."
+                )
+            election = await self.config.guild(guild).active_election()
+            if election and any(
+                candidate.get("party_id") == party_id
+                for candidate in election.get("candidates", [])
+            ):
+                return await self._reply(
+                    interaction,
+                    "A party cannot be renamed while it is on an active ballot.",
+                )
+            old_name = selected["name"]
+            selected["name"] = clean_name
+            await self.config.guild(guild).parties.set(parties)
+
+            role = guild.get_role(int(selected.get("role_id") or 0))
+            if role is not None:
+                try:
+                    await role.edit(name=clean_name, reason="Party renamed by admin")
+                except discord.HTTPException:
+                    warnings.append("I could not rename the party role.")
+            channel = guild.get_channel(int(selected.get("channel_id") or 0))
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    await channel.edit(
+                        name=self._party_channel_name(clean_name, party_id),
+                        topic=f"Private channel for {clean_name} • Party ID: {party_id}",
+                        reason="Party renamed by admin",
+                    )
+                except discord.HTTPException:
+                    warnings.append("I could not rename the private party channel.")
+        message = f"Renamed **{old_name}** to **{clean_name}**."
+        if warnings:
+            message += "\n" + "\n".join(f"⚠️ {item}" for item in warnings)
+        await self._reply(interaction, message)
+
+    @admin.command(
+        name="delete-party",
+        description="Permanently delete a party and its managed resources",
+    )
+    async def admin_delete_party(
+        self, interaction: discord.Interaction, party_name: str
+    ) -> None:
+        guild = self._guild(interaction)
+        if guild is None or not await self._require_admin(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with self._lock(guild.id):
+            parties = await self.config.guild(guild).parties()
+            party_id, selected = self._find_party(parties, party_name)
+            if party_id is None or selected is None:
+                return await self._reply(interaction, "That party does not exist.")
+            election = await self.config.guild(guild).active_election()
+            if election and any(
+                candidate.get("party_id") == party_id
+                for candidate in election.get("candidates", [])
+            ):
+                return await self._reply(
+                    interaction,
+                    "A party cannot be deleted while it is on an active ballot.",
+                )
+            channel = guild.get_channel(int(selected.get("channel_id") or 0))
+            try:
+                if isinstance(channel, discord.TextChannel):
+                    await channel.delete(reason="Party deleted by government admin")
+                role = guild.get_role(int(selected.get("role_id") or 0))
+                if role is not None:
+                    await role.delete(reason="Party deleted by government admin")
+            except discord.Forbidden:
+                return await self._reply(
+                    interaction,
+                    "I cannot delete that party's role or channel. Check my permissions and role position.",
+                )
+            Path(selected["icon_path"]).unlink(missing_ok=True)
+            del parties[party_id]
+            await self.config.guild(guild).parties.set(parties)
+            _, warning = await self._sync_party_leader_role(guild, parties)
+        message = f"Deleted **{selected['name']}**, its role, and its private channel."
+        if warning:
+            message += f"\n⚠️ {warning}"
+        await self._reply(interaction, message)
+
+    @admin.command(
         name="start-election", description="Start a 24-hour presidential election"
     )
     async def admin_start_election(self, interaction: discord.Interaction) -> None:
@@ -2272,6 +2576,13 @@ class Government(commands.Cog):
                 _, warning = await self._ensure_party_role(guild, party_id, parties)
                 if warning:
                     warnings.append(f"{parties[party_id]['name']}: {warning}")
+                _, channel_warning = await self._ensure_party_channel(
+                    guild, party_id, parties
+                )
+                if channel_warning:
+                    warnings.append(
+                        f"{parties[party_id]['name']} channel: {channel_warning}"
+                    )
             _, warning = await self._sync_party_leader_role(guild, parties)
             if warning:
                 warnings.append(f"Party Leader role: {warning}")

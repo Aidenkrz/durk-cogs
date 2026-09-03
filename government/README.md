@@ -8,7 +8,7 @@ for persistent button voting.
 
 1. Load `Polls`, then load `Government`.
 2. Run `/government admin setup #channel`. The cog also creates a read-only
-   `current-laws` channel, publishes the four immutable provisions, seeds the
+   `current-laws` channel, publishes the five immutable provisions, seeds the
    six Presidency rules as separate amendable founding laws, and immediately
    backfills every enacted law already in its stored register. Use `/government
    admin set-laws-channel` if you prefer an existing channel.
@@ -19,6 +19,10 @@ for persistent button voting.
 4. Configure a campaign channel so the permissionless `Party Leader` role can
    post there. Only leaders of parties with at least five current members keep
    that shared role.
+5. Run `/government admin set-party-category` to select where private party
+   channels belong. A party receives a private text channel when it exceeds five
+   members. The channel grants access only through that party's role; Discord
+   administrators and the server owner retain their normal override access.
 
 ## Lifecycle
 
@@ -35,6 +39,9 @@ for persistent button voting.
 - At five members, the cog creates a party role with the requested color and
   icon and no permissions. The leader also receives the shared, permissionless
   `Party Leader` role.
+- At six members, the cog creates a private party text channel in the configured
+  category. Membership changes automatically control access through the party
+  role, and unauthorized manual role assignments are removed.
 - An administrator can start an election when no election is open and the
   current term has at most 24 hours remaining. All qualifying parties appear on
   the secret ballot. A unique plurality elects the party leader for 14 days;
@@ -52,9 +59,11 @@ for persistent button voting.
 - `/government law amend` proposes replacement text for an enacted law. A
   successful vote archives the old version as amended and publishes the new
   version. The six founding government rules require two-thirds votes to amend
-  or repeal; the four Immutable Laws are not law records and cannot be targeted.
+  or repeal; the five Immutable Laws are not law records and cannot be targeted.
 - Administrators can void proposals or enacted laws that conflict with the
   immutable Discord, legal, safety, owner-authority, or infrastructure rules.
 
 Use `/government admin reconcile` after manually deleting or moving roles, or
-after correcting a role hierarchy problem.
+after correcting a role hierarchy or channel-permission problem. Administrators
+can also use `/government admin rename-party` and `/government admin
+delete-party` to manage party records and their associated roles/channels.
