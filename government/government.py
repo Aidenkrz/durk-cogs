@@ -267,6 +267,159 @@ class Government(commands.Cog):
             raise ValueError("Party icons must be a PNG, JPEG, or static WebP image.")
         return data, image_type
 
+    async def _send_government_log(
+        self, guild: discord.Guild, embed: discord.Embed
+    ) -> Optional[str]:
+        channel_id = await self.config.guild(guild).channel_id()
+        channel = guild.get_channel(int(channel_id or 0))
+        if not isinstance(channel, discord.TextChannel):
+            return "The government channel is missing, so the event was not logged."
+        try:
+            await channel.send(
+                embed=embed, allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.Forbidden:
+            return "I cannot post event logs in the government channel."
+        except discord.HTTPException:
+            log.exception("Could not post a government event log in %s", guild.id)
+            return "Discord rejected the government event log."
+        return None
+
+    @staticmethod
+    def _official_party_embed(
+        guild: discord.Guild, party_id: str, party: Dict[str, Any]
+    ) -> discord.Embed:
+        leader = guild.get_member(int(party.get("leader_id") or 0))
+        role = guild.get_role(int(party.get("role_id") or 0))
+        channel = guild.get_channel(int(party.get("channel_id") or 0))
+        member_count = len(party.get("member_ids", []))
+        embed = discord.Embed(
+            title="Party Becomes Official",
+            description=(
+                f"**{party['name']}** reached the required "
+                f"{MIN_PARTY_MEMBERS} members and is now an official party."
+            ),
+            colour=discord.Colour(int(party.get("color") or 0)),
+            timestamp=utcnow(),
+        )
+        embed.add_field(
+            name="Leader", value=leader.mention if leader else "Vacant", inline=True
+        )
+        embed.add_field(name="Members", value=str(member_count), inline=True)
+        embed.add_field(
+            name="Party role",
+            value=role.mention if role else "Creation pending",
+            inline=True,
+        )
+        embed.add_field(
+            name="Private channel",
+            value=(
+                channel.mention
+                if isinstance(channel, discord.TextChannel)
+                else "Creation pending"
+            ),
+            inline=True,
+        )
+        embed.set_footer(text=f"Party ID: {party_id}")
+        return embed
+
+    @staticmethod
+    def _party_merger_embed(
+        guild: discord.Guild,
+        party_id: str,
+        party: Dict[str, Any],
+        source_names: List[str],
+    ) -> discord.Embed:
+        leader = guild.get_member(int(party.get("leader_id") or 0))
+        role = guild.get_role(int(party.get("role_id") or 0))
+        channel = guild.get_channel(int(party.get("channel_id") or 0))
+        embed = discord.Embed(
+            title="Party Merger Completed",
+            description=(
+                f"**{source_names[0]}** and **{source_names[1]}** merged to form "
+                f"**{party['name']}**."
+            ),
+            colour=discord.Colour(int(party.get("color") or 0)),
+            timestamp=utcnow(),
+        )
+        embed.add_field(
+            name="Leader", value=leader.mention if leader else "Vacant", inline=True
+        )
+        embed.add_field(
+            name="Members", value=str(len(party.get("member_ids", []))), inline=True
+        )
+        embed.add_field(
+            name="Party role",
+            value=role.mention if role else "Not created",
+            inline=True,
+        )
+        embed.add_field(
+            name="Private channel",
+            value=(
+                channel.mention
+                if isinstance(channel, discord.TextChannel)
+                else "Not created"
+            ),
+            inline=True,
+        )
+        embed.set_footer(text=f"New party ID: {party_id}")
+        return embed
+
+    @staticmethod
+    def _party_leadership_embed(
+        party_id: str,
+        party: Dict[str, Any],
+        previous_leader_id: Optional[int],
+        new_leader_id: Optional[int],
+        reason: str,
+    ) -> discord.Embed:
+        embed = discord.Embed(
+            title="Party Leadership Changed",
+            description=f"Leadership of **{party['name']}** has changed.",
+            colour=discord.Colour(int(party.get("color") or 0)),
+            timestamp=utcnow(),
+        )
+        embed.add_field(
+            name="Previous leader",
+            value=(f"<@{previous_leader_id}>" if previous_leader_id else "Vacant"),
+            inline=True,
+        )
+        embed.add_field(
+            name="New leader",
+            value=f"<@{new_leader_id}>" if new_leader_id else "Vacant",
+            inline=True,
+        )
+        embed.add_field(name="Reason", value=reason, inline=False)
+        embed.set_footer(text=f"Party ID: {party_id}")
+        return embed
+
+    @staticmethod
+    def _party_lifecycle_embed(
+        title: str,
+        party_id: str,
+        party: Dict[str, Any],
+        description: str,
+    ) -> discord.Embed:
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            colour=discord.Colour(int(party.get("color") or 0)),
+            timestamp=utcnow(),
+        )
+        embed.add_field(
+            name="Members",
+            value=str(len(party.get("member_ids", []))),
+            inline=True,
+        )
+        leader_id = int(party.get("leader_id") or 0)
+        embed.add_field(
+            name="Leader",
+            value=f"<@{leader_id}>" if leader_id else "Vacant",
+            inline=True,
+        )
+        embed.set_footer(text=f"Party ID: {party_id}")
+        return embed
+
     async def _ensure_office_roles(
         self, guild: discord.Guild
     ) -> Tuple[discord.Role, discord.Role]:
@@ -1183,18 +1336,62 @@ class Government(commands.Cog):
             settings = await self.config.guild(guild).all()
             parties = settings.get("parties") or {}
             changed = False
-            for party in parties.values():
+            audit_embeds: List[discord.Embed] = []
+            leadership_changed_ids: Set[str] = set()
+            for party_id, party in parties.items():
                 members = [int(uid) for uid in party.get("member_ids", [])]
                 if member.id not in members:
                     continue
+                previous_member_count = len(members)
+                previous_leader_id = int(party.get("leader_id") or 0) or None
                 members.remove(member.id)
                 party["member_ids"] = members
                 if int(party.get("leader_id") or 0) == member.id:
                     party["leader_id"] = members[0] if members else None
+                new_leader_id = int(party.get("leader_id") or 0) or None
+                if previous_leader_id != new_leader_id:
+                    leadership_changed_ids.add(party_id)
+                    if previous_member_count >= MIN_PARTY_MEMBERS:
+                        audit_embeds.append(
+                            self._party_leadership_embed(
+                                party_id,
+                                party,
+                                previous_leader_id,
+                                new_leader_id,
+                                "The previous leader left the server.",
+                            )
+                        )
+                if (
+                    previous_member_count >= MIN_PARTY_MEMBERS
+                    and len(members) < MIN_PARTY_MEMBERS
+                ):
+                    audit_embeds.append(
+                        self._party_lifecycle_embed(
+                            "Party Lost Official Status",
+                            party_id,
+                            party,
+                            f"**{party['name']}** fell below the required "
+                            f"{MIN_PARTY_MEMBERS} members and is no longer eligible for elections.",
+                        )
+                    )
                 changed = True
             if changed:
                 await self.config.guild(guild).parties.set(parties)
+                if leadership_changed_ids:
+                    pending = await self.config.guild(guild).pending_party_merges()
+                    if self._remove_merge_requests_for_parties(
+                        pending, leadership_changed_ids
+                    ):
+                        await self.config.guild(guild).pending_party_merges.set(pending)
                 await self._sync_party_leader_role(guild, parties)
+                for embed in audit_embeds:
+                    warning = await self._send_government_log(guild, embed)
+                    if warning:
+                        log.warning(
+                            "Could not audit member departure in %s: %s",
+                            guild.id,
+                            warning,
+                        )
 
             if int(settings.get("president_id") or 0) == member.id:
                 vice = guild.get_member(int(settings.get("vice_president_id") or 0))
@@ -1470,6 +1667,7 @@ class Government(commands.Cog):
                 "role_id": None,
                 "channel_id": None,
                 "created_at": unix_now(),
+                "official_since": None,
             }
             await self.config.guild(guild).parties.set(parties)
         await self._reply(
@@ -1495,9 +1693,17 @@ class Government(commands.Cog):
                     ctx,
                     "That party does not exist. Use `government party list`.",
                 )
+            previous_member_count = len(selected.get("member_ids", []))
+            previous_leader_id = int(selected.get("leader_id") or 0) or None
             selected.setdefault("member_ids", []).append(ctx.author.id)
             if not selected.get("leader_id"):
                 selected["leader_id"] = ctx.author.id
+            new_leader_id = int(selected.get("leader_id") or 0) or None
+            became_official = (
+                previous_member_count < MIN_PARTY_MEMBERS <= len(selected["member_ids"])
+            )
+            if became_official:
+                selected["official_since"] = unix_now()
             await self.config.guild(guild).parties.set(parties)
             role, warning = await self._ensure_party_role(guild, party_id, parties)
             _, leader_warning = await self._sync_party_leader_role(guild, parties)
@@ -1509,10 +1715,37 @@ class Government(commands.Cog):
                     await ctx.author.add_roles(role, reason="Joined government party")
                 except discord.HTTPException:
                     warning = "You joined, but I could not assign the party role."
+            event_warnings: List[str] = []
+            if became_official:
+                log_warning = await self._send_government_log(
+                    guild, self._official_party_embed(guild, party_id, selected)
+                )
+                if log_warning:
+                    event_warnings.append(log_warning)
+            if (
+                previous_leader_id != new_leader_id
+                and len(selected.get("member_ids", [])) >= MIN_PARTY_MEMBERS
+            ):
+                log_warning = await self._send_government_log(
+                    guild,
+                    self._party_leadership_embed(
+                        party_id,
+                        selected,
+                        previous_leader_id,
+                        new_leader_id,
+                        "A member filled the party's vacant leadership position.",
+                    ),
+                )
+                if log_warning:
+                    event_warnings.append(log_warning)
             warning = warning or leader_warning or channel_warning
             message = f"You joined **{selected['name']}** ({len(selected['member_ids'])} members)."
             if warning:
                 message += f"\n⚠️ {warning}"
+            if event_warnings:
+                message += "\n" + "\n".join(
+                    f"⚠️ {item}" for item in dict.fromkeys(event_warnings)
+                )
         await self._reply(ctx, message)
 
     @party.command(name="leave")
@@ -1526,6 +1759,8 @@ class Government(commands.Cog):
             party_id, selected = self._party_for_user(parties, ctx.author.id)
             if selected is None or party_id is None:
                 return await self._reply(ctx, "You do not belong to a party.")
+            previous_member_count = len(selected.get("member_ids", []))
+            previous_leader_id = int(selected.get("leader_id") or 0) or None
             members = [
                 int(uid)
                 for uid in selected.get("member_ids", [])
@@ -1534,12 +1769,51 @@ class Government(commands.Cog):
             selected["member_ids"] = members
             if int(selected.get("leader_id") or 0) == ctx.author.id:
                 selected["leader_id"] = members[0] if members else None
+            new_leader_id = int(selected.get("leader_id") or 0) or None
             await self.config.guild(guild).parties.set(parties)
             await self._remove_role(ctx.author, selected.get("role_id"))
             _, warning = await self._sync_party_leader_role(guild, parties)
+            event_warnings: List[str] = []
+            if previous_leader_id != new_leader_id:
+                pending = await self.config.guild(guild).pending_party_merges()
+                if self._remove_merge_requests_for_parties(pending, {party_id}):
+                    await self.config.guild(guild).pending_party_merges.set(pending)
+                if previous_member_count >= MIN_PARTY_MEMBERS:
+                    log_warning = await self._send_government_log(
+                        guild,
+                        self._party_leadership_embed(
+                            party_id,
+                            selected,
+                            previous_leader_id,
+                            new_leader_id,
+                            "The previous leader left the party.",
+                        ),
+                    )
+                    if log_warning:
+                        event_warnings.append(log_warning)
+            if (
+                previous_member_count >= MIN_PARTY_MEMBERS
+                and len(members) < MIN_PARTY_MEMBERS
+            ):
+                log_warning = await self._send_government_log(
+                    guild,
+                    self._party_lifecycle_embed(
+                        "Party Lost Official Status",
+                        party_id,
+                        selected,
+                        f"**{selected['name']}** fell below the required "
+                        f"{MIN_PARTY_MEMBERS} members and is no longer eligible for elections.",
+                    ),
+                )
+                if log_warning:
+                    event_warnings.append(log_warning)
         message = f"You left **{selected['name']}**."
         if warning:
             message += f"\n⚠️ {warning}"
+        if event_warnings:
+            message += "\n" + "\n".join(
+                f"⚠️ {item}" for item in dict.fromkeys(event_warnings)
+            )
         await self._reply(ctx, message)
 
     @party.command(name="list")
@@ -1849,12 +2123,29 @@ class Government(commands.Cog):
                 )
             selected["leader_id"] = member.id
             await self.config.guild(guild).parties.set(parties)
+            pending = await self.config.guild(guild).pending_party_merges()
+            if self._remove_merge_requests_for_parties(pending, {party_id}):
+                await self.config.guild(guild).pending_party_merges.set(pending)
             _, warning = await self._sync_party_leader_role(guild, parties)
+            log_warning = None
+            if len(selected.get("member_ids", [])) >= MIN_PARTY_MEMBERS:
+                log_warning = await self._send_government_log(
+                    guild,
+                    self._party_leadership_embed(
+                        party_id,
+                        selected,
+                        ctx.author.id,
+                        member.id,
+                        "Leadership was transferred by the previous leader.",
+                    ),
+                )
         message = (
             f"Transferred leadership of **{selected['name']}** to {member.mention}."
         )
         if warning:
             message += f"\n⚠️ {warning}"
+        if log_warning:
+            message += f"\n⚠️ {log_warning}"
         await self._reply(ctx, message, ephemeral=False)
 
     @party.group(name="merge", invoke_without_command=True)
@@ -2062,6 +2353,9 @@ class Government(commands.Cog):
                 "role_id": None,
                 "channel_id": None,
                 "created_at": unix_now(),
+                "official_since": (
+                    unix_now() if len(member_ids) >= MIN_PARTY_MEMBERS else None
+                ),
                 "merged_from": [
                     {"party_id": source_ids[0], "name": first["name"]},
                     {"party_id": source_ids[1], "name": second["name"]},
@@ -2098,6 +2392,17 @@ class Government(commands.Cog):
             _, leader_warning = await self._sync_party_leader_role(guild, parties)
             if leader_warning:
                 warnings.append(leader_warning)
+            log_warning = await self._send_government_log(
+                guild,
+                self._party_merger_embed(
+                    guild,
+                    new_party_id,
+                    merged_party,
+                    [first["name"], second["name"]],
+                ),
+            )
+            if log_warning:
+                warnings.append(log_warning)
 
         message = (
             f"Merged **{first['name']}** and **{second['name']}** into "
@@ -2183,9 +2488,22 @@ class Government(commands.Cog):
             if self._remove_merge_requests_for_parties(pending, {party_id}):
                 await self.config.guild(guild).pending_party_merges.set(pending)
             _, warning = await self._sync_party_leader_role(guild, parties)
+            log_warning = None
+            if len(selected.get("member_ids", [])) >= MIN_PARTY_MEMBERS:
+                log_warning = await self._send_government_log(
+                    guild,
+                    self._party_lifecycle_embed(
+                        "Official Party Disbanded",
+                        party_id,
+                        selected,
+                        f"**{selected['name']}** was disbanded by its leader.",
+                    ),
+                )
         message = f"Disbanded **{selected['name']}** and removed its role and private channel."
         if warning:
             message += f"\n⚠️ {warning}"
+        if log_warning:
+            message += f"\n⚠️ {log_warning}"
         await self._reply(ctx, message)
 
     @government.command(name="appoint")
@@ -2653,7 +2971,76 @@ class Government(commands.Cog):
                     )
                 except discord.HTTPException:
                     warnings.append("I could not rename the private party channel.")
+            if len(selected.get("member_ids", [])) >= MIN_PARTY_MEMBERS:
+                log_warning = await self._send_government_log(
+                    guild,
+                    self._party_lifecycle_embed(
+                        "Official Party Renamed",
+                        party_id,
+                        selected,
+                        f"**{old_name}** was renamed to **{clean_name}** by an administrator.",
+                    ),
+                )
+                if log_warning:
+                    warnings.append(log_warning)
         message = f"Renamed **{old_name}** to **{clean_name}**."
+        if warnings:
+            message += "\n" + "\n".join(f"⚠️ {item}" for item in warnings)
+        await self._reply(ctx, message)
+
+    @admin.command(name="set-party-leader")
+    async def admin_set_party_leader(
+        self, ctx: commands.Context, party_name: str, member: discord.Member
+    ) -> None:
+        """Set a party's leader. Quote a multi-word party name."""
+        guild = self._guild(ctx)
+        if guild is None or not await self._require_admin(ctx):
+            return
+        if member.bot:
+            return await self._reply(ctx, "A bot cannot lead a political party.")
+        warnings: List[str] = []
+        async with self._lock(guild.id):
+            parties = await self.config.guild(guild).parties()
+            party_id, selected = self._find_party(parties, party_name)
+            if party_id is None or selected is None:
+                return await self._reply(ctx, "That party does not exist.")
+            if member.id not in {
+                int(user_id) for user_id in selected.get("member_ids", [])
+            }:
+                return await self._reply(
+                    ctx, "The new leader must already be a member of that party."
+                )
+            previous_leader_id = int(selected.get("leader_id") or 0) or None
+            if previous_leader_id == member.id:
+                return await self._reply(ctx, "That member already leads this party.")
+            election = await self.config.guild(guild).active_election()
+            if self._party_is_on_ballot(election, {party_id}):
+                return await self._reply(
+                    ctx,
+                    "A party's leader cannot change while it is on an active ballot.",
+                )
+            selected["leader_id"] = member.id
+            await self.config.guild(guild).parties.set(parties)
+            pending = await self.config.guild(guild).pending_party_merges()
+            if self._remove_merge_requests_for_parties(pending, {party_id}):
+                await self.config.guild(guild).pending_party_merges.set(pending)
+            _, leader_warning = await self._sync_party_leader_role(guild, parties)
+            if leader_warning:
+                warnings.append(leader_warning)
+            if len(selected.get("member_ids", [])) >= MIN_PARTY_MEMBERS:
+                log_warning = await self._send_government_log(
+                    guild,
+                    self._party_leadership_embed(
+                        party_id,
+                        selected,
+                        previous_leader_id,
+                        member.id,
+                        "Leadership was changed by an administrator.",
+                    ),
+                )
+                if log_warning:
+                    warnings.append(log_warning)
+        message = f"Set {member.mention} as leader of **{selected['name']}**."
         if warnings:
             message += "\n" + "\n".join(f"⚠️ {item}" for item in warnings)
         await self._reply(ctx, message)
@@ -2699,9 +3086,22 @@ class Government(commands.Cog):
             if self._remove_merge_requests_for_parties(pending, {party_id}):
                 await self.config.guild(guild).pending_party_merges.set(pending)
             _, warning = await self._sync_party_leader_role(guild, parties)
+            log_warning = None
+            if len(selected.get("member_ids", [])) >= MIN_PARTY_MEMBERS:
+                log_warning = await self._send_government_log(
+                    guild,
+                    self._party_lifecycle_embed(
+                        "Official Party Deleted",
+                        party_id,
+                        selected,
+                        f"**{selected['name']}** was deleted by an administrator.",
+                    ),
+                )
         message = f"Deleted **{selected['name']}**, its role, and its private channel."
         if warning:
             message += f"\n⚠️ {warning}"
+        if log_warning:
+            message += f"\n⚠️ {log_warning}"
         await self._reply(ctx, message)
 
     @admin.command(name="start-election")

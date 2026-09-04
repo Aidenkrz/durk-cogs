@@ -10,8 +10,10 @@ for persistent button voting.
 2. Run `[p]government admin setup #channel`. The cog also creates a read-only
    `current-laws` channel, publishes the five immutable provisions, seeds the
    six Presidency rules as separate amendable founding laws, and immediately
-   backfills every enacted law already in its stored register. Use `[p]government
-   admin set-laws-channel` if you prefer an existing channel.
+   backfills every enacted law already in its stored register. The configured
+   government channel also receives election, law, and official-party audit
+   logs. Use `[p]government admin set-laws-channel` if you prefer an existing
+   laws channel.
 3. Put the bot's role above the roles it creates and grant it **Manage Roles**,
    **Manage Channels**, **Manage Messages**, **Send Messages**, **Embed Links**,
    **Add Reactions**, and **Read Message History**. **Create Public Threads** is
@@ -47,6 +49,9 @@ for persistent button voting.
 - At five members, the cog creates a private party text channel in the configured
   category. Membership changes automatically control access through the party
   role, and unauthorized manual role assignments are removed.
+- The government channel logs parties gaining or losing official status,
+  leadership changes in official parties, completed mergers, official-party
+  renames, and official-party deletion or disbanding.
 - An administrator can start an election when no election is open and the
   current term has at most 24 hours remaining. All qualifying parties appear on
   the secret ballot. A unique plurality elects the party leader for 14 days;
@@ -90,6 +95,7 @@ Useful prefix examples:
 - `[p]government law propose ordinary "Park Rules" Be respectful in the park.`
 - `[p]government law amend 3 "Updated Park Rules" Replacement law text here.`
 - `[p]government admin rename-party "Old Party" New Party`
+- `[p]government admin set-party-leader "Party Name" @Member`
 - `[p]government admin delete-party Party Name`
 
 The party list uses one message with reaction controls to move between pages.
