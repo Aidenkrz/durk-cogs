@@ -138,6 +138,22 @@ class Government(commands.Cog):
         self.config = Config.get_conf(
             self, identifier=0xC0715717A710, force_registration=True
         )
+
+        # Config instances are cached by Red across cog reloads. Older versions
+        # registered active_election as None, but it contains a mapping while an
+        # election is running. Normalize that stale in-memory default before
+        # registering the corrected schema so this migration does not require a
+        # full bot restart or discard the persisted election.
+        registered_guild_defaults = getattr(self.config, "_defaults", {}).get(
+            self.config.GUILD
+        )
+        if (
+            isinstance(registered_guild_defaults, dict)
+            and "active_election" in registered_guild_defaults
+            and not isinstance(registered_guild_defaults["active_election"], dict)
+        ):
+            registered_guild_defaults["active_election"] = {}
+
         self.config.register_guild(
             channel_id=None,
             laws_channel_id=None,
