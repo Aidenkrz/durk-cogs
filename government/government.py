@@ -156,7 +156,10 @@ class Government(commands.Cog):
             vice_president_id=None,
             term_started_at=None,
             term_ends_at=None,
-            active_election=None,
+            # This value stores a nested mapping while an election is active.
+            # Red Config requires mapping-valued data to have a mapping default;
+            # using None here makes guild().all() crash during an election.
+            active_election={},
             election_history=[],
             laws={},
             next_law_number=1,
@@ -1150,7 +1153,7 @@ class Government(commands.Cog):
         async with self.config.guild(guild).election_history() as history:
             history.append(record)
             del history[:-20]
-        await self.config.guild(guild).active_election.set(None)
+        await self.config.guild(guild).active_election.set({})
 
         channel = guild.get_channel(int(settings.get("channel_id") or 0))
         if channel is not None:
@@ -1258,7 +1261,7 @@ class Government(commands.Cog):
             if api is not None and election:
                 election_poll = await api.get_poll(election.get("poll_id"))
                 if election_poll is None or election_poll.status == "cancelled":
-                    await self.config.guild(guild).active_election.set(None)
+                    await self.config.guild(guild).active_election.set({})
                 elif election_poll.status == "closed":
                     await self._finish_election(guild, election_poll)
 
@@ -1315,7 +1318,7 @@ class Government(commands.Cog):
             settings = await self.config.guild(guild).all()
             election = settings.get("active_election")
             if election and election.get("poll_id") == getattr(poll, "id", None):
-                await self.config.guild(guild).active_election.set(None)
+                await self.config.guild(guild).active_election.set({})
             async with self.config.guild(guild).laws() as laws:
                 for law in laws.values():
                     if (
