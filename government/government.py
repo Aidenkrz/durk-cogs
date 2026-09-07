@@ -566,6 +566,7 @@ class Government(commands.Cog):
                     permissions=discord.Permissions.none(),
                     colour=discord.Colour(int(party["color"])),
                     display_icon=icon,
+                    mentionable=False,
                     reason="Party reached five members",
                 )
                 party["role_id"] = role.id
@@ -576,6 +577,7 @@ class Government(commands.Cog):
                     permissions=discord.Permissions.none(),
                     colour=discord.Colour(int(party["color"])),
                     display_icon=icon,
+                    mentionable=False,
                     reason="Synchronize government party role",
                 )
 
@@ -1761,6 +1763,94 @@ class Government(commands.Cog):
         )
         embed.add_field(name="Enacted laws", value=str(enacted))
         await ctx.send(embed=embed)
+
+    @government.command(name="pingparty", aliases=("ping-party",))
+    async def government_ping_party(self, ctx: commands.Context) -> None:
+        """Ping your party's role. Only the party's current leader may use this."""
+        guild = self._guild(ctx)
+        if guild is None or not isinstance(ctx.author, discord.Member):
+            return await self._reply(ctx, "This command can only be used in a server.")
+
+        ping_error: Optional[str] = None
+        restore_warning: Optional[str] = None
+        async with self._lock(guild.id):
+            parties = await self.config.guild(guild).parties()
+            _, selected = self._party_for_user(parties, ctx.author.id)
+            if selected is None or int(selected.get("leader_id") or 0) != ctx.author.id:
+                return await self._reply(
+                    ctx, "Only your party's current leader can ping its role."
+                )
+
+            role = guild.get_role(int(selected.get("role_id") or 0))
+            if role is None:
+                return await self._reply(
+                    ctx,
+                    f"**{selected['name']}** does not have a party role yet. "
+                    f"Party roles are created at {MIN_PARTY_MEMBERS} members.",
+                )
+
+            bot_member = guild.me
+            permissions_for = getattr(ctx.channel, "permissions_for", None)
+            bot_can_mention_roles = bool(
+                bot_member is not None
+                and permissions_for is not None
+                and permissions_for(bot_member).mention_everyone
+            )
+            temporarily_mentionable = False
+            try:
+                if not role.mentionable and not bot_can_mention_roles:
+                    role = await role.edit(
+                        mentionable=True,
+                        reason=(
+                            f"Party ping requested by leader {ctx.author} "
+                            f"({ctx.author.id})"
+                        ),
+                    )
+                    temporarily_mentionable = True
+                await ctx.send(
+                    f"{role.mention} — party ping requested by {ctx.author.mention}.",
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False,
+                        users=False,
+                        roles=[role],
+                        replied_user=False,
+                    ),
+                )
+            except discord.Forbidden:
+                ping_error = (
+                    "I could not ping your party role. Check my Send Messages and "
+                    "Manage Roles permissions, or grant me Mention Everyone in this "
+                    "channel."
+                )
+            except discord.HTTPException:
+                log.exception(
+                    "Could not ping party role %s in guild %s", role.id, guild.id
+                )
+                ping_error = "Discord rejected the party ping. Please try again."
+            finally:
+                if temporarily_mentionable:
+                    try:
+                        await role.edit(
+                            mentionable=False,
+                            reason="Restore party role after leader ping",
+                        )
+                    except discord.HTTPException:
+                        log.exception(
+                            "Could not restore party role %s mentionability in guild %s",
+                            role.id,
+                            guild.id,
+                        )
+                        restore_warning = (
+                            "I could not make the party role non-mentionable again. "
+                            "An administrator should run `government admin reconcile`."
+                        )
+
+        if ping_error:
+            if restore_warning:
+                ping_error += f"\n⚠️ {restore_warning}"
+            return await self._reply(ctx, ping_error)
+        if restore_warning:
+            await self._reply(ctx, f"⚠️ {restore_warning}")
 
     @slash_party.command(
         name="create", description="Create a party and become its leader"

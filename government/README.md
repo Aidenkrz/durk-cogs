@@ -41,6 +41,10 @@ for persistent button voting.
 - Party leaders can update those fields with `/government party edit`; entering
   `-` clears a slogan, description, or manifesto. Profiles intentionally have
   no website field or public application button.
+- A party's current leader can use `[p]government pingparty` (or the shorter
+  `[p]gov pingparty`) to ping that party's role. The command temporarily makes a
+  non-mentionable party role mentionable only when the bot lacks permission to
+  mention it directly, then restores the role immediately after sending.
 - A leader can propose a merger with `[p]government party merge propose @OtherLeader New Party Name`.
   The invited leader has 24 hours to accept. Once accepted, memberships are
   combined into a newly named party led by the proposer. It inherits the
@@ -100,6 +104,7 @@ Useful prefix examples:
 - `[p]government party join Party Name`
 - `[p]government party merge propose @OtherLeader New Party Name`
 - `[p]government party merge accept abc123`
+- `[p]gov pingparty`
 - `[p]government law propose ordinary "Park Rules" Be respectful in the park.`
 - `[p]government law amend 3 "Updated Park Rules" Replacement law text here.`
 - `[p]government law cancel 7 Proposal withdrawn for revision.`
