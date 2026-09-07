@@ -25,8 +25,8 @@ MERGE_REQUEST_SECONDS = DAY_SECONDS
 MIN_PARTY_MEMBERS = 5
 PARTY_CHANNEL_MIN_MEMBERS = MIN_PARTY_MEMBERS
 PARTY_RESOURCES_VERSION = 1
-CONSTITUTION_VERSION = 3
-LAW_DATA_VERSION = 1
+CONSTITUTION_VERSION = 4
+LAW_DATA_VERSION = 2
 MAX_ICON_BYTES = 256 * 1024
 MAX_PARTY_NAME = 50
 MAX_PARTY_SLOGAN = 100
@@ -759,8 +759,32 @@ class Government(commands.Cog):
                 del laws[law_id]
                 changed = True
 
+        constitutional_law_id = next(
+            (
+                law_id
+                for law_id, law in laws.items()
+                if law.get("source") == "founding_constitution"
+                and law.get("title") == "Constitutional Amendments"
+            ),
+            None,
+        )
+        if constitutional_law_id not in {None, "5"} and "5" not in laws:
+            laws["5"] = laws.pop(constitutional_law_id)
+            for law in laws.values():
+                if str(law.get("target_law_id")) == constitutional_law_id:
+                    law["target_law_id"] = "5"
+            changed = True
+
         if changed:
             await group.laws.set(laws)
+            next_number = (
+                max(
+                    (int(law_id) for law_id in laws if str(law_id).isdigit()),
+                    default=0,
+                )
+                + 1
+            )
+            await group.next_law_number.set(next_number)
         await group.law_data_version.set(LAW_DATA_VERSION)
         return changed
 
@@ -948,6 +972,14 @@ class Government(commands.Cog):
             raise ValueError(
                 "An administrator must first run `government admin setup #channel`."
             )
+        if self._polls_api() is None:
+            raise ValueError("The Polls cog must be loaded before proposing a law.")
+        if isinstance(channel, discord.TextChannel) and guild.me is not None:
+            permissions = channel.permissions_for(guild.me)
+            if not permissions.create_public_threads:
+                raise ValueError(
+                    "I need Create Public Threads in the government channel."
+                )
         number = int(settings.get("next_law_number") or 1)
         law_id = str(number)
         vote_end = unix_now() + LAW_VOTE_SECONDS
@@ -981,13 +1013,10 @@ class Government(commands.Cog):
         )
         thread_id = None
         if isinstance(channel, discord.TextChannel):
-            try:
-                thread = await message.create_thread(
-                    name=f"Discussion: Law {law_id} - {title}"[:100]
-                )
-                thread_id = thread.id
-            except discord.HTTPException:
-                pass
+            thread = await message.create_thread(
+                name=f"Discussion: Law {law_id} - {title}"[:100]
+            )
+            thread_id = thread.id
 
         laws = settings.get("laws") or {}
         laws[law_id] = {
@@ -1019,14 +1048,11 @@ class Government(commands.Cog):
         channel = guild.get_channel(int(law.get("channel_id") or 0))
         if channel is None:
             raise RuntimeError("The configured government channel no longer exists.")
-        vote_channel: discord.abc.Messageable = channel
         thread = guild.get_thread(int(law.get("thread_id") or 0))
-        if thread is not None:
-            if thread.archived:
-                await thread.edit(
-                    archived=False, reason=f"Open voting for Law {law_id}"
-                )
-            vote_channel = thread
+        if thread is not None and thread.archived:
+            await thread.edit(
+                archived=False, reason=f"Open discussion for Law {law_id}"
+            )
         requirement = (
             "two-thirds" if law["kind"] == "amendment" else "a simple majority"
         )
@@ -1036,7 +1062,7 @@ class Government(commands.Cog):
         target_law_id = law.get("target_law_id")
         poll = await api.create_poll(
             guild=guild,
-            channel=vote_channel,
+            channel=channel,
             author_id=int(law["proposer_id"]),
             question=(
                 f"Law {law_id}: repeal Law {target_law_id}?"
@@ -1070,7 +1096,7 @@ class Government(commands.Cog):
             current["vote_started_at"] = unix_now()
             current["vote_ends_at"] = int(poll.closes_at.timestamp())
         try:
-            await vote_channel.send(
+            await channel.send(
                 f"The 12-hour vote for **Law {law_id}** is now open and requires "
                 f"{requirement} to pass.",
                 allowed_mentions=discord.AllowedMentions.none(),
@@ -2648,6 +2674,10 @@ class Government(commands.Cog):
                 return await self._reply(
                     ctx, "I cannot post in the configured government channel."
                 )
+            except discord.HTTPException:
+                return await self._reply(
+                    ctx, "Discord rejected the law thread or poll creation. Try again."
+                )
         await self._reply(
             ctx,
             f"Law {law_id} has a discussion thread and its 12-hour vote is now open.",
@@ -2712,6 +2742,10 @@ class Government(commands.Cog):
             except discord.Forbidden:
                 return await self._reply(
                     ctx, "I cannot post in the configured government channel."
+                )
+            except discord.HTTPException:
+                return await self._reply(
+                    ctx, "Discord rejected the law thread or poll creation. Try again."
                 )
         await self._reply(
             ctx,
@@ -2784,6 +2818,10 @@ class Government(commands.Cog):
                 return await self._reply(
                     ctx, "I cannot post in the configured government channel."
                 )
+            except discord.HTTPException:
+                return await self._reply(
+                    ctx, "Discord rejected the law thread or poll creation. Try again."
+                )
         await self._reply(
             ctx,
             f"Amendment proposal Law {amendment_id} has a discussion thread and its 12-hour vote is now open. If it passes, it will replace Law {target_id} in current laws.",
@@ -2817,8 +2855,9 @@ class Government(commands.Cog):
                 int(settings.get("president_id") or 0) == ctx.author.id
                 and int(settings.get("term_ends_at") or 0) > unix_now()
             )
-            is_admin = ctx.author.guild_permissions.administrator or await self.bot.is_owner(
-                ctx.author
+            is_admin = (
+                ctx.author.guild_permissions.administrator
+                or await self.bot.is_owner(ctx.author)
             )
             if not is_president and not is_admin:
                 return await self._reply(
@@ -2844,7 +2883,7 @@ class Government(commands.Cog):
                 )
             if poll is not None and poll.status == "open":
                 try:
-                    await api.close_poll(poll.id)
+                    closed_poll = await api.close_poll(poll.id)
                 except Exception:
                     log.exception(
                         "Could not cancel poll %s for Law %s", poll.id, target_id
@@ -2852,13 +2891,18 @@ class Government(commands.Cog):
                     return await self._reply(
                         ctx, "I could not close that law's poll. Check the console."
                     )
+                if closed_poll.status == "closed":
+                    await self._finish_law_vote(guild, closed_poll)
+                    return await self._reply(
+                        ctx,
+                        "That vote closed before it could be cancelled; its result "
+                        "has now been processed.",
+                    )
 
             async with self.config.guild(guild).laws() as laws:
                 current = laws.get(target_id)
                 if current is None or current.get("status") != "voting":
-                    return await self._reply(
-                        ctx, "That law vote is no longer open."
-                    )
+                    return await self._reply(ctx, "That law vote is no longer open.")
                 current["status"] = "cancelled"
                 current["decided_at"] = unix_now()
                 current["cancelled_by"] = ctx.author.id
@@ -2920,6 +2964,12 @@ class Government(commands.Cog):
             embed.add_field(
                 name="Vote",
                 value=f"{law['approve_votes']} approve / {law['reject_votes']} reject",
+                inline=False,
+            )
+        if law.get("status") == "cancelled" and law.get("cancel_reason"):
+            embed.add_field(
+                name="Cancellation reason",
+                value=law["cancel_reason"],
                 inline=False,
             )
         await ctx.send(embed=embed)

@@ -17,7 +17,7 @@ for persistent button voting.
 3. Put the bot's role above the roles it creates and grant it **Manage Roles**,
    **Manage Channels**, **Manage Messages**, **Send Messages**, **Embed Links**,
    **Add Reactions**, **Read Message History**, and **Create Public Threads** so
-   it can create law discussion and voting threads.
+   it can create law discussion threads.
 4. Configure a campaign channel so the permissionless `Party Leader` role can
    post there. Only leaders of parties with at least five current members keep
    that shared role.
@@ -60,8 +60,9 @@ for persistent button voting.
   or an administrator vacates the office, the Vice President serves the rest of
   the existing term.
 - A presidential law proposal immediately creates a public discussion thread
-  containing a 12-hour vote. Ordinary laws need more approvals than rejections;
-  constitutional amendments need at least two-thirds approval.
+  and posts a 12-hour vote in the government channel. Ordinary laws need more
+  approvals than rejections; constitutional amendments need at least two-thirds
+  approval.
 - `[p]government law cancel <law ID> [reason]` lets the sitting President or an
   administrator cancel a law vote while it is open.
 - `[p]government law repeal` lets the President propose removing an enacted law.
