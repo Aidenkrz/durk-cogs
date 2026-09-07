@@ -64,7 +64,9 @@ for persistent button voting.
   approvals than rejections; constitutional amendments need at least two-thirds
   approval.
 - `[p]government law cancel <law ID> [reason]` lets the sitting President or an
-  administrator cancel a law vote while it is open.
+  administrator cancel a law vote while it is open. A withdrawn proposal is
+  archived for auditing and its unused law number becomes available again;
+  rejected proposals continue to retain their numbers.
 - `[p]government law repeal` lets the President propose removing an enacted law.
   Repeals use the same discussion and voting requirements as the target law;
   once passed, the old law is removed from `current-laws` while its historical

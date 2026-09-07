@@ -26,7 +26,7 @@ MIN_PARTY_MEMBERS = 5
 PARTY_CHANNEL_MIN_MEMBERS = MIN_PARTY_MEMBERS
 PARTY_RESOURCES_VERSION = 1
 CONSTITUTION_VERSION = 4
-LAW_DATA_VERSION = 2
+LAW_DATA_VERSION = 3
 MAX_ICON_BYTES = 256 * 1024
 MAX_PARTY_NAME = 50
 MAX_PARTY_SLOGAN = 100
@@ -176,6 +176,7 @@ class Government(commands.Cog):
             active_election={},
             election_history=[],
             laws={},
+            cancelled_law_history=[],
             law_data_version=0,
             next_law_number=1,
         )
@@ -775,16 +776,28 @@ class Government(commands.Cog):
                     law["target_law_id"] = "5"
             changed = True
 
+        cancelled_history = await group.cancelled_law_history()
+        archived_cancelled = False
+        for law_id, law in list(laws.items()):
+            if law.get("status") != "cancelled":
+                continue
+            archived = dict(law)
+            archived.setdefault("former_law_id", law_id)
+            archived.setdefault("cancel_reason", "Cancelled before this migration.")
+            cancelled_history.append(archived)
+            del laws[law_id]
+            archived_cancelled = True
+            changed = True
+
         if changed:
             await group.laws.set(laws)
-            next_number = (
-                max(
-                    (int(law_id) for law_id in laws if str(law_id).isdigit()),
-                    default=0,
-                )
-                + 1
-            )
+            used_numbers = {int(law_id) for law_id in laws if str(law_id).isdigit()}
+            next_number = 1
+            while next_number in used_numbers:
+                next_number += 1
             await group.next_law_number.set(next_number)
+        if archived_cancelled:
+            await group.cancelled_law_history.set(cancelled_history[-50:])
         await group.law_data_version.set(LAW_DATA_VERSION)
         return changed
 
@@ -980,7 +993,10 @@ class Government(commands.Cog):
                 raise ValueError(
                     "I need Create Public Threads in the government channel."
                 )
+        laws = settings.get("laws") or {}
         number = int(settings.get("next_law_number") or 1)
+        while str(number) in laws:
+            number += 1
         law_id = str(number)
         vote_end = unix_now() + LAW_VOTE_SECONDS
         embed = discord.Embed(
@@ -1018,7 +1034,6 @@ class Government(commands.Cog):
             )
             thread_id = thread.id
 
-        laws = settings.get("laws") or {}
         laws[law_id] = {
             "title": title,
             "text": text,
@@ -1038,6 +1053,43 @@ class Government(commands.Cog):
         await self.config.guild(guild).next_law_number.set(number + 1)
         await self._start_law_vote(guild, law_id, laws[law_id])
         return law_id
+
+    async def _withdraw_law_record(
+        self,
+        guild: discord.Guild,
+        law_id: str,
+        *,
+        cancelled_by: Optional[int],
+        reason: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Archive a cancelled proposal and release its number for reuse."""
+        group = self.config.guild(guild)
+        withdrawn: Optional[Dict[str, Any]] = None
+        async with group.laws() as laws:
+            current = laws.get(law_id)
+            if current is None or current.get("status") != "voting":
+                return None
+            withdrawn = dict(current)
+            del laws[law_id]
+
+        cancelled_at = unix_now()
+        withdrawn.update(
+            {
+                "former_law_id": law_id,
+                "status": "cancelled",
+                "decided_at": cancelled_at,
+                "cancelled_by": cancelled_by,
+                "cancel_reason": reason,
+            }
+        )
+        async with group.cancelled_law_history() as history:
+            history.append(withdrawn)
+            del history[:-50]
+
+        if law_id.isdigit():
+            next_number = int(await group.next_law_number() or 1)
+            await group.next_law_number.set(min(next_number, int(law_id)))
+        return withdrawn
 
     async def _start_law_vote(
         self, guild: discord.Guild, law_id: str, law: Dict[str, Any]
@@ -1347,11 +1399,12 @@ class Government(commands.Cog):
                         continue
                     law_poll = await api.get_poll(law["poll_id"])
                     if law_poll is None or law_poll.status == "cancelled":
-                        async with self.config.guild(guild).laws() as laws:
-                            current = laws.get(law_id)
-                            if current and current.get("status") == "voting":
-                                current["status"] = "cancelled"
-                                current["decided_at"] = now
+                        await self._withdraw_law_record(
+                            guild,
+                            law_id,
+                            cancelled_by=None,
+                            reason="The associated poll was cancelled or removed.",
+                        )
                     elif law_poll.status == "closed":
                         await self._finish_law_vote(guild, law_poll)
 
@@ -1392,14 +1445,22 @@ class Government(commands.Cog):
             election = settings.get("active_election")
             if election and election.get("poll_id") == getattr(poll, "id", None):
                 await self.config.guild(guild).active_election.set({})
-            async with self.config.guild(guild).laws() as laws:
-                for law in laws.values():
-                    if (
-                        law.get("poll_id") == getattr(poll, "id", None)
-                        and law.get("status") == "voting"
-                    ):
-                        law["status"] = "cancelled"
-                        law["decided_at"] = unix_now()
+            cancelled_law_id = next(
+                (
+                    law_id
+                    for law_id, law in (settings.get("laws") or {}).items()
+                    if law.get("poll_id") == getattr(poll, "id", None)
+                    and law.get("status") == "voting"
+                ),
+                None,
+            )
+            if cancelled_law_id is not None:
+                await self._withdraw_law_record(
+                    guild,
+                    cancelled_law_id,
+                    cancelled_by=None,
+                    reason="The associated poll was cancelled or removed.",
+                )
 
     @commands.Cog.listener()
     async def on_poll_deleted(self, poll: Any) -> None:
@@ -2899,27 +2960,32 @@ class Government(commands.Cog):
                         "has now been processed.",
                     )
 
-            async with self.config.guild(guild).laws() as laws:
-                current = laws.get(target_id)
-                if current is None or current.get("status") != "voting":
-                    return await self._reply(ctx, "That law vote is no longer open.")
-                current["status"] = "cancelled"
-                current["decided_at"] = unix_now()
-                current["cancelled_by"] = ctx.author.id
-                current["cancel_reason"] = reason
+            withdrawn = await self._withdraw_law_record(
+                guild,
+                target_id,
+                cancelled_by=ctx.author.id,
+                reason=reason,
+            )
+            if withdrawn is None:
+                return await self._reply(ctx, "That law vote is no longer open.")
 
             channel = guild.get_channel(int(settings.get("channel_id") or 0))
             if channel is not None:
                 try:
                     await channel.send(
-                        f"**Law {target_id}: {law['title']}** was cancelled by "
-                        f"{ctx.author.mention}.\n**Reason:** {reason}",
+                        f"The proposal formerly numbered **Law {target_id}: "
+                        f"{law['title']}** was cancelled by {ctx.author.mention}; "
+                        "that law number is available again."
+                        f"\n**Reason:** {reason}",
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                 except discord.HTTPException:
                     log.exception("Could not log cancellation of Law %s", target_id)
 
-        await self._reply(ctx, f"Cancelled the vote for Law {target_id}.")
+        await self._reply(
+            ctx,
+            f"Cancelled the vote for Law {target_id}; that number is available again.",
+        )
 
     @law.command(name="list")
     async def law_list(self, ctx: commands.Context) -> None:
@@ -3570,3 +3636,14 @@ class Government(commands.Cog):
                     laws_changed = True
             if laws_changed:
                 await group.laws.set(laws)
+            cancelled_laws = settings.get("cancelled_law_history") or []
+            cancelled_laws_changed = False
+            for law in cancelled_laws:
+                if int(law.get("proposer_id") or 0) == user_id:
+                    law["proposer_id"] = 0
+                    cancelled_laws_changed = True
+                if int(law.get("cancelled_by") or 0) == user_id:
+                    law["cancelled_by"] = None
+                    cancelled_laws_changed = True
+            if cancelled_laws_changed:
+                await group.cancelled_law_history.set(cancelled_laws)
