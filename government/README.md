@@ -9,15 +9,15 @@ for persistent button voting.
 1. Load `Polls`, then load `Government`.
 2. Run `[p]government admin setup #channel`. The cog also creates a read-only
    `current-laws` channel, publishes the five immutable provisions, seeds the
-   six Presidency rules as separate amendable founding laws, and immediately
+   five Presidency rules as separate amendable founding laws, and immediately
    backfills every enacted law already in its stored register. The configured
    government channel also receives election, law, and official-party audit
    logs. Use `[p]government admin set-laws-channel` if you prefer an existing
    laws channel.
 3. Put the bot's role above the roles it creates and grant it **Manage Roles**,
    **Manage Channels**, **Manage Messages**, **Send Messages**, **Embed Links**,
-   **Add Reactions**, and **Read Message History**. **Create Public Threads** is
-   optional but recommended for law discussion threads.
+   **Add Reactions**, **Read Message History**, and **Create Public Threads** so
+   it can create law discussion and voting threads.
 4. Configure a campaign channel so the permissionless `Party Leader` role can
    post there. Only leaders of parties with at least five current members keep
    that shared role.
@@ -59,16 +59,18 @@ for persistent button voting.
 - The President appoints a Vice President. If the President leaves the server
   or an administrator vacates the office, the Vice President serves the rest of
   the existing term.
-- A presidential law proposal receives 24 hours of public discussion, then an
-  automatic 24-hour public vote. Ordinary laws need more approvals than
-  rejections; constitutional amendments need at least two-thirds approval.
+- A presidential law proposal immediately creates a public discussion thread
+  containing a 12-hour vote. Ordinary laws need more approvals than rejections;
+  constitutional amendments need at least two-thirds approval.
+- `[p]government law cancel <law ID> [reason]` lets the sitting President or an
+  administrator cancel a law vote while it is open.
 - `[p]government law repeal` lets the President propose removing an enacted law.
   Repeals use the same discussion and voting requirements as the target law;
   once passed, the old law is removed from `current-laws` while its historical
   record is retained.
 - `[p]government law amend` proposes replacement text for an enacted law. A
   successful vote archives the old version as amended and publishes the new
-  version. The six founding government rules require two-thirds votes to amend
+  version. The five founding government rules require two-thirds votes to amend
   or repeal; the five Immutable Laws are not law records and cannot be targeted.
 - Administrators can void proposals or enacted laws that conflict with the
   immutable Discord, legal, safety, owner-authority, or infrastructure rules.
@@ -94,6 +96,7 @@ Useful prefix examples:
 - `[p]government party merge accept abc123`
 - `[p]government law propose ordinary "Park Rules" Be respectful in the park.`
 - `[p]government law amend 3 "Updated Park Rules" Replacement law text here.`
+- `[p]government law cancel 7 Proposal withdrawn for revision.`
 - `[p]government admin rename-party "Old Party" New Party`
 - `[p]government admin set-party-leader "Party Name" @Member`
 - `[p]government admin delete-party Party Name`
