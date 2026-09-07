@@ -14,6 +14,9 @@ for persistent button voting.
    government channel also receives election, law, and official-party audit
    logs. Use `[p]government admin set-laws-channel` if you prefer an existing
    laws channel.
+   Use `[p]government admin set-vote-ping-role @Role` to notify a role whenever
+   a law vote or presidential election opens. Run the command without a role to
+   disable these notifications.
 3. Put the bot's role above the roles it creates and grant it **Manage Roles**,
    **Manage Channels**, **Manage Messages**, **Send Messages**, **Embed Links**,
    **Add Reactions**, **Read Message History**, and **Create Public Threads** so
@@ -100,6 +103,7 @@ Useful prefix examples:
 - `[p]government law propose ordinary "Park Rules" Be respectful in the park.`
 - `[p]government law amend 3 "Updated Park Rules" Replacement law text here.`
 - `[p]government law cancel 7 Proposal withdrawn for revision.`
+- `[p]government admin set-vote-ping-role @Voters`
 - `[p]government admin rename-party "Old Party" New Party`
 - `[p]government admin set-party-leader "Party Name" @Member`
 - `[p]government admin delete-party Party Name`

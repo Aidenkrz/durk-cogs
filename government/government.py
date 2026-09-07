@@ -154,6 +154,7 @@ class Government(commands.Cog):
 
         self.config.register_guild(
             channel_id=None,
+            vote_ping_role_id=None,
             laws_channel_id=None,
             constitution_message_id=None,
             constitution_version=0,
@@ -196,6 +197,30 @@ class Government(commands.Cog):
     def _polls_api(self):
         cog = self.bot.get_cog("Polls")
         return getattr(cog, "api", None) if cog is not None else None
+
+    async def _send_vote_notice(
+        self,
+        guild: discord.Guild,
+        channel: discord.abc.Messageable,
+        message: str,
+    ) -> None:
+        """Announce a new vote and ping the configured notification role."""
+        role_id = await self.config.guild(guild).vote_ping_role_id()
+        role = guild.get_role(int(role_id or 0))
+        content = message
+        allowed_mentions = discord.AllowedMentions.none()
+        if role is not None:
+            content = f"{role.mention} {message}"
+            allowed_mentions = discord.AllowedMentions(
+                everyone=False,
+                users=False,
+                roles=[role],
+                replied_user=False,
+            )
+        try:
+            await channel.send(content, allowed_mentions=allowed_mentions)
+        except discord.HTTPException:
+            log.exception("Could not send a vote notice in guild %s", guild.id)
 
     async def _require_admin(self, source: Any) -> bool:
         member = getattr(source, "author", None) or source.user
@@ -1147,14 +1172,12 @@ class Government(commands.Cog):
             current["poll_id"] = poll.id
             current["vote_started_at"] = unix_now()
             current["vote_ends_at"] = int(poll.closes_at.timestamp())
-        try:
-            await channel.send(
-                f"The 12-hour vote for **Law {law_id}** is now open and requires "
-                f"{requirement} to pass.",
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except discord.HTTPException:
-            log.exception("Could not post the voting notice for Law %s", law_id)
+        await self._send_vote_notice(
+            guild,
+            channel,
+            f"The 12-hour vote for **Law {law_id}** is now open and requires "
+            f"{requirement} to pass.",
+        )
 
     async def _finish_law_vote(self, guild: discord.Guild, poll: Any) -> None:
         api = self._polls_api()
@@ -1562,6 +1585,8 @@ class Government(commands.Cog):
                 await self.config.guild(role.guild).vice_president_role_id.set(None)
             if settings.get("party_leader_role_id") == role.id:
                 await self.config.guild(role.guild).party_leader_role_id.set(None)
+            if settings.get("vote_ping_role_id") == role.id:
+                await self.config.guild(role.guild).vote_ping_role_id.set(None)
             parties = settings.get("parties") or {}
             changed = False
             for party in parties.values():
@@ -1723,6 +1748,11 @@ class Government(commands.Cog):
                 if isinstance(laws_channel, discord.TextChannel)
                 else "Not configured"
             ),
+        )
+        vote_ping_role = guild.get_role(int(settings.get("vote_ping_role_id") or 0))
+        embed.add_field(
+            name="Vote notifications",
+            value=vote_ping_role.mention if vote_ping_role else "Disabled",
         )
         enacted = sum(
             1
@@ -3136,6 +3166,48 @@ class Government(commands.Cog):
             message += f"\n⚠️ {warning}"
         await self._reply(ctx, message)
 
+    @admin.command(name="set-vote-ping-role", aliases=("vote-ping-role",))
+    async def admin_set_vote_ping_role(
+        self,
+        ctx: commands.Context,
+        role: Optional[discord.Role] = None,
+    ) -> None:
+        """Set the role pinged for new votes; omit the role to disable pings."""
+        guild = self._guild(ctx)
+        if guild is None or not await self._require_admin(ctx):
+            return
+        if role is None:
+            await self.config.guild(guild).vote_ping_role_id.set(None)
+            return await self._reply(ctx, "Vote notification pings are now disabled.")
+        if role.is_default():
+            return await self._reply(
+                ctx, "Choose a specific role instead of the server's everyone role."
+            )
+
+        government_channel_id = await self.config.guild(guild).channel_id()
+        government_channel = guild.get_channel(int(government_channel_id or 0))
+        can_ping = role.mentionable
+        if guild.me is not None:
+            if isinstance(government_channel, discord.TextChannel):
+                can_ping = (
+                    can_ping
+                    or government_channel.permissions_for(guild.me).mention_everyone
+                )
+            else:
+                can_ping = can_ping or guild.me.guild_permissions.mention_everyone
+        if not can_ping:
+            return await self._reply(
+                ctx,
+                "That role is not mentionable. Make it mentionable or grant the bot "
+                "the Mention Everyone permission in the government channel.",
+            )
+
+        await self.config.guild(guild).vote_ping_role_id.set(role.id)
+        await self._reply(
+            ctx,
+            f"New law votes and presidential elections will notify **{role.name}**.",
+        )
+
     @admin.command(name="set-party-category")
     async def admin_set_party_category(
         self, ctx: commands.Context, category: discord.CategoryChannel
@@ -3433,6 +3505,12 @@ class Government(commands.Cog):
                     "ends_at": int(poll.closes_at.timestamp()),
                     "candidates": candidates,
                 }
+            )
+            await self._send_vote_notice(
+                guild,
+                channel,
+                "A new 24-hour **presidential election** is now open. "
+                f"Voting closes <t:{int(poll.closes_at.timestamp())}:R>.",
             )
         await self._reply(
             ctx,
