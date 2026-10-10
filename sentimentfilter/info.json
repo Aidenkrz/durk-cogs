@@ -1,0 +1,21 @@
+{
+    "author": ["Durk"],
+    "install_msg": "SentimentFilter installed. The bot owner must set an OpenRouter key with `[p]set api openrouter api_key,<key>`, then use `[p]sentimentfilter addchannel #channel`. Existing MessageFilter sentiment channels are imported automatically.",
+    "name": "SentimentFilter",
+    "short": "Delete negative or hostile messages using TypeSafe Jev",
+    "description": "Removes complaints and hostility toward people in chosen channels, judged by TypeSafe Jev 1.13 through OpenRouter. The rule is configurable per server. Supports timeouts, logging, a silent mode, and SocialCredit integration.",
+    "tags": [
+        "filter",
+        "moderation",
+        "sentiment",
+        "automod",
+        "ai"
+    ],
+    "requirements": [],
+    "required_cogs": {},
+    "min_bot_version": "3.5.0",
+    "hidden": false,
+    "disabled": false,
+    "type": "COG",
+    "end_user_data_statement": "This cog does not store user data. Messages sent in filtered channels are sent to OpenRouter and TypeSafe for classification."
+}

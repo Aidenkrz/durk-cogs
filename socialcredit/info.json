@@ -3,7 +3,7 @@
     "install_msg": "Thank you for installing the Social Credit cog! Use `[p]credit` to check your score.",
     "name": "SocialCredit",
     "short": "Track social credit scores based on behavior and interactions",
-    "description": "A social credit system that tracks user scores based on message sentiment and social interactions like hugging. Integrates with MessageFilter for automatic scoring.",
+    "description": "A social credit system that tracks user scores based on message sentiment and social interactions like hugging. Integrates with SentimentFilter for automatic scoring.",
     "tags": ["social", "credit", "score", "hug", "sentiment", "gamification"],
     "requirements": ["aiosqlite", "Pillow"],
     "required_cogs": {},

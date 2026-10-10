@@ -173,7 +173,7 @@ class SocialCredit(commands.Cog):
         channel_id: int,
         compound_score: float = 0.0,
     ) -> Optional[int]:
-        """Called by messagefilter when a message passes sentiment checks.
+        """Called by SentimentFilter when a message passes sentiment checks.
 
         The credit amount scales with how positive the compound score is.
         compound_score ranges 0.0 to 1.0 for positive messages.
@@ -209,7 +209,7 @@ class SocialCredit(commands.Cog):
         channel_id: int,
         compound_score: float = 0.0,
     ) -> Optional[int]:
-        """Called by messagefilter when a message triggers a sentiment violation.
+        """Called by SentimentFilter when a message triggers a sentiment violation.
 
         The credit penalty scales with how negative the compound score is.
         compound_score ranges -1.0 to 0.0 for negative messages.

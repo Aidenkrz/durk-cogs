@@ -2,20 +2,14 @@
     "author": ["Durk"],
     "install_msg": "Thank you for installing the MessageFilter cog, loser!",
     "name": "MessageFilter",
-    "short": "Filter messages by required words and negative sentiment",
-    "description": "Automatically delete messages that don't contain required words and filter negative sentiment using VADER/NLTK analysis. Supports per-channel configuration, timeout on violations, and logging.",
+    "short": "Delete messages that don't contain required words",
+    "description": "Automatically delete messages that don't contain one of a channel's required words. Supports wildcards, per-channel stats, timeouts on violations, and logging. Sentiment filtering now lives in the SentimentFilter cog.",
     "tags": [
         "filter",
         "moderation",
-        "sentiment",
         "automod"
     ],
-    "requirements": [
-        "nltk",
-        "detoxify==0.5.2",
-        "transformers>=4.30.0,<5.0",
-        "huggingface_hub>=0.34.0,<1.0"
-    ],
+    "requirements": [],
     "required_cogs": {},
     "min_bot_version": "3.5.0",
     "hidden": false,
