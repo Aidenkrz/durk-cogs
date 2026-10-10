@@ -43,8 +43,13 @@ class Judgement:
     cost: Optional[float]
 
     @property
+    def severity_level(self) -> int:
+        """Index into SEVERITY_LEVELS of the nearest level."""
+        return max(0, min(len(SEVERITY_LEVELS) - 1, round(self.severity)))
+
+    @property
     def severity_label(self) -> str:
-        return SEVERITY_LEVELS[min(len(SEVERITY_LEVELS) - 1, round(self.severity))]
+        return SEVERITY_LEVELS[self.severity_level]
 
 
 class JevClient:

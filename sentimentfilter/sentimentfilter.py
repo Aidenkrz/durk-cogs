@@ -8,7 +8,7 @@ from redbot.core import Config, commands
 from redbot.core.bot import Red
 from redbot.core.utils.chat_formatting import humanize_timedelta
 
-from .jev import DEFAULT_ALLOW, DEFAULT_FLAG, DEFAULT_QUESTION, JevClient, JevError, Judgement
+from .jev import DEFAULT_ALLOW, DEFAULT_FLAG, DEFAULT_QUESTION, SEVERITY_LEVELS, JevClient, JevError, Judgement
 
 log = logging.getLogger("red.DurkCogs.SentimentFilter")
 
@@ -33,6 +33,7 @@ class SentimentFilter(commands.Cog):
         self.config.register_guild(
             channels={},  # channel id -> {"filtered_count": int}
             threshold=0.7,
+            allowed_severity=None,  # index into SEVERITY_LEVELS; None = no severity limit
             question=None,  # None means the jev.DEFAULT_* text
             flag=None,
             allow=None,
@@ -96,6 +97,20 @@ class SentimentFilter(commands.Cog):
             log.info("Imported MessageFilter sentiment settings for %d guild(s)", imported)
         await self.config.legacy_imported.set(True)
 
+    @staticmethod
+    def _should_remove(judgement: Judgement, settings: dict) -> bool:
+        if judgement.flagged_p < settings["threshold"]:
+            return False
+        allowed = settings["allowed_severity"]
+        return allowed is None or judgement.severity_level > allowed
+
+    @staticmethod
+    def _severity_setting(settings: dict) -> str:
+        allowed = settings["allowed_severity"]
+        if allowed is None:
+            return "Off (any severity is removed)"
+        return f"Up to {SEVERITY_LEVELS[allowed]} is allowed"
+
     async def _judge(self, text: str, settings: dict) -> Judgement:
         return await self.jev.judge(
             text,
@@ -141,9 +156,10 @@ class SentimentFilter(commands.Cog):
             return
 
         social_credit = self.bot.get_cog("SocialCredit")
-        if judgement.flagged_p >= settings["threshold"]:
+        if self._should_remove(judgement, settings):
             await self._enforce(message, judgement, settings, str(channel_id), social_credit)
-        elif social_credit:
+        elif social_credit and judgement.flagged_p < settings["threshold"]:
+            # Flagged messages under the severity limit stay up but earn nothing.
             await social_credit.reward_positive_sentiment(
                 message.author.id,
                 message.guild.id,
@@ -274,6 +290,26 @@ class SentimentFilter(commands.Cog):
         await self.config.guild(ctx.guild).threshold.set(confidence)
         await self._reply(ctx, "Threshold Updated", f"Messages Jev is at least `{confidence:.0%}` sure about will be removed")
 
+    @sentimentfilter.command(name="severity")
+    async def sf_severity(self, ctx: commands.Context, level: Optional[str] = None):
+        """Set the highest severity that is still allowed: none, mild, moderate, severe.
+
+        Flagged messages are only removed when Jev rates them above this level.
+        For example `mild` lets mild complaints through but removes moderate and worse.
+        Leave empty to turn the limit off, so every flagged message is removed.
+        """
+        if level is None:
+            await self.config.guild(ctx.guild).allowed_severity.set(None)
+            return await self._reply(ctx, "Severity Limit Off", "Every flagged message will be removed, whatever its severity")
+        allowed = SEVERITY_LEVELS[:-1]  # allowing "extreme" would mean nothing is ever removed
+        level = level.lower()
+        if level not in allowed:
+            return await ctx.send(f"Severity must be one of: {', '.join(allowed)}")
+        index = SEVERITY_LEVELS.index(level)
+        await self.config.guild(ctx.guild).allowed_severity.set(index)
+        removed = ", ".join(SEVERITY_LEVELS[index + 1 :])
+        await self._reply(ctx, "Severity Limit Updated", f"Flagged messages up to **{level}** are allowed; **{removed}** will be removed")
+
     @sentimentfilter.command(name="question")
     async def sf_question(self, ctx: commands.Context, *, text: Optional[str] = None):
         """Set the yes/no question Jev answers for each message. Leave empty to reset."""
@@ -347,6 +383,7 @@ class SentimentFilter(commands.Cog):
             inline=False,
         )
         embed.add_field(name="Threshold", value=f"`{settings['threshold']}`")
+        embed.add_field(name="Severity Limit", value=self._severity_setting(settings))
         embed.add_field(name="Timeout", value=humanize_timedelta(seconds=settings["timeout"]) or "Disabled")
         embed.add_field(name="Silent Mode", value="On" if settings["silent"] else "Off")
         embed.add_field(name="Log Channel", value=log_channel.mention if log_channel else "None")
@@ -373,7 +410,7 @@ class SentimentFilter(commands.Cog):
             except JevError as exc:
                 return await ctx.send(f"Jev request failed: {exc}")
 
-        flagged = judgement.flagged_p >= settings["threshold"]
+        flagged = self._should_remove(judgement, settings)
         embed = discord.Embed(
             title="Sentiment Analysis",
             description=_clip(f"**Text:** {text}", 2000),
