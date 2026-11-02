@@ -1,0 +1,10 @@
+{
+  "author": ["Durk"],
+  "install_msg": "Thanks for installing DurkMod! Note: unload the core Mod cog first, its `ban` command conflicts with this one.",
+  "name": "DurkMod",
+  "short": "A ban command that's actually a timeout.",
+  "description": "Provides a `ban` command that announces a ban but only times the member out for the given duration.",
+  "tags": ["moderation", "fun"],
+  "requirements": [],
+  "end_user_data_statement": "This cog does not store any user data."
+}
