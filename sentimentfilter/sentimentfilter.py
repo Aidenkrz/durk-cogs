@@ -15,6 +15,7 @@ log = logging.getLogger("red.DurkCogs.SentimentFilter")
 MAX_TIMEOUT_SECONDS = 28 * 24 * 60 * 60  # Discord's hard limit
 LEGACY_IDENTIFIER = 1234567890  # MessageFilter's Config identifier
 ERROR_LOG_INTERVAL = 300  # seconds between repeated API error warnings
+HAPPY_THRESHOLD = 0.7  # targeted users' messages must be at least this likely to be very happy
 
 GREEN, YELLOW, RED = 0x00FF00, 0xFFD700, 0xFF0000
 
@@ -111,12 +112,13 @@ class SentimentFilter(commands.Cog):
             return "Off (any severity is removed)"
         return f"Up to {SEVERITY_LEVELS[allowed]} is allowed"
 
-    async def _judge(self, text: str, settings: dict) -> Judgement:
+    async def _judge(self, text: str, settings: dict, happy: bool = False) -> Judgement:
         return await self.jev.judge(
             text,
             question=settings["question"] or DEFAULT_QUESTION,
             flag=settings["flag"] or DEFAULT_FLAG,
             allow=settings["allow"] or DEFAULT_ALLOW,
+            happy=happy,
         )
 
     # ── Listener ───────────────────────────────────────────────────────
@@ -164,13 +166,14 @@ class SentimentFilter(commands.Cog):
         """Judge a message and enforce the server's settings, skipping the channel/immunity checks.
 
         Other cogs call this with `targeted=True` to filter specific users anywhere.
-        Targeted messages that pass earn no social credit, so being watched can't be farmed.
+        Targeted messages must also be very happy, and ones that pass earn no social credit,
+        so being watched can't be farmed.
         """
         if self.jev is None or not self._is_judgeable(message):
             return
         settings = await self.config.guild(message.guild).all()
         try:
-            judgement = await self._judge(message.content, settings)
+            judgement = await self._judge(message.content, settings, happy=targeted)
         except JevError as exc:
             # Fail open: an API outage shouldn't delete or punish anyone.
             now = time.monotonic()
@@ -180,7 +183,7 @@ class SentimentFilter(commands.Cog):
             return
 
         social_credit = self.bot.get_cog("SocialCredit")
-        if self._should_remove(judgement, settings):
+        if self._should_remove(judgement, settings) or (targeted and judgement.happy < HAPPY_THRESHOLD):
             await self._enforce(message, judgement, settings, self._channel_key(message), social_credit, targeted)
         elif social_credit and not targeted and judgement.flagged_p < settings["threshold"]:
             # Flagged messages under the severity limit stay up but earn nothing.
@@ -215,12 +218,15 @@ class SentimentFilter(commands.Cog):
 
             await self._send_log(message, judgement, settings, targeted)
 
-            try:
-                await author.send(
+            if targeted:
+                dm = f"Your message in {message.channel.mention} was deemed too unhappy. Please try harder."
+            else:
+                dm = (
                     f"Your message in {message.channel.mention} was removed by the sentiment filter "
-                    f"(confidence {judgement.flagged_p:.0%}, severity: {judgement.severity_label})",
-                    delete_after=120,
+                    f"(confidence {judgement.flagged_p:.0%}, severity: {judgement.severity_label})"
                 )
+            try:
+                await author.send(dm, delete_after=120)
             except discord.HTTPException:
                 pass
 
@@ -265,6 +271,8 @@ class SentimentFilter(commands.Cog):
         )
         embed.add_field(name="Confidence", value=f"{judgement.flagged_p:.2f} (cutoff {settings['threshold']})")
         embed.add_field(name="Severity", value=f"{judgement.severity_label} ({judgement.severity:.2f}/4)")
+        if judgement.happy is not None:
+            embed.add_field(name="Happiness", value=f"{judgement.happy:.2f} (needs {HAPPY_THRESHOLD})")
         embed.set_author(
             name=f"{message.author} ({message.author.id})",
             icon_url=message.author.display_avatar.url,
@@ -432,7 +440,7 @@ class SentimentFilter(commands.Cog):
         settings = await self.config.guild(ctx.guild).all()
         async with ctx.typing():
             try:
-                judgement = await self._judge(text, settings)
+                judgement = await self._judge(text, settings, happy=True)
             except JevError as exc:
                 return await ctx.send(f"Jev request failed: {exc}")
 
@@ -445,7 +453,13 @@ class SentimentFilter(commands.Cog):
         embed.add_field(name="Confidence", value=f"`{judgement.flagged_p:.2f}` (cutoff `{settings['threshold']}`)")
         embed.add_field(name="Severity", value=f"{judgement.severity_label} (`{judgement.severity:.2f}`/4)")
         embed.add_field(name="Positive Tone", value=f"`{judgement.positive:.2f}`")
+        embed.add_field(name="Happiness", value=f"`{judgement.happy:.2f}` (filtered users need `{HAPPY_THRESHOLD}`)")
         embed.add_field(name="Would Remove", value="Yes" if flagged else "No", inline=False)
+        embed.add_field(
+            name="Would Remove (Filtered User)",
+            value="Yes" if flagged or judgement.happy < HAPPY_THRESHOLD else "No",
+            inline=False,
+        )
         if judgement.cost is not None:
             embed.set_footer(text=f"Cost: ${judgement.cost:.6f}")
         await ctx.send(embed=embed)

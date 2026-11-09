@@ -3,7 +3,8 @@
 Jev answers typed questions about a piece of text with calibrated
 probabilities in one pass. Each message is asked three questions in a single
 request: whether it breaks the configured rule, how severe it is, and whether
-its tone is positive (used for SocialCredit rewards).
+its tone is positive (used for SocialCredit rewards). Messages from targeted
+users also get a fourth question asking whether they are very happy.
 """
 
 import asyncio
@@ -41,6 +42,7 @@ class Judgement:
     severity: float  # expected level, 0 (none) to 4 (extreme)
     positive: float  # p(tone is positive or friendly)
     cost: Optional[float]
+    happy: Optional[float] = None  # p(very happy), only when asked
 
     @property
     def severity_level(self) -> int:
@@ -62,7 +64,7 @@ class JevClient:
     async def close(self) -> None:
         await self._session.close()
 
-    async def judge(self, text: str, *, question: str, flag: str, allow: str) -> Judgement:
+    async def judge(self, text: str, *, question: str, flag: str, allow: str, happy: bool = False) -> Judgement:
         payload = {
             "model": MODEL,
             "state": text[:MAX_STATE_CHARS],
@@ -83,6 +85,15 @@ class JevClient:
                 },
             },
         }
+        if happy:
+            payload["questions"]["happy"] = {
+                "type": "noul",
+                "instructions": "Is this message very happy: clearly cheerful, upbeat or enthusiastic?",
+                "criteria": {
+                    "true": "Obviously joyful, excited, grateful or delighted in tone.",
+                    "false": "Neutral, flat, mixed, merely polite, sarcastic, or negative.",
+                },
+            }
         try:
             async with self._session.post(ENDPOINT, json=payload) as resp:
                 status = resp.status
@@ -101,6 +112,7 @@ class JevClient:
                 severity=float(answers["severity"]["score"]),
                 positive=float(answers["positive"]["noul"]),
                 cost=(body.get("usage") or {}).get("cost"),
+                happy=float(answers["happy"]["noul"]) if happy else None,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise JevError(f"Unexpected response: {str(body)[:200]}") from exc
