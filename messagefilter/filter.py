@@ -20,11 +20,11 @@ class MessageFilter(commands.Cog):
     # ── Word-filter channel management ─────────────────────────────────
 
     @commands.group()
-    async def filter(self, ctx):
+    async def wordfilter(self, ctx):
         """Manage message filtering"""
         pass
 
-    @filter.command()
+    @wordfilter.command()
     @commands.admin_or_permissions(administrator=True)
     async def addchannel(self, ctx, channel: discord.TextChannel):
         async with self.config.guild(ctx.guild).channels() as channels:
@@ -47,7 +47,7 @@ class MessageFilter(commands.Cog):
                 )
             await ctx.send(embed=embed)
 
-    @filter.command()
+    @wordfilter.command()
     @commands.admin_or_permissions(administrator=True)
     async def removechannel(self, ctx, channel: discord.TextChannel):
         async with self.config.guild(ctx.guild).channels() as channels:
@@ -67,7 +67,7 @@ class MessageFilter(commands.Cog):
                 )
             await ctx.send(embed=embed)
 
-    @filter.command()
+    @wordfilter.command()
     @commands.admin_or_permissions(administrator=True)
     async def addword(self, ctx, *, args: str):
         """Add required words to a channel's filter"""
@@ -117,7 +117,7 @@ class MessageFilter(commands.Cog):
 
             await ctx.send(embed=embed)
 
-    @filter.command()
+    @wordfilter.command()
     @commands.admin_or_permissions(administrator=True)
     async def removeword(self, ctx, *, args: str):
         """Remove words from a channel's filter"""
@@ -176,14 +176,14 @@ class MessageFilter(commands.Cog):
 
             await ctx.send(embed=embed)
 
-    @filter.command()
+    @wordfilter.command()
     @commands.admin_or_permissions(administrator=True)
     async def logchannel(self, ctx, channel: discord.TextChannel):
         """Set the channel for logging filtered messages"""
         await self.config.guild(ctx.guild).log_channel.set(channel.id)
         await ctx.send(f"Filter logs will now be sent to {channel.mention}")
 
-    @filter.command()
+    @wordfilter.command()
     async def list(self, ctx):
         """Show currently filtered channels and their required words"""
         channels = await self.config.guild(ctx.guild).channels()
@@ -210,7 +210,7 @@ class MessageFilter(commands.Cog):
 
         await ctx.send(embed=embed)
 
-    @filter.command()
+    @wordfilter.command()
     async def stats(self, ctx, channel: discord.TextChannel = None):
         """Show filtering statistics for a channel"""
         channel = channel or ctx.channel
