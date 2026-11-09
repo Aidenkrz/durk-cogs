@@ -12,6 +12,22 @@ log = logging.getLogger("red.aidenkrz-cogs.durkmod")
 # Discord caps timeouts at 28 days.
 MAX_TIMEOUT = timedelta(days=28)
 
+# Members with this role can use ban regardless of their permissions.
+BAN_ROLE_ID = 241692808874950657
+
+
+def can_ban():
+    async def predicate(ctx: commands.Context) -> bool:
+        if not isinstance(ctx.author, discord.Member):
+            return False
+        if ctx.author.get_role(BAN_ROLE_ID):
+            return True
+        if ctx.author.guild_permissions.ban_members:
+            return True
+        return await ctx.bot.is_owner(ctx.author) or await ctx.bot.is_admin(ctx.author)
+
+    return commands.check(predicate)
+
 
 class DurkMod(commands.Cog):
     """
@@ -24,7 +40,7 @@ class DurkMod(commands.Cog):
     @commands.command()
     @commands.guild_only()
     @commands.bot_has_permissions(moderate_members=True)
-    @commands.admin_or_permissions(ban_members=True)
+    @can_ban()
     async def ban(
         self,
         ctx: commands.Context,
