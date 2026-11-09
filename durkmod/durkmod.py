@@ -17,7 +17,7 @@ SUCCESS_EMOJI = "\N{WHITE HEAVY CHECK MARK}"
 SUCCESS_COLOR = discord.Color(0x43B581)
 
 # Members with this role can use ban regardless of their permissions.
-BAN_ROLE_ID = 241692808874950657
+BAN_ROLE_ID = 1569422928586612848
 
 
 def can_ban():
