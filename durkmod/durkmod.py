@@ -59,22 +59,21 @@ class DurkMod(commands.Cog):
                 del filtered[uid]
             return dict(filtered)
 
+    async def is_filtered(self, member: discord.Member) -> bool:
+        """Whether the member is on the active `filter` list. SentimentFilter calls this."""
+        expires = (await self.config.guild(member.guild).filtered()).get(str(member.id), False)
+        return expires is None or (expires is not False and expires > time.time())
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot or not message.guild:
+        if message.author.bot or not isinstance(message.author, discord.Member):
             return
-        filtered = await self.config.guild(message.guild).filtered()
-        key = str(message.author.id)
-        if key not in filtered:
-            return
-        if filtered[key] is not None and filtered[key] <= time.time():
+        if not await self.is_filtered(message.author):
             return
         sentiment = self.bot.get_cog("SentimentFilter")
         if sentiment is None:
             return
-        # Filtered channels already run the message through SentimentFilter's own listener.
-        if await sentiment.would_filter(message):
-            return
+        # SentimentFilter's own listener skips filtered users, so this is the only pass.
         ctx = await self.bot.get_context(message)
         if ctx.valid and ctx.command.cog is self:
             return

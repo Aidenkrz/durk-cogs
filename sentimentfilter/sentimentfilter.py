@@ -148,6 +148,10 @@ class SentimentFilter(commands.Cog):
             return False
         if await self.bot.is_automod_immune(message):
             return False
+        # DurkMod's `filter` users are handled there, with targeted=True.
+        durkmod = self.bot.get_cog("DurkMod")
+        if durkmod and await durkmod.is_filtered(message.author):
+            return False
         ctx = await self.bot.get_context(message)
         return not (ctx.valid and ctx.command.cog is self)
 
@@ -192,10 +196,10 @@ class SentimentFilter(commands.Cog):
     ):
         """Delete, log, DM and time out, then dock social credit.
 
-        Silent mode skips everything except the social credit penalty.
+        Silent mode skips everything except the social credit penalty, unless the user is targeted.
         """
         author = message.author
-        if not settings["silent"]:
+        if targeted or not settings["silent"]:
             try:
                 await message.delete()
             except discord.NotFound:
