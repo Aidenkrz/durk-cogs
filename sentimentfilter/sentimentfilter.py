@@ -121,30 +121,50 @@ class SentimentFilter(commands.Cog):
 
     # ── Listener ───────────────────────────────────────────────────────
 
-    @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        if self.jev is None or message.author.bot or not message.guild:
-            return
-        if not message.content.strip() or not isinstance(message.author, discord.Member):
-            return
-
-        settings = await self.config.guild(message.guild).all()
+    @staticmethod
+    def _channel_key(message: discord.Message) -> str:
         # Threads inherit their parent channel's setting.
         channel = message.channel
-        channel_id = channel.parent_id if isinstance(channel, discord.Thread) else channel.id
-        if str(channel_id) not in settings["channels"]:
-            return
+        return str(channel.parent_id if isinstance(channel, discord.Thread) else channel.id)
 
+    @staticmethod
+    def _is_judgeable(message: discord.Message) -> bool:
+        return (
+            not message.author.bot
+            and message.guild is not None
+            and isinstance(message.author, discord.Member)
+            and bool(message.content.strip())
+        )
+
+    async def would_filter(self, message: discord.Message) -> bool:
+        """Whether the channel-based listener will judge this message on its own."""
+        if self.jev is None or not self._is_judgeable(message):
+            return False
+        if self._channel_key(message) not in await self.config.guild(message.guild).channels():
+            return False
         if message.author.guild_permissions.administrator:
-            return
+            return False
         if await self.bot.cog_disabled_in_guild(self, message.guild):
-            return
+            return False
         if await self.bot.is_automod_immune(message):
-            return
+            return False
         ctx = await self.bot.get_context(message)
-        if ctx.valid and ctx.command.cog is self:
-            return
+        return not (ctx.valid and ctx.command.cog is self)
 
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message):
+        if await self.would_filter(message):
+            await self.filter_message(message)
+
+    async def filter_message(self, message: discord.Message, *, targeted: bool = False) -> None:
+        """Judge a message and enforce the server's settings, skipping the channel/immunity checks.
+
+        Other cogs call this with `targeted=True` to filter specific users anywhere.
+        Targeted messages that pass earn no social credit, so being watched can't be farmed.
+        """
+        if self.jev is None or not self._is_judgeable(message):
+            return
+        settings = await self.config.guild(message.guild).all()
         try:
             judgement = await self._judge(message.content, settings)
         except JevError as exc:
@@ -157,8 +177,8 @@ class SentimentFilter(commands.Cog):
 
         social_credit = self.bot.get_cog("SocialCredit")
         if self._should_remove(judgement, settings):
-            await self._enforce(message, judgement, settings, str(channel_id), social_credit)
-        elif social_credit and judgement.flagged_p < settings["threshold"]:
+            await self._enforce(message, judgement, settings, self._channel_key(message), social_credit, targeted)
+        elif social_credit and not targeted and judgement.flagged_p < settings["threshold"]:
             # Flagged messages under the severity limit stay up but earn nothing.
             await social_credit.reward_positive_sentiment(
                 message.author.id,
@@ -167,7 +187,9 @@ class SentimentFilter(commands.Cog):
                 compound_score=judgement.positive,
             )
 
-    async def _enforce(self, message, judgement: Judgement, settings: dict, channel_key: str, social_credit):
+    async def _enforce(
+        self, message, judgement: Judgement, settings: dict, channel_key: str, social_credit, targeted: bool
+    ):
         """Delete, log, DM and time out, then dock social credit.
 
         Silent mode skips everything except the social credit penalty.
@@ -187,7 +209,7 @@ class SentimentFilter(commands.Cog):
                 if channel_key in channels:
                     channels[channel_key]["filtered_count"] = channels[channel_key].get("filtered_count", 0) + 1
 
-            await self._send_log(message, judgement, settings)
+            await self._send_log(message, judgement, settings, targeted)
 
             try:
                 await author.send(
@@ -223,7 +245,7 @@ class SentimentFilter(commands.Cog):
                 compound_score=-judgement.severity / 4,
             )
 
-    async def _send_log(self, message: discord.Message, judgement: Judgement, settings: dict):
+    async def _send_log(self, message: discord.Message, judgement: Judgement, settings: dict, targeted: bool):
         log_channel = settings["log_channel"] and message.guild.get_channel(settings["log_channel"])
         if not log_channel:
             return
@@ -233,7 +255,7 @@ class SentimentFilter(commands.Cog):
             timestamp=message.created_at,
             description=_clip(
                 f"**Message sent by {message.author.mention} removed in "
-                f"{message.channel.mention}**\n{message.content}",
+                f"{message.channel.mention}{' (targeted user)' if targeted else ''}**\n{message.content}",
                 4096,
             ),
         )
