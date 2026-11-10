@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from datetime import timedelta
 from typing import Optional
@@ -18,6 +19,10 @@ ERROR_LOG_INTERVAL = 300  # seconds between repeated API error warnings
 HAPPY_THRESHOLD = 0.5  # targeted users' messages must be at least this likely to be very happy
 
 GREEN, YELLOW, RED = 0x00FF00, 0xFFD700, 0xFF0000
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif", ".heic")
+URL_RE = re.compile(r"<?https?://\S+>?")
+# Only these are messages a user typed; the rest are system messages like pins and thread creation.
+USER_MESSAGE_TYPES = (discord.MessageType.default, discord.MessageType.reply)
 
 
 def _clip(text: str, limit: int) -> str:
@@ -138,6 +143,30 @@ class SentimentFilter(commands.Cog):
             and bool(message.content.strip())
         )
 
+    @staticmethod
+    def _media_reason(message: discord.Message) -> Optional[str]:
+        """Why a targeted user's message fails without being judged, or None if it should be judged.
+
+        Images and stickers always fail, as do messages with no text besides links and attachments.
+        """
+        if message.stickers:
+            return "Sticker: " + ", ".join(s.name for s in message.stickers)
+        images = [
+            a.filename for a in message.attachments
+            if (a.content_type or "").startswith("image/") or a.filename.lower().endswith(IMAGE_EXTENSIONS)
+        ]
+        if images:
+            return "Image: " + ", ".join(images)
+        if any(e.type in ("image", "gifv") for e in message.embeds):
+            return "Image embed"
+        if URL_RE.sub("", message.content).strip():
+            return None
+        if message.attachments:
+            return "Only attachments: " + ", ".join(a.filename for a in message.attachments)
+        if message.content.strip():
+            return "Only links"
+        return "Empty message"
+
     async def would_filter(self, message: discord.Message) -> bool:
         """Whether the channel-based listener will judge this message on its own."""
         if self.jev is None or not self._is_judgeable(message):
@@ -166,12 +195,22 @@ class SentimentFilter(commands.Cog):
         """Judge a message and enforce the server's settings, skipping the channel/immunity checks.
 
         Other cogs call this with `targeted=True` to filter specific users anywhere.
-        Targeted messages must also be very happy, and ones that pass earn no social credit,
-        so being watched can't be farmed.
+        Targeted messages must also be very happy and contain no images or stickers, and
+        ones that pass earn no social credit, so being watched can't be farmed.
         """
-        if self.jev is None or not self._is_judgeable(message):
+        if message.author.bot or message.guild is None or not isinstance(message.author, discord.Member):
+            return
+        if message.type not in USER_MESSAGE_TYPES:
             return
         settings = await self.config.guild(message.guild).all()
+        if targeted:
+            media = self._media_reason(message)
+            if media:
+                social_credit = self.bot.get_cog("SocialCredit")
+                await self._enforce(message, None, settings, self._channel_key(message), social_credit, targeted, media)
+                return
+        if self.jev is None or not self._is_judgeable(message):
+            return
         try:
             judgement = await self._judge(message.content, settings, happy=targeted)
         except JevError as exc:
@@ -195,11 +234,19 @@ class SentimentFilter(commands.Cog):
             )
 
     async def _enforce(
-        self, message, judgement: Judgement, settings: dict, channel_key: str, social_credit, targeted: bool
+        self,
+        message,
+        judgement: Optional[Judgement],
+        settings: dict,
+        channel_key: str,
+        social_credit,
+        targeted: bool,
+        media: Optional[str] = None,
     ):
         """Delete, log, DM and time out, then dock social credit.
 
         Silent mode skips everything except the social credit penalty, unless the user is targeted.
+        Images and stickers from targeted users come with `media` set and no judgement.
         """
         author = message.author
         if targeted or not settings["silent"]:
@@ -216,9 +263,14 @@ class SentimentFilter(commands.Cog):
                 if channel_key in channels:
                     channels[channel_key]["filtered_count"] = channels[channel_key].get("filtered_count", 0) + 1
 
-            await self._send_log(message, judgement, settings, targeted)
+            await self._send_log(message, judgement, settings, targeted, media)
 
-            if targeted:
+            if media:
+                dm = (
+                    f"Your message in {message.channel.mention} was removed. Images, stickers and "
+                    "messages without any text aren't allowed."
+                )
+            elif targeted:
                 dm = f"Your message in {message.channel.mention} was deemed too unhappy. Please try harder."
             else:
                 dm = (
@@ -240,13 +292,14 @@ class SentimentFilter(commands.Cog):
                         timedelta(seconds=seconds),
                         reason=(
                             f"Sentiment filter in #{message.channel.name}: "
-                            f"{judgement.flagged_p:.2f}, {judgement.severity_label} [x{multiplier:.1f}]"
+                            + (media.split(":")[0].lower() if media else f"{judgement.flagged_p:.2f}, {judgement.severity_label}")
+                            + f" [x{multiplier:.1f}]"
                         ),
                     )
                 except discord.HTTPException:
                     pass
 
-        if social_credit:
+        if social_credit and judgement:
             # Severity 0-4 maps onto SocialCredit's -1..0 compound scale.
             await social_credit.penalize_negative_sentiment(
                 author.id,
@@ -255,7 +308,14 @@ class SentimentFilter(commands.Cog):
                 compound_score=-judgement.severity / 4,
             )
 
-    async def _send_log(self, message: discord.Message, judgement: Judgement, settings: dict, targeted: bool):
+    async def _send_log(
+        self,
+        message: discord.Message,
+        judgement: Optional[Judgement],
+        settings: dict,
+        targeted: bool,
+        media: Optional[str] = None,
+    ):
         log_channel = settings["log_channel"] and message.guild.get_channel(settings["log_channel"])
         if not log_channel:
             return
@@ -269,10 +329,13 @@ class SentimentFilter(commands.Cog):
                 4096,
             ),
         )
-        embed.add_field(name="Confidence", value=f"{judgement.flagged_p:.2f} (cutoff {settings['threshold']})")
-        embed.add_field(name="Severity", value=f"{judgement.severity_label} ({judgement.severity:.2f}/4)")
-        if judgement.happy is not None:
-            embed.add_field(name="Happiness", value=f"{judgement.happy:.2f} (needs {HAPPY_THRESHOLD})")
+        if media:
+            embed.add_field(name="Reason", value=_clip(media, 1024))
+        else:
+            embed.add_field(name="Confidence", value=f"{judgement.flagged_p:.2f} (cutoff {settings['threshold']})")
+            embed.add_field(name="Severity", value=f"{judgement.severity_label} ({judgement.severity:.2f}/4)")
+            if judgement.happy is not None:
+                embed.add_field(name="Happiness", value=f"{judgement.happy:.2f} (needs {HAPPY_THRESHOLD})")
         embed.set_author(
             name=f"{message.author} ({message.author.id})",
             icon_url=message.author.display_avatar.url,
