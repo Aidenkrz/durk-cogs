@@ -66,6 +66,33 @@ class DurkMod(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
+        await self._filter_if_targeted(message)
+
+    @commands.Cog.listener()
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent):
+        # Raw so edits to messages outside the cache are caught too.
+        data = payload.data
+        author_id = (data.get("author") or {}).get("id")
+        # Link embeds loading also fire this event, but only real edits set edited_timestamp.
+        if payload.guild_id is None or author_id is None or not data.get("edited_timestamp"):
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        member = guild and guild.get_member(int(author_id))
+        if member is None or not await self.is_filtered(member):
+            return
+        cached = payload.cached_message
+        if cached is not None and cached.content == data.get("content", cached.content):
+            return
+        channel = guild.get_channel_or_thread(payload.channel_id)
+        if channel is None:
+            return
+        try:
+            message = await channel.fetch_message(payload.message_id)
+        except discord.HTTPException:
+            return
+        await self._filter_if_targeted(message)
+
+    async def _filter_if_targeted(self, message: discord.Message):
         if message.author.bot or not isinstance(message.author, discord.Member):
             return
         if not await self.is_filtered(message.author):
