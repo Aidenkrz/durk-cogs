@@ -15,7 +15,7 @@ log = logging.getLogger("red.DurkCogs.SentimentFilter")
 MAX_TIMEOUT_SECONDS = 28 * 24 * 60 * 60  # Discord's hard limit
 LEGACY_IDENTIFIER = 1234567890  # MessageFilter's Config identifier
 ERROR_LOG_INTERVAL = 300  # seconds between repeated API error warnings
-HAPPY_THRESHOLD = 0.7  # targeted users' messages must be at least this likely to be very happy
+HAPPY_THRESHOLD = 0.5  # targeted users' messages must be at least this likely to be very happy
 
 GREEN, YELLOW, RED = 0x00FF00, 0xFFD700, 0xFF0000
 
