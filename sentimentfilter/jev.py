@@ -88,10 +88,22 @@ class JevClient:
         if happy:
             payload["questions"]["happy"] = {
                 "type": "noul",
-                "instructions": "Is this message very happy: clearly cheerful, upbeat or enthusiastic?",
+                "instructions": (
+                    "Is this message genuinely very happy: a sincere, cheerful, upbeat or enthusiastic "
+                    "message written to communicate something? The sender knows they must sound happy "
+                    "to get through, so judge the actual content, not the presence of happy words."
+                ),
                 "criteria": {
-                    "true": "Obviously joyful, excited, grateful or delighted in tone.",
-                    "false": "Neutral, flat, mixed, merely polite, sarcastic, or negative.",
+                    "true": (
+                        "A real message whose content is sincerely joyful, excited, grateful or delighted, "
+                        "with happy wording that fits naturally."
+                    ),
+                    "false": (
+                        "Neutral, flat, mixed, merely polite, sarcastic, or negative. Also any attempt to "
+                        "game a happiness check: repeating words like happy, yay, love or lol, spamming "
+                        "emoji or exclamation marks, filler with no real content, or cheerful words tacked "
+                        "onto a message that is otherwise neutral, negative or a complaint."
+                    ),
                 },
             }
         try:
