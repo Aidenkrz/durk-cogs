@@ -89,20 +89,26 @@ class JevClient:
             payload["questions"]["happy"] = {
                 "type": "noul",
                 "instructions": (
-                    "Is this message genuinely very happy: a sincere, cheerful, upbeat or enthusiastic "
-                    "message written to communicate something? The sender knows they must sound happy "
-                    "to get through, so judge the actual content, not the presence of happy words."
+                    "Is this a genuinely very happy message: a sincere, coherent thought in normal language "
+                    "that clearly expresses joy, excitement, gratitude or delight about something? The sender "
+                    "is being forced to sound happy and is actively trying to sneak other messages past this "
+                    "check, so be strict and answer no when in doubt. Judge only what the words mean; emoji "
+                    "do not count as happiness."
                 ),
                 "criteria": {
                     "true": (
-                        "A real message whose content is sincerely joyful, excited, grateful or delighted, "
-                        "with happy wording that fits naturally."
+                        "A real, meaningful message, normally at least a full sentence in plain language, "
+                        "that is sincerely and obviously happy about something concrete. The happiness comes "
+                        "from what is said, not from emoji, capitals or keywords."
                     ),
                     "false": (
-                        "Neutral, flat, mixed, merely polite, sarcastic, or negative. Also any attempt to "
-                        "game a happiness check: repeating words like happy, yay, love or lol, spamming "
-                        "emoji or exclamation marks, filler with no real content, or cheerful words tacked "
-                        "onto a message that is otherwise neutral, negative or a complaint."
+                        "Anything else. Neutral, flat, mixed, merely polite, sarcastic or negative messages. "
+                        "One or two words, fragments, slogans or catchphrases. Nonsense, memes, random or "
+                        "made-up words, or deliberately broken caveman speech like 'ME LIKE X'. Messages where "
+                        "emoji carry the feeling, like 'WORD 🥹'. Repeating words like happy, yay, love or lol, "
+                        "or spamming emoji or punctuation. Inside jokes, trolling, or mocking or teasing "
+                        "anyone. Talking about being filtered or censored, or testing what gets through. "
+                        "Cheerful words tacked onto a message that is otherwise neutral, negative or pointless."
                     ),
                 },
             }
